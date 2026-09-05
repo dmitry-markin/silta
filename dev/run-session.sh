@@ -49,7 +49,9 @@ exec 3> "$fifo"
 printf '%s\n' "$initial" >&3
 
 id=""
+[ $# -ge 1 ] && id=$1   # a resumed session prints no init line
 for _ in $(seq 1 60); do
+  [ -n "$id" ] && break
   id=$(grep -o '"session_id":"[^"]*"' "$state/hub.log" 2>/dev/null | head -1 | cut -d'"' -f4 || true)
   [ -n "$id" ] && break
   kill -0 "$pid" 2>/dev/null || break
@@ -61,6 +63,16 @@ if [ -n "$id" ]; then
 else
   echo "no session id seen in $state/hub.log yet" >&2
 fi
-echo "claude pid $pid; log $state/hub.log; press Ctrl-C or close the FIFO to stop"
-trap 'kill "$pid" 2>/dev/null || true' INT TERM
+echo "claude pid $pid; log $state/hub.log; press Ctrl-C to stop"
+# Stop by closing stdin (EOF ends a -p session cleanly); SIGTERM makes Claude Code
+# linger for minutes with a FIFO on stdin, and resuming the same session id while the
+# old process is still alive leaves the channel unregistered in the new one.
+stop() {
+  exec 3>&-
+  for _ in $(seq 1 150); do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.1; done
+  echo "claude did not exit on stdin EOF within 15 s, killing it" >&2
+  kill -9 "$pid" 2>/dev/null || true
+}
+trap stop INT TERM
 wait "$pid"
+echo "session exited"

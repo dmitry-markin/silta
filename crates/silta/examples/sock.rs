@@ -62,11 +62,14 @@ async fn connect(path: &PathBuf, stdin: &mut LineReader<Stdin>) -> anyhow::Resul
     Ok(())
 }
 
-/// Returns `Ok(true)` when the peer closed and `Ok(false)` when stdin closed.
+/// Returns `Ok(true)` when the peer closed while stdin is still open, `Ok(false)` once
+/// stdin has closed (the peer is drained until it closes too, so a piped one-shot
+/// `printf ... | sock connect` still prints the answers).
 async fn pump(stream: UnixStream, stdin: &mut LineReader<Stdin>) -> anyhow::Result<bool> {
     let (read_half, mut write_half) = stream.into_split();
     let mut peer = LineReader::new(read_half);
     let mut stdout = tokio::io::stdout();
+    let mut stdin_open = true;
     loop {
         tokio::select! {
             line = peer.next_line() => match line? {
@@ -75,9 +78,9 @@ async fn pump(stream: UnixStream, stdin: &mut LineReader<Stdin>) -> anyhow::Resu
                     stdout.write_all(b"\n").await?;
                     stdout.flush().await?;
                 }
-                None => return Ok(true),
+                None => return Ok(stdin_open),
             },
-            line = stdin.next_line() => match line? {
+            line = stdin.next_line(), if stdin_open => match line? {
                 Some(line) => {
                     write_half.write_all(line.as_bytes()).await?;
                     write_half.write_all(b"\n").await?;
@@ -85,8 +88,8 @@ async fn pump(stream: UnixStream, stdin: &mut LineReader<Stdin>) -> anyhow::Resu
                 }
                 None => {
                     let _ = write_half.shutdown().await;
-                    eprintln!("sock: stdin closed");
-                    return Ok(false);
+                    eprintln!("sock: stdin closed, draining the peer");
+                    stdin_open = false;
                 }
             },
         }
