@@ -1,7 +1,0 @@
-{
-  "mcpServers": {
-    "fakechat-dev": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/run.sh"
-    }
-  }
-}

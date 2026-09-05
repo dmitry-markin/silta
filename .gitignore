@@ -21,3 +21,8 @@ deploy/*.toml
 .vscode/
 *.swp
 .DS_Store
+
+# Dev environment: host-specific config with test-server passwords, and runtime state
+dev/*.toml
+!dev/*.example.toml
+dev/state/

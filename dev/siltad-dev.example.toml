@@ -1,0 +1,27 @@
+# siltad configuration for development against the loopback conduit on this host.
+# Copy to dev/siltad.toml (gitignored), fill in the password, use absolute paths.
+
+socket    = "/ABSOLUTE/PATH/TO/silta/dev/state/siltad.sock"
+state_dir = "/ABSOLUTE/PATH/TO/silta/dev/state/silta"
+
+[matrix]
+homeserver_url = "http://localhost"
+user_id        = "@silta:localhost"
+password       = "..."             # used only when state_dir/session.json is absent
+device_id      = "silta"
+device_name    = "Silta"
+
+[[people]]
+name = "Bob"
+role = "owner"
+addresses = ["@bob:localhost"]
+
+[[people]]
+name = "Alice"
+role = "family"
+addresses = ["@alice:localhost"]
+
+[[sessions]]
+name = "hub"
+receive = "all"
+send = "any"
