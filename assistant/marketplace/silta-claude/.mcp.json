@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "silta": {
+      "command": "${SILTA_CLAUDE_BIN:-silta-claude}"
+    }
+  }
+}

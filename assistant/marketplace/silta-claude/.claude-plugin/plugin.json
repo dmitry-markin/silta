@@ -1,0 +1,6 @@
+{
+  "name": "silta-claude",
+  "version": "0.1.0",
+  "description": "Matrix channel for Claude Code sessions through the silta daemon",
+  "keywords": ["channel", "mcp", "matrix"]
+}

@@ -1,0 +1,21 @@
+[package]
+name = "siltad"
+description = "silta daemon: owns the bot's Matrix device and routes rooms to assistant sessions over a Unix socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+silta.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+matrix-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
