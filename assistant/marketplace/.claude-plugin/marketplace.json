@@ -1,0 +1,13 @@
+{
+  "name": "silta-local",
+  "description": "Local marketplace for the silta project (channel plugins under development)",
+  "owner": { "name": "silta" },
+  "plugins": [
+    {
+      "name": "fakechat-dev",
+      "description": "The official fakechat channel server on port 8793, packaged locally to test the channel allowlist via managed settings",
+      "category": "development",
+      "source": "./fakechat-dev"
+    }
+  ]
+}

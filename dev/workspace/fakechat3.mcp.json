@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "fakechat3": {
+      "command": "bun",
+      "args": ["run", "--cwd", "/home/bob/.claude/plugins/cache/claude-plugins-official/fakechat/0.0.1", "--silent", "start"],
+      "env": { "FAKECHAT_PORT": "8793" }
+    }
+  }
+}

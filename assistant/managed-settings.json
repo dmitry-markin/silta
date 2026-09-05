@@ -1,0 +1,10 @@
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "marketplace": "claude-plugins-official", "plugin": "telegram" },
+    { "marketplace": "claude-plugins-official", "plugin": "discord" },
+    { "marketplace": "claude-plugins-official", "plugin": "imessage" },
+    { "marketplace": "claude-plugins-official", "plugin": "fakechat" },
+    { "marketplace": "silta-local", "plugin": "fakechat-dev" }
+  ]
+}

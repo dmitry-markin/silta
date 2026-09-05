@@ -1,0 +1,23 @@
+# Rust
+target/
+
+# Claude Code local state
+.claude/settings.local.json
+**/.claude/settings.local.json
+CLAUDE.local.md
+
+# Assistant workspace runtime files (spike and later): notes and inbox, not the persona
+dev/workspace/notes.md
+dev/workspace/inbox/
+
+# Secrets and host-specific config: only *.example files are tracked
+*.env
+*.secret
+deploy/*.toml
+!deploy/*.example.toml
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
