@@ -24,7 +24,10 @@ use matrix_sdk::{
     Room, RoomMemberships, RoomState,
 };
 use silta::{
-    protocol::{CmdResult, Edit, FetchMessages, HistoryAttachment, HistoryMessage, React, Reply, ResultError, SendFile},
+    protocol::{
+        CmdResult, Edit, FetchMessage, FetchMessages, HistoryAttachment, HistoryMessage, React, Reply, ResultError,
+        SendFile,
+    },
     text::chunk_text,
     time::rfc3339_utc,
 };
@@ -68,6 +71,13 @@ pub async fn send_file(daemon: &Daemon, session: &str, id: u64, cmd: SendFile) -
 pub async fn fetch_messages(daemon: &Daemon, session: &str, id: u64, cmd: FetchMessages) -> CmdResult {
     match do_fetch_messages(daemon, session, cmd).await {
         Ok((messages, more)) => CmdResult::history(id, messages, more),
+        Err((code, message)) => CmdResult::err(id, code, message),
+    }
+}
+
+pub async fn fetch_message(daemon: &Daemon, session: &str, id: u64, cmd: FetchMessage) -> CmdResult {
+    match do_fetch_message(daemon, session, cmd).await {
+        Ok(message) => CmdResult::history(id, vec![message], None),
         Err((code, message)) => CmdResult::err(id, code, message),
     }
 }
@@ -361,6 +371,21 @@ async fn do_fetch_messages(daemon: &Daemon, session: &str, cmd: FetchMessages) -
     };
     info!(session, room = %room.room_id(), count = out.len(), skipped, pages, more = more.is_some(), "history fetched");
     Ok((out, more))
+}
+
+/// One message by id, whole, under the same ownership rule as history. The SDK fetches
+/// it from the event cache or the server and decrypts it.
+async fn do_fetch_message(daemon: &Daemon, session: &str, cmd: FetchMessage) -> Result<HistoryMessage, Fail> {
+    let target = parse_event_id(&cmd.event_id)?;
+    let room = readable_room(daemon, session, &cmd.room_id).await?;
+    let event = room
+        .load_or_fetch_event(&target, None)
+        .await
+        .map_err(|e| (ResultError::NotFound, format!("cannot fetch {target}: {e}")))?;
+    let message = history_message(daemon, &event)
+        .ok_or_else(|| (ResultError::NotFound, format!("{target} is not a message from a registered person or the bot")))?;
+    info!(session, room = %room.room_id(), %target, bytes = message.text.len(), "message fetched");
+    Ok(message)
 }
 
 /// One raw timeline event as a history message: registered senders and the bot only,

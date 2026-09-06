@@ -85,6 +85,7 @@ impl Daemon {
             CmdKind::Edit(edit) => outbound::edit(self, session, cmd.id, edit).await,
             CmdKind::SendFile(file) => outbound::send_file(self, session, cmd.id, file).await,
             CmdKind::FetchMessages(fetch) => outbound::fetch_messages(self, session, cmd.id, fetch).await,
+            CmdKind::FetchMessage(fetch) => outbound::fetch_message(self, session, cmd.id, fetch).await,
         }
     }
 

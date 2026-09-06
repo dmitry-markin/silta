@@ -14,7 +14,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
-use silta::protocol::{CmdKind, Edit, Event, EventKind, FetchMessages, HistoryMessage, React, Reply, SendFile};
+use silta::protocol::{CmdKind, Edit, Event, EventKind, FetchMessage, FetchMessages, HistoryMessage, React, Reply, SendFile};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -38,7 +38,8 @@ Tools: reply sends text; react sends an emoji, as the whole answer or as a mark 
 have seen a message before a long task; edit_message replaces one of your own messages, only \
 when a correction or a progress update makes the chat clearer; send_file sends a file from \
 this host; fetch_messages reads recent room history when something has fallen out of your \
-context. Terminal output never reaches the sender. After a tool has sent something, end the \
+context, with long texts shortened, and fetch_message reads one message whole by its event \
+id. Terminal output never reaches the sender. After a tool has sent something, end the \
 turn without restating it.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -104,6 +105,14 @@ pub struct FetchMessagesParams {
     pub from: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FetchMessageParams {
+    /// The room: the room_id attribute of the channel tag.
+    pub room_id: String,
+    /// The message: an event_id from a fetch_messages line or a channel tag.
+    pub event_id: String,
+}
+
 #[derive(Clone)]
 pub struct SiltaChannel {
     daemon: DaemonClient,
@@ -165,7 +174,7 @@ impl SiltaChannel {
         match self.daemon.command(kind).await {
             Ok(result) => {
                 let messages = result.messages.unwrap_or_default();
-                let mut lines: Vec<String> = messages.iter().map(history_line).collect();
+                let mut lines: Vec<String> = messages.iter().map(|m| history_line(m, Some(HISTORY_TEXT_CHARS))).collect();
                 if lines.is_empty() {
                     lines.push("(no messages)".to_owned());
                 }
@@ -177,6 +186,24 @@ impl SiltaChannel {
             }
             Err(err) => {
                 warn!("fetch_messages failed: {err}");
+                Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]))
+            }
+        }
+    }
+
+    #[tool(
+        name = "fetch_message",
+        description = "Fetch one message whole by its event id (from a fetch_messages line or a channel tag): the same fields as fetch_messages, with the full text. Use it after fetch_messages when you need the whole text of a shortened message. Fails with not_found when the event does not exist or is not a message from a registered person or yourself, and with room_not_allowed when this session does not own the room."
+    )]
+    async fn fetch_message(&self, Parameters(p): Parameters<FetchMessageParams>) -> Result<CallToolResult, McpError> {
+        let kind = CmdKind::FetchMessage(FetchMessage { room_id: p.room_id, event_id: p.event_id });
+        match self.daemon.command(kind).await {
+            Ok(result) => {
+                let line = result.messages.unwrap_or_default().first().map(|m| history_line(m, None)).unwrap_or_default();
+                Ok(CallToolResult::success(vec![ContentBlock::text(line)]))
+            }
+            Err(err) => {
+                warn!("fetch_message failed: {err}");
                 Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]))
             }
         }
@@ -203,8 +230,9 @@ impl SiltaChannel {
 /// for reading long ones whole, and Claude Code refuses tool results over a token cap.
 const HISTORY_TEXT_CHARS: usize = 300;
 
-/// One history message as a compact JSON line for the model.
-fn history_line(m: &HistoryMessage) -> String {
+/// One history message as a compact JSON line for the model; `max_chars` shortens the
+/// text, `None` keeps it whole.
+fn history_line(m: &HistoryMessage, max_chars: Option<usize>) -> String {
     let mut line = serde_json::Map::new();
     line.insert("event_id".into(), json!(m.event_id));
     if m.own {
@@ -220,9 +248,9 @@ fn history_line(m: &HistoryMessage) -> String {
         line.insert("thread".into(), json!(v));
     }
     let chars = m.text.chars().count();
-    if chars > HISTORY_TEXT_CHARS {
-        let head: String = m.text.chars().take(HISTORY_TEXT_CHARS).collect();
-        line.insert("text".into(), json!(format!("{head}… [{} more characters]", chars - HISTORY_TEXT_CHARS)));
+    if let Some(max) = max_chars.filter(|&max| chars > max) {
+        let head: String = m.text.chars().take(max).collect();
+        line.insert("text".into(), json!(format!("{head}… [{} more characters]", chars - max)));
     } else {
         line.insert("text".into(), json!(m.text));
     }
@@ -365,7 +393,9 @@ mod tests {
             text: "ж".repeat(1000),
             attachments: vec![HistoryAttachment { name: "a.pdf".into(), mime: "application/pdf".into(), size: 10 }],
         };
-        let line = history_line(&long);
+        let whole: serde_json::Value = serde_json::from_str(&history_line(&long, None)).unwrap();
+        assert_eq!(whole["text"].as_str().unwrap().chars().count(), 1000);
+        let line = history_line(&long, Some(HISTORY_TEXT_CHARS));
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["own"], true);
         assert!(v.get("person").is_none() && v.get("sender").is_none());

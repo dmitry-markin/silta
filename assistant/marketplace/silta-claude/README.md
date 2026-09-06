@@ -23,7 +23,7 @@ try to start the plugin, fail without `SILTA_SESSION`, and poison
 `~/.claude/mcp-needs-auth-cache.json`. `--add-dir` names the daemon's inbox, where
 attachments are downloaded, so the session may read them.
 
-Tools: `reply`, `react`, `edit_message`, `send_file`, `fetch_messages`. Events: messages
+Tools: `reply`, `react`, `edit_message`, `send_file`, `fetch_messages`, `fetch_message`. Events: messages
 (with attachments, replies and threads) and reactions on the bot's own messages.
 
 The plugin must be on the machine's channel allowlist (`assistant/managed-settings.json`).

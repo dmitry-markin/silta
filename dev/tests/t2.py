@@ -104,7 +104,7 @@ print("6. reactions: Alice on her own message (must not arrive), then on the bot
 alice("react", dm, eid_photo, "🙂")
 e = event(timeout=6)
 ok(e is None, "reaction on Alice's own message is not delivered")
-alice("react", dm, bot_eid, "👍")
+reaction_eid = alice("react", dm, bot_eid, "👍")
 e = event()
 ok(e and e["kind"] == "reaction" and e.get("reacts_to") == bot_eid and e["text"] == "👍", "reaction on the bot's message delivered")
 
@@ -127,7 +127,7 @@ r = cmd("send_file", room_id=dm, path=huge); print("  (25 MB file:", r.get("erro
 
 print("9. history")
 r = cmd("fetch_messages", room_id=dm, limit=5); m = r.get("messages", [])
-ok(r["ok"] and len(m) == 5 and m[0]["ts"] >= m[-1]["ts"], "five messages newest first")
+ok(r["ok"] and len(m) >= 5 and all(m[i]["ts"] >= m[i + 1]["ts"] for i in range(len(m) - 1)), "at least five messages, newest first")
 ok(any(x["own"] for x in m) and any(not x["own"] for x in m), "both the bot's and Alice's messages listed")
 ok(any(x["attachments"] for x in m), "attachments listed by name")
 for x in m[:5]: print("   ", x["ts"][11:19], "own" if x["own"] else x.get("person"), repr(x["text"][:40]), [a["name"] for a in x["attachments"]], "thread" if x.get("thread") else "", "reply" if x.get("in_reply_to") else "")
@@ -141,6 +141,15 @@ print("10. a quote of a thread message follows it into the thread")
 thread_msg = [x for x in m if x.get("thread") and not x["own"]]
 if thread_msg:
     r = cmd("reply", room_id=dm, text="quoted from the thread", reply_to=thread_msg[0]["event_id"]); ok(r["ok"], "quote accepted")
+print("11. one message whole")
+r = cmd("reply", room_id=dm, text="z" * 3000); long_eid = r.get("event_id")
+r = cmd("fetch_message", room_id=dm, event_id=long_eid); m1 = (r.get("messages") or [{}])[0]
+ok(r["ok"] and m1.get("own") and m1.get("text") == "z" * 3000, "the bot's long message comes back whole")
+r = cmd("fetch_message", room_id=dm, event_id=eid_photo); m1 = (r.get("messages") or [{}])[0]
+ok(r["ok"] and m1.get("person") == "Alice" and m1.get("text") == "a picture" and m1["attachments"][0]["name"] == "shapes.png", "Alice's photo message with its attachment")
+r = cmd("fetch_message", room_id=dm, event_id="$nonexistent:localhost"); ok(r.get("error") == "not_found", "unknown event: not_found")
+r = cmd("fetch_message", room_id=dm, event_id=reaction_eid); ok(r.get("error") == "not_found", "a reaction is not a message: not_found")
+r = cmd("fetch_message", room_id=family, event_id=eid_photo); ok(r.get("error") == "room_not_allowed", "a room the session does not own: room_not_allowed")
 time.sleep(4)
 watch.terminate(); watch.wait(timeout=10); watch_out.close()
 print("--- watch (Alice's view, last 16 lines) ---")

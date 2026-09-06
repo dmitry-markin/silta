@@ -173,6 +173,7 @@ pub enum CmdKind {
     Edit(Edit),
     SendFile(SendFile),
     FetchMessages(FetchMessages),
+    FetchMessage(FetchMessage),
 }
 
 impl CmdKind {
@@ -183,6 +184,7 @@ impl CmdKind {
             CmdKind::Edit(_) => "edit",
             CmdKind::SendFile(_) => "send_file",
             CmdKind::FetchMessages(_) => "fetch_messages",
+            CmdKind::FetchMessage(_) => "fetch_message",
         }
     }
 }
@@ -240,6 +242,13 @@ pub struct FetchMessages {
     /// The `more` token of an earlier result, to page further back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+}
+
+/// Fetch one message by id, whole. Answered like `fetch_messages`, with one message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchMessage {
+    pub room_id: String,
+    pub event_id: String,
 }
 
 /// The daemon's answer to a command.
@@ -535,6 +544,12 @@ mod tests {
         assert_eq!(f.limit, Some(20));
         let msg = roundtrip_client(r#"{"cmd":{"id":6,"fetch_messages":{"room_id":"!r"}}}"#);
         assert!(matches!(msg, ClientMessage::Cmd(Cmd { kind: CmdKind::FetchMessages(_), .. })));
+
+        let msg = roundtrip_client(r#"{"cmd":{"id":7,"fetch_message":{"room_id":"!r","event_id":"$e"}}}"#);
+        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        assert_eq!(cmd.kind.name(), "fetch_message");
+        let CmdKind::FetchMessage(f) = cmd.kind else { panic!("not fetch_message") };
+        assert_eq!(f.event_id, "$e");
     }
 
     #[test]
