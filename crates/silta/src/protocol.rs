@@ -111,6 +111,10 @@ pub struct Event {
     pub event_id: String,
     /// RFC 3339 UTC, from `origin_server_ts`.
     pub ts: String,
+    /// The event id this message quotes (`m.in_reply_to`), when it is a reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    /// The text; an emote arrives as `/me <text>`.
     pub text: String,
     pub transcribed: bool,
     /// Always present so that items can be added later without a protocol bump.
@@ -316,6 +320,14 @@ mod tests {
         assert_eq!(e.kind, EventKind::Message);
         assert_eq!(e.person, "Alice");
         assert!(e.attachments.is_empty());
+    }
+
+    #[test]
+    fn event_with_in_reply_to() {
+        let json = r#"{"event":{"kind":"message","person":"Bob","role":"owner","sender":"@bob:silta.test","room_id":"!abc:silta.test","event_id":"$q","ts":"2026-09-06T03:00:00Z","in_reply_to":"$xyz","text":"yes, that one","transcribed":false,"attachments":[]}}"#;
+        let msg = roundtrip_daemon(json);
+        let DaemonMessage::Event(e) = msg else { panic!("not event") };
+        assert_eq!(e.in_reply_to.as_deref(), Some("$xyz"));
     }
 
     #[test]

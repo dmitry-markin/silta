@@ -25,6 +25,11 @@ pub struct Config {
     pub people: Vec<PersonConfig>,
     #[serde(default)]
     pub sessions: Vec<SessionConfig>,
+    /// After a start, messages from before it are still delivered if they are at most
+    /// this old and were not delivered before; older history is skipped. Also the
+    /// maximum age of a message queued for a session that is not connected.
+    #[serde(default = "default_replay_window_secs")]
+    pub replay_window_secs: u64,
     /// Reserved for later; accepted and ignored with a warning.
     #[serde(default)]
     pub inbox_max_age_days: Option<toml::Value>,
@@ -47,6 +52,10 @@ pub struct MatrixConfig {
 
 fn default_device_name() -> String {
     "Silta".to_owned()
+}
+
+fn default_replay_window_secs() -> u64 {
+    300
 }
 
 impl fmt::Debug for MatrixConfig {
@@ -537,6 +546,13 @@ name = "alice"
 receive = { people = ["Alice"] }
 send = "own"
 "#;
+
+    #[test]
+    fn replay_window_default_and_override() {
+        assert_eq!(config(HUB_ONLY).replay_window_secs, 300);
+        let c = Config::parse(&format!("replay_window_secs = 30\n{BASE}\n{HUB_ONLY}")).unwrap();
+        assert_eq!(c.replay_window_secs, 30);
+    }
 
     #[test]
     fn parses_the_plan_example() {

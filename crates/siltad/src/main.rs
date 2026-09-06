@@ -48,10 +48,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         warn!("{warning}");
     }
     info!(
-        "siltad {} starting: {} people, {} sessions, socket {}",
+        "siltad {} starting: {} people, {} sessions, replay window {} s, socket {}",
         env!("CARGO_PKG_VERSION"),
         config.people.len(),
         config.sessions.len(),
+        config.replay_window_secs,
         config.socket.display()
     );
 
@@ -69,7 +70,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     )
     .await?;
 
-    let daemon = Arc::new(Daemon::new(client, Routing::new(&config)));
+    let daemon = Arc::new(Daemon::new(client, Routing::new(&config), &config.state_dir, config.replay_window_secs));
     matrix::register_handlers(&daemon);
 
     let cancel = CancellationToken::new();

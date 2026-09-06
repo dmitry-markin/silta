@@ -3,8 +3,10 @@
 //! framing, and small text helpers. Everything here is pure and unit-tested; the
 //! network and Matrix code lives in the binaries.
 
+pub mod backlog;
 pub mod config;
 pub mod line;
 pub mod protocol;
+pub mod replay;
 pub mod text;
 pub mod time;

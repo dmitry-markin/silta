@@ -3,6 +3,7 @@
 
 socket    = "/ABSOLUTE/PATH/TO/silta/dev/state/siltad.sock"
 state_dir = "/ABSOLUTE/PATH/TO/silta/dev/state/silta"
+replay_window_secs = 300   # optional; messages from a downtime this old are still delivered
 
 [matrix]
 homeserver_url = "http://localhost"

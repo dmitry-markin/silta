@@ -9,8 +9,9 @@
 //!
 //! Commands: `dm <user>` creates or finds the encrypted DM with a user; `room <name>
 //! <user>...` creates an encrypted private room and invites users; `send <room> <text>`
-//! sends a plain text message; `watch` prints decrypted incoming messages and joins any
-//! invite.
+//! sends a plain text message; `reply <room> <event_id> <text>` sends a quoted reply;
+//! `emote <room> <text>` sends a `/me` emote; `watch` prints decrypted incoming
+//! messages and typing changes, and joins any invite.
 
 use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 
@@ -19,12 +20,16 @@ use matrix_sdk::{
     config::SyncSettings,
     ruma::{
         api::client::room::{create_room::v3::Request as CreateRoomRequest, Visibility},
-        events::room::{
-            encrypted::OriginalSyncRoomEncryptedEvent,
-            member::{MembershipState, StrippedRoomMemberEvent},
-            message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+        events::{
+            relation::{InReplyTo, Reply},
+            room::{
+                encrypted::OriginalSyncRoomEncryptedEvent,
+                member::{MembershipState, StrippedRoomMemberEvent},
+                message::{MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent},
+            },
+            typing::SyncTypingEvent,
         },
-        OwnedUserId, RoomId, UserId,
+        EventId, OwnedUserId, RoomId, UserId,
     },
     Client, Room, RoomState,
 };
@@ -70,9 +75,21 @@ async fn run() -> Result<()> {
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["dm", other] => dm(&client, other).await,
         ["room", name, users @ ..] if !users.is_empty() => room(&client, name, users).await,
-        ["send", room_id, text @ ..] if !text.is_empty() => send(&client, room_id, &text.join(" ")).await,
+        ["send", room_id, text @ ..] if !text.is_empty() => {
+            send(&client, room_id, RoomMessageEventContent::text_plain(text.join(" "))).await
+        }
+        ["reply", room_id, event_id, text @ ..] if !text.is_empty() => {
+            let mut content = RoomMessageEventContent::text_plain(text.join(" "));
+            content.relates_to = Some(Relation::Reply(Reply::new(InReplyTo::new(EventId::parse(event_id)?))));
+            send(&client, room_id, content).await
+        }
+        ["emote", room_id, text @ ..] if !text.is_empty() => {
+            send(&client, room_id, RoomMessageEventContent::emote_plain(text.join(" "))).await
+        }
         ["watch"] => watch(&client).await,
-        _ => bail!("usage: testclient dm <user> | room <name> <user>... | send <room> <text> | watch"),
+        _ => bail!(
+            "usage: testclient dm <user> | room <name> <user>... | send <room> <text> | reply <room> <event_id> <text> | emote <room> <text> | watch"
+        ),
     }
 }
 
@@ -115,14 +132,14 @@ async fn room(client: &Client, name: &str, users: &[&str]) -> Result<()> {
     Ok(())
 }
 
-async fn send(client: &Client, room_id: &str, text: &str) -> Result<()> {
+async fn send(client: &Client, room_id: &str, content: RoomMessageEventContent) -> Result<()> {
     let room_id = RoomId::parse(room_id)?;
     sync_once(client).await?;
     let room = client.get_room(&room_id).context("not in that room (run watch to accept invites)")?;
     if room.state() != RoomState::Joined {
         bail!("not joined to {room_id}");
     }
-    let response = room.send(RoomMessageEventContent::text_plain(text)).await?;
+    let response = room.send(content).await?;
     println!("{}", response.response.event_id);
     Ok(())
 }
@@ -148,6 +165,13 @@ async fn watch(client: &Client) -> Result<()> {
     });
     client.add_event_handler(|event: OriginalSyncRoomEncryptedEvent, room: Room| async move {
         println!("[{}] {} {}: <undecryptable>", room.room_id(), event.event_id, event.sender);
+    });
+    client.add_event_handler(|event: SyncTypingEvent, room: Room| async move {
+        let who: Vec<String> = event.content.user_ids.iter().map(|u| u.to_string()).collect();
+        let now = silta::time::rfc3339_utc(
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+        );
+        println!("[{}] {} typing: {}", room.room_id(), &now[11..19], if who.is_empty() { "(none)".to_owned() } else { who.join(", ") });
     });
     eprintln!("watching as {} (Ctrl-C to stop)", client.user_id().map(|u| u.to_string()).unwrap_or_default());
     client.sync(SyncSettings::default().timeout(Duration::from_secs(30))).await?;

@@ -68,11 +68,13 @@ pub async fn reply(daemon: &Daemon, session: &str, id: u64, reply: Reply) -> Cmd
         match room.send(content).await {
             Ok(sent) => last_event_id = Some(sent.response.event_id),
             Err(e) => {
+                daemon.typing_stop(&room_id);
                 let _ = room.typing_notice(false).await;
                 return err(ResultError::SendFailed, format!("sending to {room_id} failed after {i} of {} chunks: {e}", chunks.len()));
             }
         }
     }
+    daemon.typing_stop(&room_id);
     let _ = room.typing_notice(false).await;
     let event_id = last_event_id.map(|e| e.to_string()).unwrap_or_default();
     info!(session, room = %room_id, chunks = chunks.len(), bytes = reply.text.len(), "sent");

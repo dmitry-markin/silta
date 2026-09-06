@@ -18,7 +18,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::daemon::Shared;
+use crate::daemon::{now_ms, Shared};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -94,6 +94,23 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
     }
     info!(session, client = %hello.client, "session connected");
 
+    // Messages that arrived while the session was away, oldest first.
+    let (queued, evicted) = daemon.registry.take_backlog(&session, now_ms());
+    if evicted > 0 {
+        warn!(session, evicted, "dropped queued messages older than the replay window");
+    }
+    let count = queued.len();
+    for (ts_ms, event) in queued {
+        if let Err(err) = write_line(&mut writer, &DaemonMessage::Event(event.clone())).await {
+            warn!(session, "write failed while delivering the backlog: {err}");
+            return;
+        }
+        daemon.after_delivery(&session, &event, ts_ms);
+    }
+    if count > 0 {
+        info!(session, count, "delivered the messages queued while the session was away");
+    }
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -142,6 +159,7 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
             },
         }
     }
+    daemon.typing_stop_session(&session);
     info!(session, "session disconnected");
 }
 
