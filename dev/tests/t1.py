@@ -48,6 +48,7 @@ n = mread(); meta = n["params"]["meta"]; print("notification", n["method"], "con
 p1 = meta.get("attachment_1_path", ""); p2 = meta.get("attachment_2_path", "")
 print("  PASS attachments written to the inbox under safe names" if p1 == f"{INBOX}/a1-1-photo.jpg" and open(p1, "rb").read() == photo and open(p2, "rb").read() == notes else f"  FAIL inbox paths {p1} {p2}")
 print("  PASS inbox file is 0600" if oct(os.stat(p1).st_mode & 0o777) == "0o600" else "  FAIL inbox file mode")
+print("  PASS no Matrix id on the tag" if "sender" not in meta and meta["person"] == "Alice" else f"  FAIL sender on the tag: {meta}")
 # 1b: an attachment whose transfer never came (swept from the daemon's spool)
 dsend({"event": dict(base, event_id="$a1b", text="see this", attachments=[{"transfer": "gone-1", "name": "old.pdf", "mime": "application/pdf", "size": 5}])})
 n = mread(); print("notification", "content", repr(n["params"]["content"]))
