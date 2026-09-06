@@ -429,6 +429,34 @@ pub struct Routing {
     groups: Option<usize>,
 }
 
+/// What the daemon knows about a room besides its members: whether the bot's account
+/// marks it as a DM (the inviting client's `is_direct`, which the SDK keeps in the
+/// bot's `m.direct` when it joins), and whether it has a name or an alias, which
+/// clients give to rooms and never to DMs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoomShape {
+    pub direct: bool,
+    pub named: bool,
+}
+
+impl RoomShape {
+    pub const fn default_const() -> RoomShape {
+        RoomShape { direct: false, named: false }
+    }
+    pub const DM: RoomShape = RoomShape { direct: true, named: false };
+    pub const NAMED: RoomShape = RoomShape { direct: false, named: true };
+}
+
+/// Group or one person's room. Two or more registered people make a group whatever
+/// the flags say. With one person the DM flag decides when it is there; without it a
+/// named room is a group and an unnamed one a DM: a two-person room created as a room
+/// carries a name, a DM from a client that forgot the flag carries none, and of the
+/// two possible mistakes a nameless group answered by the person's own mind is the
+/// harmless one, a DM answered by the shared hub is not (decided 2026-09-06).
+fn is_group(people: usize, shape: RoomShape) -> bool {
+    people >= 2 || (!shape.direct && shape.named)
+}
+
 impl Routing {
     pub fn new(config: &Config) -> Routing {
         let mut by_address = HashMap::new();
@@ -531,10 +559,16 @@ impl Routing {
     }
 
     /// Decide who gets an inbound message. `members` are the user ids in the room. The
-    /// session listing the room wins; otherwise a group room (two or more registered
-    /// people) goes to the `groups` session and a DM to the person's session; the
-    /// `all` session takes what is left, and without one the message is dropped.
-    pub fn inbound<'m>(&self, sender: &str, room_id: &str, members: impl IntoIterator<Item = &'m str>) -> Inbound<'_> {
+    /// session listing the room wins; otherwise a group room (see [`is_group`]) goes
+    /// to the `groups` session and a DM to the person's session; the `all` session
+    /// takes what is left, and without one the message is dropped.
+    pub fn inbound<'m>(
+        &self,
+        sender: &str,
+        room_id: &str,
+        members: impl IntoIterator<Item = &'m str>,
+        shape: RoomShape,
+    ) -> Inbound<'_> {
         if self.is_bot(sender) {
             return Inbound::Drop(DropReason::OwnMessage);
         }
@@ -545,7 +579,7 @@ impl Routing {
             Some(&i) => Some(i),
             None => {
                 let (people, _) = self.people_in(members);
-                let specific = if people.len() >= 2 { self.groups } else { self.by_person.get(&person.name).copied() };
+                let specific = if is_group(people.len(), shape) { self.groups } else { self.by_person.get(&person.name).copied() };
                 specific.or(self.all)
             }
         };
@@ -562,13 +596,14 @@ impl Routing {
         session: &str,
         room_id: &str,
         members: impl IntoIterator<Item = &'m str>,
+        shape: RoomShape,
     ) -> Result<(), SendDenied> {
         let Some(&i) = self.by_name.get(session) else {
             return Err(SendDenied::UnknownSession);
         };
         match self.sessions[i].send {
             SendPolicy::Any => Ok(()),
-            SendPolicy::Own => self.owns_room(i, room_id, members),
+            SendPolicy::Own => self.owns_room(i, room_id, members, shape),
         }
     }
 
@@ -580,6 +615,7 @@ impl Routing {
         session: &str,
         room_id: &str,
         members: impl IntoIterator<Item = &'m str>,
+        shape: RoomShape,
     ) -> Result<(), SendDenied> {
         let Some(&i) = self.by_name.get(session) else {
             return Err(SendDenied::UnknownSession);
@@ -587,13 +623,14 @@ impl Routing {
         if self.all == Some(i) {
             return Ok(());
         }
-        self.owns_room(i, room_id, members)
+        self.owns_room(i, room_id, members, shape)
     }
 
     /// A session owns a room it lists, and any room whose members other than the bot
-    /// are all registered people it receives from: everyone for `all`, two or more
-    /// people for `groups`, the listed people otherwise.
-    fn owns_room<'m>(&self, i: usize, room_id: &str, members: impl IntoIterator<Item = &'m str>) -> Result<(), SendDenied> {
+    /// are all registered people it receives from: everyone for `all`, the group rooms
+    /// for `groups`, the DMs of the listed people otherwise (the same rule as the
+    /// routing, so the hub owns a named two-person room and the person's mind does not).
+    fn owns_room<'m>(&self, i: usize, room_id: &str, members: impl IntoIterator<Item = &'m str>, shape: RoomShape) -> Result<(), SendDenied> {
         if self.by_room.get(room_id) == Some(&i) {
             return Ok(());
         }
@@ -601,10 +638,11 @@ impl Routing {
         if people.is_empty() || !all_registered {
             return Err(SendDenied::NotAllowed);
         }
+        let group = is_group(people.len(), shape);
         let owned = match &self.sessions[i].receive {
             Receive::All => true,
-            Receive::Groups => people.len() >= 2,
-            Receive::Selective { people: listed, .. } => people.iter().all(|p| listed.iter().any(|l| l == p)),
+            Receive::Groups => group,
+            Receive::Selective { people: listed, .. } => !group && people.iter().all(|p| listed.iter().any(|l| l == p)),
         };
         if owned {
             Ok(())
@@ -617,6 +655,9 @@ impl Routing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No DM flag, no name: the members alone decide, as before the shape existed.
+    const PLAIN: RoomShape = RoomShape::default_const();
 
     const BASE: &str = r#"
 socket    = "/run/silta/siltad.sock"
@@ -896,20 +937,20 @@ user = "u"
         let dm = ["@alice:silta.test", bot];
         // Room beats person: Alice in the family room goes to the hub.
         assert_eq!(
-            r.inbound("@alice:silta.test", "!family:silta.test", dm),
+            r.inbound("@alice:silta.test", "!family:silta.test", dm, PLAIN),
             Inbound::Deliver { session: "hub", person: &r.people[1] }
         );
         // Person otherwise, through any of their addresses.
         assert_eq!(
-            r.inbound("@alice2:silta.test", "!dm:silta.test", ["@alice2:silta.test", bot]),
+            r.inbound("@alice2:silta.test", "!dm:silta.test", ["@alice2:silta.test", bot], PLAIN),
             Inbound::Deliver { session: "alice", person: &r.people[1] }
         );
         assert_eq!(
-            r.inbound("@bob:silta.test", "!dm2:silta.test", ["@bob:silta.test", bot]),
+            r.inbound("@bob:silta.test", "!dm2:silta.test", ["@bob:silta.test", bot], PLAIN),
             Inbound::Deliver { session: "hub", person: &r.people[0] }
         );
-        assert_eq!(r.inbound("@mallory:silta.test", "!dm:silta.test", dm), Inbound::Drop(DropReason::UnknownSender));
-        assert_eq!(r.inbound("@silta:silta.test", "!dm:silta.test", dm), Inbound::Drop(DropReason::OwnMessage));
+        assert_eq!(r.inbound("@mallory:silta.test", "!dm:silta.test", dm, PLAIN), Inbound::Drop(DropReason::UnknownSender));
+        assert_eq!(r.inbound("@silta:silta.test", "!dm:silta.test", dm, PLAIN), Inbound::Drop(DropReason::OwnMessage));
 
         // Without an `all` session, an unlisted person is dropped.
         let r = Routing::new(&config(
@@ -920,12 +961,12 @@ receive = { people = ["Alice"] }
 user = "u"
 "#,
         ));
-        assert_eq!(r.inbound("@bob:silta.test", "!x:silta.test", ["@bob:silta.test", bot]), Inbound::Drop(DropReason::NoSession));
+        assert_eq!(r.inbound("@bob:silta.test", "!x:silta.test", ["@bob:silta.test", bot], PLAIN), Inbound::Drop(DropReason::NoSession));
 
         // The `all` session is the fallback for everyone registered.
         let r = Routing::new(&config(HUB_ONLY));
-        assert!(matches!(r.inbound("@bob:silta.test", "!any:silta.test", ["@bob:silta.test"]), Inbound::Deliver { session: "hub", .. }));
-        assert!(matches!(r.inbound("@alice:silta.test", "!any:silta.test", ["@alice:silta.test"]), Inbound::Deliver { session: "hub", .. }));
+        assert!(matches!(r.inbound("@bob:silta.test", "!any:silta.test", ["@bob:silta.test"], PLAIN), Inbound::Deliver { session: "hub", .. }));
+        assert!(matches!(r.inbound("@alice:silta.test", "!any:silta.test", ["@alice:silta.test"], PLAIN), Inbound::Deliver { session: "hub", .. }));
         assert_eq!(r.people_for("hub").len(), 2);
     }
 
@@ -936,30 +977,30 @@ user = "u"
         let family = ["@alice:silta.test", "@bob:silta.test", bot];
         let alice_dm = ["@alice:silta.test", bot];
         // Alice's message in the family room reaches the hub, in her DM her mind.
-        assert!(matches!(r.inbound("@alice:silta.test", "!family:silta.test", family), Inbound::Deliver { session: "hub", .. }));
-        assert!(matches!(r.inbound("@alice:silta.test", "!dm:silta.test", alice_dm), Inbound::Deliver { session: "alice", .. }));
+        assert!(matches!(r.inbound("@alice:silta.test", "!family:silta.test", family, PLAIN), Inbound::Deliver { session: "hub", .. }));
+        assert!(matches!(r.inbound("@alice:silta.test", "!dm:silta.test", alice_dm, PLAIN), Inbound::Deliver { session: "alice", .. }));
         // Two addresses of one person are still a DM.
         assert!(matches!(
-            r.inbound("@alice:silta.test", "!dm:silta.test", ["@alice:silta.test", "@alice2:silta.test", bot]),
+            r.inbound("@alice:silta.test", "!dm:silta.test", ["@alice:silta.test", "@alice2:silta.test", bot], PLAIN),
             Inbound::Deliver { session: "alice", .. }
         ));
         // A stranger in the room does not make it a group.
         assert!(matches!(
-            r.inbound("@alice:silta.test", "!odd:silta.test", ["@alice:silta.test", "@mallory:silta.test", bot]),
+            r.inbound("@alice:silta.test", "!odd:silta.test", ["@alice:silta.test", "@mallory:silta.test", bot], PLAIN),
             Inbound::Deliver { session: "alice", .. }
         ));
         // The hub owns the family room and never a DM; a mind owns its DM only.
-        assert_eq!(r.may_send("hub", "!family:silta.test", family), Ok(()));
-        assert_eq!(r.may_read("hub", "!family:silta.test", family), Ok(()));
-        assert_eq!(r.may_send("hub", "!dm:silta.test", alice_dm), Err(SendDenied::NotAllowed));
-        assert_eq!(r.may_read("hub", "!dm:silta.test", alice_dm), Err(SendDenied::NotAllowed));
-        assert_eq!(r.may_send("alice", "!dm:silta.test", alice_dm), Ok(()));
-        assert_eq!(r.may_send("alice", "!family:silta.test", family), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_send("hub", "!family:silta.test", family, PLAIN), Ok(()));
+        assert_eq!(r.may_read("hub", "!family:silta.test", family, PLAIN), Ok(()));
+        assert_eq!(r.may_send("hub", "!dm:silta.test", alice_dm, PLAIN), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_read("hub", "!dm:silta.test", alice_dm, PLAIN), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_send("alice", "!dm:silta.test", alice_dm, PLAIN), Ok(()));
+        assert_eq!(r.may_send("alice", "!family:silta.test", family, PLAIN), Err(SendDenied::NotAllowed));
         // A group room with a stranger belongs to nobody.
-        assert_eq!(r.may_send("hub", "!odd:silta.test", ["@alice:silta.test", "@bob:silta.test", "@mallory:silta.test"]), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_send("hub", "!odd:silta.test", ["@alice:silta.test", "@bob:silta.test", "@mallory:silta.test"], PLAIN), Err(SendDenied::NotAllowed));
         // Without a groups session a group room is dropped, unless an `all` session exists.
         let r = Routing::new(&config(SPLIT));
-        assert!(matches!(r.inbound("@alice:silta.test", "!other:silta.test", family), Inbound::Drop(DropReason::NoSession)));
+        assert!(matches!(r.inbound("@alice:silta.test", "!other:silta.test", family, PLAIN), Inbound::Drop(DropReason::NoSession)));
         // The welcome names the people a session receives from.
         let r = Routing::new(&config(MINDS));
         assert_eq!(r.people_for("alice").iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Alice"]);
@@ -969,24 +1010,55 @@ user = "u"
     }
 
     #[test]
+    fn the_dm_flag_and_the_name_decide_a_one_person_room() {
+        let r = Routing::new(&config(MINDS));
+        let bot = "@silta:silta.test";
+        let bob_and_bot = ["@bob:silta.test", bot];
+        let family = ["@alice:silta.test", "@bob:silta.test", bot];
+        let bob = "@bob:silta.test";
+        // A two-person room created as a room (named, no DM flag) is a group: the hub's.
+        assert!(matches!(r.inbound(bob, "!pair:silta.test", bob_and_bot, RoomShape::NAMED), Inbound::Deliver { session: "hub", .. }));
+        assert_eq!(r.may_send("hub", "!pair:silta.test", bob_and_bot, RoomShape::NAMED), Ok(()));
+        assert_eq!(r.may_read("hub", "!pair:silta.test", bob_and_bot, RoomShape::NAMED), Ok(()));
+        assert_eq!(r.may_send("bob", "!pair:silta.test", bob_and_bot, RoomShape::NAMED), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_read("bob", "!pair:silta.test", bob_and_bot, RoomShape::NAMED), Err(SendDenied::NotAllowed));
+        // A flagged DM is the person's, named or not.
+        for shape in [RoomShape::DM, RoomShape { direct: true, named: true }] {
+            assert!(matches!(r.inbound(bob, "!dm:silta.test", bob_and_bot, shape), Inbound::Deliver { session: "bob", .. }));
+            assert_eq!(r.may_send("bob", "!dm:silta.test", bob_and_bot, shape), Ok(()));
+            assert_eq!(r.may_send("hub", "!dm:silta.test", bob_and_bot, shape), Err(SendDenied::NotAllowed));
+        }
+        // An unflagged, unnamed two-person room is treated as a DM: the safe side.
+        assert!(matches!(r.inbound(bob, "!bare:silta.test", bob_and_bot, PLAIN), Inbound::Deliver { session: "bob", .. }));
+        // Two or more people are a group whatever the flags say.
+        for shape in [PLAIN, RoomShape::DM, RoomShape::NAMED] {
+            assert!(matches!(r.inbound(bob, "!family:silta.test", family, shape), Inbound::Deliver { session: "hub", .. }));
+            assert_eq!(r.may_send("bob", "!family:silta.test", family, shape), Err(SendDenied::NotAllowed));
+        }
+        // A listed room goes where it is listed, whatever its shape.
+        let r = Routing::new(&config(SPLIT));
+        assert!(matches!(r.inbound("@alice:silta.test", "!family:silta.test", ["@alice:silta.test", bot], RoomShape::DM), Inbound::Deliver { session: "hub", .. }));
+    }
+
+    #[test]
     fn send_policy() {
         let r = Routing::new(&config(SPLIT));
         let bot = "@silta:silta.test";
         // `any` may write anywhere.
-        assert_eq!(r.may_send("hub", "!whatever:silta.test", ["@mallory:silta.test", bot]), Ok(()));
+        assert_eq!(r.may_send("hub", "!whatever:silta.test", ["@mallory:silta.test", bot], PLAIN), Ok(()));
         // `own`: Alice's DM is fine, a room with Bob in it is not.
-        assert_eq!(r.may_send("alice", "!dm:silta.test", ["@alice:silta.test", bot]), Ok(()));
+        assert_eq!(r.may_send("alice", "!dm:silta.test", ["@alice:silta.test", bot], PLAIN), Ok(()));
         assert_eq!(
-            r.may_send("alice", "!family:silta.test", ["@alice:silta.test", "@bob:silta.test", bot]),
+            r.may_send("alice", "!family:silta.test", ["@alice:silta.test", "@bob:silta.test", bot], PLAIN),
             Err(SendDenied::NotAllowed)
         );
         assert_eq!(
-            r.may_send("alice", "!x:silta.test", ["@alice:silta.test", "@mallory:silta.test"]),
+            r.may_send("alice", "!x:silta.test", ["@alice:silta.test", "@mallory:silta.test"], PLAIN),
             Err(SendDenied::NotAllowed)
         );
         // A room the bot is alone in is not an own room either.
-        assert_eq!(r.may_send("alice", "!empty:silta.test", [bot]), Err(SendDenied::NotAllowed));
-        assert_eq!(r.may_send("ghost", "!dm:silta.test", [bot]), Err(SendDenied::UnknownSession));
+        assert_eq!(r.may_send("alice", "!empty:silta.test", [bot], PLAIN), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_send("ghost", "!dm:silta.test", [bot], PLAIN), Err(SendDenied::UnknownSession));
 
         // `own` on an explicitly listed room ignores the member list.
         let r = Routing::new(&config(
@@ -998,8 +1070,8 @@ send = "own"
 user = "u"
 "#,
         ));
-        assert_eq!(r.may_send("fam", "!family:silta.test", ["@mallory:silta.test"]), Ok(()));
-        assert_eq!(r.may_send("fam", "!other:silta.test", ["@alice:silta.test"]), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_send("fam", "!family:silta.test", ["@mallory:silta.test"], PLAIN), Ok(()));
+        assert_eq!(r.may_send("fam", "!other:silta.test", ["@alice:silta.test"], PLAIN), Err(SendDenied::NotAllowed));
 
         // An `all` session with `own` may write to any room of registered people.
         let r = Routing::new(&config(
@@ -1011,8 +1083,8 @@ send = "own"
 user = "u"
 "#,
         ));
-        assert_eq!(r.may_send("hub", "!x:silta.test", ["@alice:silta.test", "@bob:silta.test"]), Ok(()));
-        assert_eq!(r.may_send("hub", "!x:silta.test", ["@alice:silta.test", "@mallory:silta.test"]), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_send("hub", "!x:silta.test", ["@alice:silta.test", "@bob:silta.test"], PLAIN), Ok(()));
+        assert_eq!(r.may_send("hub", "!x:silta.test", ["@alice:silta.test", "@mallory:silta.test"], PLAIN), Err(SendDenied::NotAllowed));
     }
 
     #[test]
@@ -1020,18 +1092,18 @@ user = "u"
         let r = Routing::new(&config(SPLIT));
         let bot = "@silta:silta.test";
         // The hub may write into Alice's DM (`any`) but not read it.
-        assert_eq!(r.may_send("hub", "!dm:silta.test", ["@alice:silta.test", bot]), Ok(()));
-        assert_eq!(r.may_read("hub", "!dm:silta.test", ["@alice:silta.test", bot]), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_send("hub", "!dm:silta.test", ["@alice:silta.test", bot], PLAIN), Ok(()));
+        assert_eq!(r.may_read("hub", "!dm:silta.test", ["@alice:silta.test", bot], PLAIN), Err(SendDenied::NotAllowed));
         // It reads the rooms it lists and the rooms of the people it receives from.
-        assert_eq!(r.may_read("hub", "!family:silta.test", ["@alice:silta.test", "@bob:silta.test", bot]), Ok(()));
-        assert_eq!(r.may_read("hub", "!dm2:silta.test", ["@bob:silta.test", bot]), Ok(()));
+        assert_eq!(r.may_read("hub", "!family:silta.test", ["@alice:silta.test", "@bob:silta.test", bot], PLAIN), Ok(()));
+        assert_eq!(r.may_read("hub", "!dm2:silta.test", ["@bob:silta.test", bot], PLAIN), Ok(()));
         // Alice's mind reads her DM only.
-        assert_eq!(r.may_read("alice", "!dm:silta.test", ["@alice:silta.test", bot]), Ok(()));
-        assert_eq!(r.may_read("alice", "!family:silta.test", ["@alice:silta.test", "@bob:silta.test", bot]), Err(SendDenied::NotAllowed));
-        assert_eq!(r.may_read("ghost", "!dm:silta.test", [bot]), Err(SendDenied::UnknownSession));
+        assert_eq!(r.may_read("alice", "!dm:silta.test", ["@alice:silta.test", bot], PLAIN), Ok(()));
+        assert_eq!(r.may_read("alice", "!family:silta.test", ["@alice:silta.test", "@bob:silta.test", bot], PLAIN), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_read("ghost", "!dm:silta.test", [bot], PLAIN), Err(SendDenied::UnknownSession));
 
         // The `all` session reads every room, whoever is in it.
         let r = Routing::new(&config(HUB_ONLY));
-        assert_eq!(r.may_read("hub", "!x:silta.test", ["@alice:silta.test", "@mallory:silta.test"]), Ok(()));
+        assert_eq!(r.may_read("hub", "!x:silta.test", ["@alice:silta.test", "@mallory:silta.test"], PLAIN), Ok(()));
     }
 }

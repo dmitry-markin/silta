@@ -33,7 +33,7 @@ use tracing::{debug, info, warn};
 use crate::{
     content::{self, Body, Media},
     daemon::{Daemon, Dispatch, Shared},
-    outbound::member_ids,
+    outbound::{member_ids, room_shape},
     spool::{self, DownloadError},
 };
 
@@ -87,8 +87,9 @@ async fn on_invite(event: StrippedRoomMemberEvent, room: Room, client: Client, C
 
 /// The routing and replay decisions shared by messages and reactions: the registered
 /// sender, the owning session (a group room goes to the hub, a DM to the person's
-/// mind, so the room's members decide), and whether an earlier run delivered the event
-/// already. `None` means drop, already logged.
+/// mind: the members, the DM flag and the name decide, see `silta::config::is_group`),
+/// and whether an earlier run delivered the event already. `None` means drop, already
+/// logged.
 async fn admit<'a>(daemon: &'a Daemon, room: &Room, sender: &str, event_id: &str, ts: u64, what: &str) -> Option<(&'a str, &'a PersonConfig)> {
     let room_id = room.room_id().as_str();
     // Without the members a group room cannot be told from a DM, and a group room must
@@ -101,7 +102,9 @@ async fn admit<'a>(daemon: &'a Daemon, room: &Room, sender: &str, event_id: &str
             return None;
         }
     };
-    let (session, person) = match daemon.routing.inbound(sender, room_id, members.iter().map(String::as_str)) {
+    let shape = room_shape(room).await;
+    debug!(room = room_id, direct = shape.direct, named = shape.named, members = members.len(), "room shape");
+    let (session, person) = match daemon.routing.inbound(sender, room_id, members.iter().map(String::as_str), shape) {
         Inbound::Drop(reason) => {
             info!(room = room_id, sender, "dropping a {what}: {reason}");
             return None;

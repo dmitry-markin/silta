@@ -22,6 +22,7 @@ use matrix_sdk::{
     Room, RoomMemberships, RoomState,
 };
 use silta::{
+    config::RoomShape,
     protocol::{
         CmdResult, Edit, FetchMessage, FetchMessages, HistoryAttachment, HistoryMessage, React, Reply, ResultError,
         SearchMessages, SendFile, Typing,
@@ -125,11 +126,25 @@ pub async fn member_ids(room: &Room) -> Result<Vec<String>, Fail> {
     Ok(members.iter().map(|m| m.user_id().to_string()).collect())
 }
 
+/// What the routing needs to know about a room besides its members: the DM flag the
+/// SDK keeps in the bot's `m.direct` (set when the bot joined an invite marked
+/// `is_direct`), and whether the room has a name or an alias. A store failure on the
+/// flag counts as "no flag", which the rule treats as the DM side when the room is
+/// unnamed, and is logged.
+pub async fn room_shape(room: &Room) -> RoomShape {
+    let direct = room.is_direct().await.unwrap_or_else(|err| {
+        warn!(room = %room.room_id(), "cannot read the DM flag: {err}");
+        false
+    });
+    RoomShape { direct, named: room.name().is_some() || room.canonical_alias().is_some() }
+}
+
 /// A room the session's send policy allows.
 async fn writable_room(daemon: &Daemon, session: &str, room_id: &str) -> Result<Room, Fail> {
     let room = joined_room(daemon, room_id)?;
     let members = member_ids(&room).await?;
-    if daemon.routing.may_send(session, room.room_id().as_str(), members.iter().map(String::as_str)).is_err() {
+    let shape = room_shape(&room).await;
+    if daemon.routing.may_send(session, room.room_id().as_str(), members.iter().map(String::as_str), shape).is_err() {
         warn!(session, room = %room.room_id(), "send refused by policy");
         return Err((ResultError::RoomNotAllowed, format!("session {session} may not send to {}", room.room_id())));
     }
@@ -140,7 +155,8 @@ async fn writable_room(daemon: &Daemon, session: &str, room_id: &str) -> Result<
 async fn readable_room(daemon: &Daemon, session: &str, room_id: &str) -> Result<Room, Fail> {
     let room = joined_room(daemon, room_id)?;
     let members = member_ids(&room).await?;
-    if daemon.routing.may_read(session, room.room_id().as_str(), members.iter().map(String::as_str)).is_err() {
+    let shape = room_shape(&room).await;
+    if daemon.routing.may_read(session, room.room_id().as_str(), members.iter().map(String::as_str), shape).is_err() {
         warn!(session, room = %room.room_id(), "history refused by policy");
         return Err((ResultError::RoomNotAllowed, format!("session {session} may not read {}", room.room_id())));
     }
