@@ -26,11 +26,12 @@ use matrix_sdk::{
 use silta::{
     protocol::{
         CmdResult, Edit, FetchMessage, FetchMessages, HistoryAttachment, HistoryMessage, React, Reply, ResultError,
-        SendFile,
+        SearchMessages, SendFile,
     },
     text::chunk_text,
     time::rfc3339_utc,
 };
+use regex::RegexBuilder;
 use tracing::{info, warn};
 
 use crate::{
@@ -71,6 +72,13 @@ pub async fn send_file(daemon: &Daemon, session: &str, id: u64, cmd: SendFile) -
 pub async fn fetch_messages(daemon: &Daemon, session: &str, id: u64, cmd: FetchMessages) -> CmdResult {
     match do_fetch_messages(daemon, session, cmd).await {
         Ok((messages, more)) => CmdResult::history(id, messages, more),
+        Err((code, message)) => CmdResult::err(id, code, message),
+    }
+}
+
+pub async fn search_messages(daemon: &Daemon, session: &str, id: u64, cmd: SearchMessages) -> CmdResult {
+    match do_search_messages(daemon, session, cmd).await {
+        Ok(scan) => CmdResult::history(id, scan.messages, scan.more).with_scan(scan.scanned, scan.until),
         Err((code, message)) => CmdResult::err(id, code, message),
     }
 }
@@ -335,21 +343,43 @@ async fn do_send_file(daemon: &Daemon, session: &str, cmd: SendFile) -> Result<O
 /// Raw pages read for one history command at most, so a room full of reactions
 /// cannot keep the daemon paging.
 const HISTORY_MAX_PAGES: usize = 5;
+/// A search reads bigger pages and more of them: up to 1000 events per call.
+const SEARCH_PAGE: u32 = 100;
+const SEARCH_MAX_PAGES: usize = 10;
 
-/// Page backwards until at least `limit` messages are collected or the history ends.
-/// A server-side type filter would not do: in an encrypted room every event is
+/// What a backward scan of a room's history produced.
+struct Scan {
+    messages: Vec<HistoryMessage>,
+    /// The token to continue from, absent once the start of the room was reached.
+    more: Option<String>,
+    /// Events examined, messages or not.
+    scanned: u64,
+    /// The timestamp of the oldest event examined.
+    until: Option<String>,
+}
+
+/// Page backwards from `from` (or the end of the room) collecting the messages `keep`
+/// accepts, until `wanted` are collected, `max_pages` pages are read, or the history
+/// ends. A server-side type filter would not do: in an encrypted room every event is
 /// `m.room.encrypted` on the server, and conduit ignores the filter anyway. The last
-/// page is returned whole, so a call may bring a few more than `limit`.
-async fn do_fetch_messages(daemon: &Daemon, session: &str, cmd: FetchMessages) -> Result<(Vec<HistoryMessage>, Option<String>), Fail> {
-    let room = readable_room(daemon, session, &cmd.room_id).await?;
-    let limit = cmd.limit.unwrap_or(HISTORY_DEFAULT).clamp(1, HISTORY_MAX);
-    let mut from = cmd.from;
+/// page is used whole, so a call may bring a few more than `wanted`.
+async fn scan_history(
+    daemon: &Daemon,
+    room: &Room,
+    from: Option<String>,
+    page_size: u32,
+    wanted: usize,
+    max_pages: usize,
+    mut keep: impl FnMut(&mut HistoryMessage) -> bool,
+) -> Result<Scan, Fail> {
+    let mut from = from;
     let mut out = Vec::new();
-    let mut skipped = 0usize;
+    let mut scanned = 0u64;
+    let mut until = None;
     let mut pages = 0usize;
     let more = loop {
         let mut options = MessagesOptions::backward();
-        options.limit = UInt::from(limit);
+        options.limit = UInt::from(page_size);
         options.from = from.take();
         let page = room
             .messages(options)
@@ -357,20 +387,56 @@ async fn do_fetch_messages(daemon: &Daemon, session: &str, cmd: FetchMessages) -
             .map_err(|e| (ResultError::SendFailed, format!("history request for {} failed: {e}", room.room_id())))?;
         pages += 1;
         for event in &page.chunk {
-            match history_message(daemon, event) {
-                Some(message) => out.push(message),
-                None => skipped += 1,
+            scanned += 1;
+            if let Ok(any) = event.raw().deserialize() {
+                until = Some(rfc3339_utc(any.origin_server_ts().get().into()));
+            }
+            if let Some(mut message) = history_message(daemon, event) {
+                if keep(&mut message) {
+                    out.push(message);
+                }
             }
         }
         match page.end {
             None => break None,
             Some(_) if page.chunk.is_empty() => break None,
-            Some(end) if out.len() >= limit as usize || pages >= HISTORY_MAX_PAGES => break Some(end),
+            Some(end) if out.len() >= wanted || pages >= max_pages => break Some(end),
             Some(end) => from = Some(end),
         }
     };
-    info!(session, room = %room.room_id(), count = out.len(), skipped, pages, more = more.is_some(), "history fetched");
-    Ok((out, more))
+    Ok(Scan { messages: out, more, scanned, until })
+}
+
+async fn do_fetch_messages(daemon: &Daemon, session: &str, cmd: FetchMessages) -> Result<(Vec<HistoryMessage>, Option<String>), Fail> {
+    let room = readable_room(daemon, session, &cmd.room_id).await?;
+    let limit = cmd.limit.unwrap_or(HISTORY_DEFAULT).clamp(1, HISTORY_MAX);
+    let scan = scan_history(daemon, &room, cmd.from, limit, limit as usize, HISTORY_MAX_PAGES, |_| true).await?;
+    info!(session, room = %room.room_id(), count = scan.messages.len(), scanned = scan.scanned, more = scan.more.is_some(), "history fetched");
+    Ok((scan.messages, scan.more))
+}
+
+/// Search with a regular expression over the text and the attachment names. The regex
+/// crate matches in linear time, so no pattern can stall the daemon; an invalid one is
+/// a bad request with the parser's message.
+async fn do_search_messages(daemon: &Daemon, session: &str, cmd: SearchMessages) -> Result<Scan, Fail> {
+    let regex = RegexBuilder::new(&cmd.pattern)
+        .case_insensitive(true)
+        .size_limit(1 << 20)
+        .build()
+        .map_err(|e| bad(format!("invalid regular expression: {e}")))?;
+    let limit = cmd.limit.unwrap_or(HISTORY_DEFAULT).clamp(1, HISTORY_MAX);
+    let room = readable_room(daemon, session, &cmd.room_id).await?;
+    let scan = scan_history(daemon, &room, cmd.from, SEARCH_PAGE, limit as usize, SEARCH_MAX_PAGES, |m| {
+        if let Some(found) = regex.find(&m.text) {
+            m.match_start = Some(m.text[..found.start()].chars().count());
+            true
+        } else {
+            m.attachments.iter().any(|a| regex.is_match(&a.name))
+        }
+    })
+    .await?;
+    info!(session, room = %room.room_id(), pattern = %cmd.pattern, matches = scan.messages.len(), scanned = scan.scanned, more = scan.more.is_some(), "history searched");
+    Ok(scan)
 }
 
 /// One message by id, whole, under the same ownership rule as history. The SDK fetches
@@ -418,6 +484,7 @@ fn history_message(daemon: &Daemon, event: &matrix_sdk::deserialized_responses::
         in_reply_to: parsed.in_reply_to,
         thread: parsed.thread,
         text,
+        match_start: None,
         attachments,
     })
 }

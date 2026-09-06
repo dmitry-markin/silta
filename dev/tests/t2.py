@@ -150,6 +150,19 @@ ok(r["ok"] and m1.get("person") == "Alice" and m1.get("text") == "a picture" and
 r = cmd("fetch_message", room_id=dm, event_id="$nonexistent:localhost"); ok(r.get("error") == "not_found", "unknown event: not_found")
 r = cmd("fetch_message", room_id=dm, event_id=reaction_eid); ok(r.get("error") == "not_found", "a reaction is not a message: not_found")
 r = cmd("fetch_message", room_id=family, event_id=eid_photo); ok(r.get("error") == "room_not_allowed", "a room the session does not own: room_not_allowed")
+
+print("12. search with a regular expression")
+alice("send", dm, "reminder to self: the secret token is Q7X-ALPHA, do not lose it"); event()
+r = cmd("search_messages", room_id=dm, pattern=r"q7x-\w+"); m = r.get("messages") or []
+ok(r["ok"] and m and "Q7X-ALPHA" in m[0]["text"] and m[0].get("match_start") == 38 and m[0].get("person") == "Alice", "case-insensitive match with its offset")
+ok(r.get("scanned", 0) > 0 and r.get("until"), "scan count and oldest timestamp reported")
+r = cmd("search_messages", room_id=dm, pattern="^z{3000}$"); m = r.get("messages") or []
+ok(r["ok"] and m and m[0].get("own") and m[0]["event_id"] == long_eid, "anchored pattern finds the bot's long message")
+r = cmd("search_messages", room_id=dm, pattern=r"shapes\.png"); m = r.get("messages") or []
+ok(r["ok"] and m and any(a["name"] == "shapes.png" for x in m for a in x["attachments"]), "attachment names are searched")
+r = cmd("search_messages", room_id=dm, pattern="NOPE_[0-9]{9}"); ok(r["ok"] and not r.get("messages") and r.get("more") is None, "no match, scanned to the start of the room")
+r = cmd("search_messages", room_id=dm, pattern="("); ok(r.get("error") == "bad_request" and "regular expression" in (r.get("message") or ""), "invalid pattern: bad_request")
+r = cmd("search_messages", room_id=family, pattern="x"); ok(r.get("error") == "room_not_allowed", "a room the session does not own: room_not_allowed")
 time.sleep(4)
 watch.terminate(); watch.wait(timeout=10); watch_out.close()
 print("--- watch (Alice's view, last 16 lines) ---")

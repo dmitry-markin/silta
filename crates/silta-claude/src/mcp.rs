@@ -14,7 +14,9 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
-use silta::protocol::{CmdKind, Edit, Event, EventKind, FetchMessage, FetchMessages, HistoryMessage, React, Reply, SendFile};
+use silta::protocol::{
+    CmdKind, Edit, Event, EventKind, FetchMessage, FetchMessages, HistoryMessage, React, Reply, SearchMessages, SendFile,
+};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -38,8 +40,8 @@ Tools: reply sends text; react sends an emoji, as the whole answer or as a mark 
 have seen a message before a long task; edit_message replaces one of your own messages, only \
 when a correction or a progress update makes the chat clearer; send_file sends a file from \
 this host; fetch_messages reads recent room history when something has fallen out of your \
-context, with long texts shortened, and fetch_message reads one message whole by its event \
-id. Terminal output never reaches the sender. After a tool has sent something, end the \
+context, with long texts shortened; search_messages searches it with a regular expression; \
+fetch_message reads one message whole by its event id. Terminal output never reaches the sender. After a tool has sent something, end the \
 turn without restating it.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -111,6 +113,20 @@ pub struct FetchMessageParams {
     pub room_id: String,
     /// The message: an event_id from a fetch_messages line or a channel tag.
     pub event_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchMessagesParams {
+    /// The room: the room_id attribute of the channel tag.
+    pub room_id: String,
+    /// A regular expression (Rust regex syntax). Case-insensitive unless it starts with (?-i).
+    pub pattern: String,
+    /// Matches wanted, newest first. Default 20, at most 100.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// The `more` token of an earlier result, to continue the scan further back. Optional.
+    #[serde(default)]
+    pub from: Option<String>,
 }
 
 #[derive(Clone)]
@@ -192,6 +208,37 @@ impl SiltaChannel {
     }
 
     #[tool(
+        name = "search_messages",
+        description = "Search a room's history with a regular expression, newest first: the message texts and attachment names, case-insensitive unless the pattern turns it off with (?-i). Use alternation, character classes and \\b freely, and escape literal punctuation. Returns up to `limit` matches (default 20, at most 100) as lines like fetch_messages, each text windowed around its first match, then a line saying how many events were scanned and back to when, and `more: <token>` when the scan stopped before the start of the room (pass it as `from` to continue; a call scans at most 1000 events). Fails with bad_request for an invalid pattern and room_not_allowed when this session does not own the room."
+    )]
+    async fn search_messages(&self, Parameters(p): Parameters<SearchMessagesParams>) -> Result<CallToolResult, McpError> {
+        let kind = CmdKind::SearchMessages(SearchMessages { room_id: p.room_id, pattern: p.pattern, limit: p.limit, from: p.from });
+        match self.daemon.command(kind).await {
+            Ok(result) => {
+                let messages = result.messages.unwrap_or_default();
+                let mut lines: Vec<String> = messages.iter().map(|m| history_line(m, Some(HISTORY_TEXT_CHARS))).collect();
+                if lines.is_empty() {
+                    lines.push("(no matches)".to_owned());
+                }
+                lines.push(format!(
+                    "scanned {} events back to {}",
+                    result.scanned.unwrap_or(0),
+                    result.until.unwrap_or_else(|| "(nothing)".to_owned())
+                ));
+                match result.more {
+                    Some(token) => lines.push(format!("more: {token}")),
+                    None => lines.push("(searched back to the start of the room's history)".to_owned()),
+                }
+                Ok(CallToolResult::success(vec![ContentBlock::text(lines.join("\n"))]))
+            }
+            Err(err) => {
+                warn!("search_messages failed: {err}");
+                Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]))
+            }
+        }
+    }
+
+    #[tool(
         name = "fetch_message",
         description = "Fetch one message whole by its event id (from a fetch_messages line or a channel tag): the same fields as fetch_messages, with the full text. Use it after fetch_messages when you need the whole text of a shortened message. Fails with not_found when the event does not exist or is not a message from a registered person or yourself, and with room_not_allowed when this session does not own the room."
     )]
@@ -249,8 +296,19 @@ fn history_line(m: &HistoryMessage, max_chars: Option<usize>) -> String {
     }
     let chars = m.text.chars().count();
     if let Some(max) = max_chars.filter(|&max| chars > max) {
-        let head: String = m.text.chars().take(max).collect();
-        line.insert("text".into(), json!(format!("{head}… [{} more characters]", chars - max)));
+        // A window around the first match when there is one, the start otherwise.
+        let start = m.match_start.map(|at| at.saturating_sub(max / 3).min(chars - max)).unwrap_or(0);
+        let window: String = m.text.chars().skip(start).take(max).collect();
+        let after = chars - start - max;
+        let mut text = String::new();
+        if start > 0 {
+            text.push_str(&format!("[{start} characters] …"));
+        }
+        text.push_str(&window);
+        if after > 0 {
+            text.push_str(&format!("… [{after} more characters]"));
+        }
+        line.insert("text".into(), json!(text));
     } else {
         line.insert("text".into(), json!(m.text));
     }
@@ -391,6 +449,7 @@ mod tests {
             in_reply_to: None,
             thread: Some("$root".into()),
             text: "ж".repeat(1000),
+            match_start: None,
             attachments: vec![HistoryAttachment { name: "a.pdf".into(), mime: "application/pdf".into(), size: 10 }],
         };
         let whole: serde_json::Value = serde_json::from_str(&history_line(&long, None)).unwrap();
@@ -403,6 +462,33 @@ mod tests {
         assert_eq!(v["text"].as_str().unwrap().chars().count(), 300 + "… [700 more characters]".chars().count());
         assert_eq!(v["attachments"][0], "a.pdf (application/pdf, 10 bytes)");
         assert_eq!(v["thread"], "$root");
+    }
+
+    #[test]
+    fn search_hits_are_windowed_around_the_match() {
+        let mut m = HistoryMessage {
+            event_id: "$e".into(),
+            sender: "@alice:x".into(),
+            person: Some("Alice".into()),
+            role: None,
+            own: false,
+            ts: "t".into(),
+            in_reply_to: None,
+            thread: None,
+            text: format!("{}NEEDLE{}", "a".repeat(1000), "b".repeat(1000)),
+            match_start: Some(1000),
+            attachments: Vec::new(),
+        };
+        let v: serde_json::Value = serde_json::from_str(&history_line(&m, Some(300))).unwrap();
+        let text = v["text"].as_str().unwrap();
+        assert!(text.starts_with("[900 characters] …a"), "{text}");
+        assert!(text.contains("NEEDLE"));
+        assert!(text.ends_with("… [806 more characters]"), "{text}");
+        // A match near the end still gets a full window.
+        m.match_start = Some(2000);
+        let v: serde_json::Value = serde_json::from_str(&history_line(&m, Some(300))).unwrap();
+        let text = v["text"].as_str().unwrap();
+        assert!(text.starts_with("[1706 characters] …") && text.ends_with('b') && !text.contains("more characters"), "{text}");
     }
 
     #[test]

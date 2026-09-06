@@ -36,7 +36,7 @@ pub struct Config {
     /// Attachments larger than this are not downloaded; the message says so instead.
     #[serde(default = "default_inbox_max_file_mb")]
     pub inbox_max_file_mb: u64,
-    /// Reserved for later; accepted and ignored with a warning.
+    /// Reserved for speech recognition; accepted and ignored with a warning.
     #[serde(default)]
     pub asr: Option<toml::Value>,
 }

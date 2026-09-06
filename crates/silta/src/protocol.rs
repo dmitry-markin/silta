@@ -174,6 +174,7 @@ pub enum CmdKind {
     SendFile(SendFile),
     FetchMessages(FetchMessages),
     FetchMessage(FetchMessage),
+    SearchMessages(SearchMessages),
 }
 
 impl CmdKind {
@@ -185,6 +186,7 @@ impl CmdKind {
             CmdKind::SendFile(_) => "send_file",
             CmdKind::FetchMessages(_) => "fetch_messages",
             CmdKind::FetchMessage(_) => "fetch_message",
+            CmdKind::SearchMessages(_) => "search_messages",
         }
     }
 }
@@ -251,6 +253,20 @@ pub struct FetchMessage {
     pub event_id: String,
 }
 
+/// Search a room's history with a regular expression, newest first. The daemon scans
+/// pages of history; `from` continues a scan that stopped before the start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchMessages {
+    pub room_id: String,
+    /// Rust regex syntax; case-insensitive unless the pattern turns it off.
+    pub pattern: String,
+    /// Matches wanted; default 20, at most 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
 /// The daemon's answer to a command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CmdResult {
@@ -262,13 +278,19 @@ pub struct CmdResult {
     pub error: Option<ResultError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// `fetch_messages`: the messages, newest first.
+    /// `fetch_messages`, `fetch_message`, `search_messages`: the messages, newest first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<HistoryMessage>>,
-    /// `fetch_messages`: pass as `from` to page further back; absent at the start
-    /// of the room's history.
+    /// `fetch_messages`, `search_messages`: pass as `from` to page or scan further
+    /// back; absent once the start of the room's history was reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub more: Option<String>,
+    /// `search_messages`: how many events the scan examined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanned: Option<u64>,
+    /// `search_messages`: the timestamp of the oldest event examined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
 }
 
 impl CmdResult {
@@ -281,11 +303,29 @@ impl CmdResult {
             message: None,
             messages: None,
             more: None,
+            scanned: None,
+            until: None,
         }
     }
 
     pub fn history(id: u64, messages: Vec<HistoryMessage>, more: Option<String>) -> Self {
-        Self { id, ok: true, event_id: None, error: None, message: None, messages: Some(messages), more }
+        Self {
+            id,
+            ok: true,
+            event_id: None,
+            error: None,
+            message: None,
+            messages: Some(messages),
+            more,
+            scanned: None,
+            until: None,
+        }
+    }
+
+    pub fn with_scan(mut self, scanned: u64, until: Option<String>) -> Self {
+        self.scanned = Some(scanned);
+        self.until = until;
+        self
     }
 
     pub fn err(id: u64, error: ResultError, message: impl Into<String>) -> Self {
@@ -297,6 +337,8 @@ impl CmdResult {
             message: Some(message.into()),
             messages: None,
             more: None,
+            scanned: None,
+            until: None,
         }
     }
 }
@@ -319,6 +361,10 @@ pub struct HistoryMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
     pub text: String,
+    /// `search_messages`: the character offset of the first match in `text`, when the
+    /// text matched (an attachment name may have matched instead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_start: Option<usize>,
     /// Listed, not downloaded.
     pub attachments: Vec<HistoryAttachment>,
 }
@@ -550,6 +596,23 @@ mod tests {
         assert_eq!(cmd.kind.name(), "fetch_message");
         let CmdKind::FetchMessage(f) = cmd.kind else { panic!("not fetch_message") };
         assert_eq!(f.event_id, "$e");
+
+        let msg = roundtrip_client(r#"{"cmd":{"id":8,"search_messages":{"room_id":"!r","pattern":"code word is \\w+","limit":5,"from":"t9"}}}"#);
+        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        assert_eq!(cmd.kind.name(), "search_messages");
+        let CmdKind::SearchMessages(s) = cmd.kind else { panic!("not search_messages") };
+        assert_eq!(s.pattern, r"code word is \w+");
+        assert_eq!(s.limit, Some(5));
+    }
+
+    #[test]
+    fn search_result() {
+        let json = r#"{"result":{"id":8,"ok":true,"messages":[{"event_id":"$e","sender":"@alice:x","person":"Alice","role":"family","own":false,"ts":"t","text":"the code word is PELICAN","match_start":4,"attachments":[]}],"more":"t3","scanned":250,"until":"2026-09-01T00:00:00Z"}}"#;
+        let DaemonMessage::Result(r) = roundtrip_daemon(json) else { panic!("not result") };
+        assert_eq!(r.messages.as_ref().unwrap()[0].match_start, Some(4));
+        assert_eq!(r.scanned, Some(250));
+        let built = CmdResult::history(8, r.messages.clone().unwrap(), Some("t3".into())).with_scan(250, Some("2026-09-01T00:00:00Z".into()));
+        assert_eq!(built, r);
     }
 
     #[test]

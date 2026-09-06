@@ -3492,6 +3492,7 @@ dependencies = [
  "clap",
  "matrix-sdk",
  "mime_guess",
+ "regex",
  "serde",
  "serde_json",
  "silta",
