@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Adds one Silta session (a "mind") to this host:  silta-session-add <name>
+#
+# As root. Creates the system user silta-<name> in the silta group with
+# /var/lib/silta/<name> as its home and the workspace below it, registers the packaged
+# marketplace and installs the silta-claude plugin at project scope as that user,
+# enables and starts silta-session@<name>.service, and prints the [[sessions]] entry
+# for /etc/silta/siltad.toml. Safe to run again for an existing mind: it reinstalls the
+# plugin (after a package upgrade, say) and restarts the unit.
+set -euo pipefail
+name="${1:-}"
+if [ -z "$name" ] || ! [[ "$name" =~ ^[a-z][a-z0-9-]*$ ]]; then
+  echo "usage: silta-session-add <name>    (lowercase letters, digits and hyphens: the session name in siltad.toml)" >&2
+  exit 2
+fi
+[ "$(id -u)" = 0 ] || { echo "silta-session-add: run as root" >&2; exit 1; }
+user="silta-$name"
+home="/var/lib/silta/$name"
+workspace="$home/workspace"
+claude=/opt/claude/.local/bin/claude
+marketplace=/usr/share/silta/marketplace
+if [ ! -x "$claude" ]; then
+  echo "silta-session-add: $claude is missing; install Claude Code once, as the claude user:" >&2
+  echo "  runuser -u claude -- bash -c 'curl -fsSL https://claude.ai/install.sh | bash'" >&2
+  exit 1
+fi
+[ -r /etc/silta/oauth-token ] || echo "warning: /etc/silta/oauth-token is missing; the session cannot authenticate until it exists (claude setup-token)" >&2
+
+if getent passwd "$user" > /dev/null; then
+  echo "user $user exists"
+else
+  useradd --system --home-dir "$home" --create-home --shell /usr/sbin/nologin --user-group --groups silta "$user"
+  echo "created user $user with home $home"
+fi
+usermod -aG silta "$user"
+chmod 0700 "$home"
+chown "$user:$user" "$home"
+install -d -m 0700 -o "$user" -g "$user" "$workspace" "$workspace/inbox" "$workspace/out"
+
+# As the session's user, with only what Claude Code needs in the environment.
+as_user() { runuser -u "$user" -- env -i HOME="$home" PATH=/usr/bin:/bin DISABLE_AUTOUPDATER=1 "$@"; }
+(
+  cd "$workspace"
+  as_user "$claude" plugin marketplace remove silta-local > /dev/null 2>&1 || true
+  as_user "$claude" plugin marketplace add "$marketplace"
+  as_user "$claude" plugin uninstall silta-claude@silta-local > /dev/null 2>&1 || true
+  as_user "$claude" plugin install silta-claude@silta-local --scope project
+)
+echo "plugin silta-claude installed for $user in $workspace"
+
+systemctl daemon-reload
+systemctl enable "silta-session@$name.service" > /dev/null
+systemctl restart "silta-session@$name.service"
+echo "silta-session@$name.service enabled and started"
+cat <<EOT
+
+Give the daemon the session in /etc/silta/siltad.toml (a personal mind below; the hub
+is receive = "groups"), then: systemctl restart siltad
+
+[[sessions]]
+name = "$name"
+receive = { people = ["<Person>"] }
+user = "$user"
+EOT

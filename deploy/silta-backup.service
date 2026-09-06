@@ -1,0 +1,45 @@
+# A consistent copy of the daemon's store into /var/backups/silta, daily from the
+# timer; the daemon may be running (VACUUM INTO reads one snapshot of each database).
+# Seven copies are kept. To restore: stop siltad, copy the files of one directory into
+# /var/lib/siltad (the *.sqlite3 into store/, without any -wal or -shm), start siltad.
+[Unit]
+Description=silta store backup
+
+[Service]
+Type=oneshot
+User=silta
+Group=silta
+StateDirectory=siltad
+StateDirectoryMode=0700
+ReadWritePaths=/var/backups/silta
+LoadCredential=siltad.toml:/etc/silta/siltad.toml
+ExecStart=/usr/bin/siltad --config %d/siltad.toml backup --to /var/backups/silta --keep 7
+
+# The daemon's hardening, without the network.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native

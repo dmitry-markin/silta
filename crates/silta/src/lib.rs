@@ -3,6 +3,7 @@
 //! framing, files over the socket, and small text helpers. Everything here is pure and unit-tested; the
 //! network and Matrix code lives in the binaries.
 
+pub mod alert;
 pub mod backlog;
 pub mod config;
 pub mod line;

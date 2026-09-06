@@ -3,9 +3,14 @@
 use std::{collections::HashMap, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use silta::config::{Config, Routing};
-use siltad::{daemon::Daemon, matrix, server, session, spool::{self, Spool}};
+use siltad::{
+    alert, backup,
+    daemon::{now_ms, Daemon, Settings},
+    matrix, server, session,
+    spool::{self, Spool},
+};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -19,6 +24,21 @@ struct Args {
     /// Configuration file.
     #[arg(long, default_value = "/etc/silta/siltad.toml")]
     config: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Copy the store consistently into a dated directory under --to (the daemon may
+    /// be running) and remove the oldest copies beyond --keep.
+    Backup {
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long, default_value_t = 7)]
+        keep: usize,
+    },
 }
 
 #[tokio::main]
@@ -44,13 +64,17 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> anyhow::Result<()> {
     let config = Config::load(&args.config)?;
+    if let Some(Command::Backup { to, keep }) = args.command {
+        backup::run(&config.state_dir, &to, keep, &backup::stamp(now_ms()))?;
+        return Ok(());
+    }
     for warning in config.warnings() {
         warn!("{warning}");
     }
     let routing = Routing::new(&config);
     let users = resolve_users(&routing)?;
     info!(
-        "siltad {} starting: {} people, {} sessions ({}), replay window {} s, attachments up to {} MB, inbox files kept {} days, socket {}",
+        "siltad {} starting: {} people, {} sessions ({}), replay window {} s, attachments up to {} MB, inbox files kept {} days, owner alerts after {} s, socket {}",
         env!("CARGO_PKG_VERSION"),
         config.people.len(),
         config.sessions.len(),
@@ -58,6 +82,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         config.replay_window_secs,
         config.attachment_max_mb,
         config.inbox_max_age_days,
+        config.alert_grace_secs,
         config.socket.display()
     );
     let client = session::build_client(&config.matrix.homeserver_url, &config.state_dir).await?;
@@ -76,19 +101,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     let spool = Spool::new(&config.state_dir, config.attachment_max_mb.saturating_mul(1024 * 1024));
     spool.prepare()?;
-    let daemon = Arc::new(Daemon::new(
-        client,
-        routing,
-        &config.state_dir,
-        config.replay_window_secs,
-        spool,
-        config.inbox_max_age_days,
-        users,
-    ));
+    let (silence_tx, silence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let settings = Settings {
+        replay_window_secs: config.replay_window_secs,
+        inbox_max_age_days: config.inbox_max_age_days,
+        alert_grace_secs: config.alert_grace_secs,
+    };
+    let daemon = Arc::new(Daemon::new(client, routing, &config.state_dir, spool, users, settings, silence_tx));
     matrix::register_handlers(&daemon);
 
     let cancel = CancellationToken::new();
     spool::spawn_sweeper(daemon.spool.clone(), cancel.clone());
+    alert::spawn_watcher(daemon.clone(), silence_rx, cancel.clone());
     tokio::spawn({
         let cancel = cancel.clone();
         async move {

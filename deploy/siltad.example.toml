@@ -1,0 +1,52 @@
+# siltad configuration. Installed as /etc/silta/siltad.toml, root-owned and mode 0600:
+# systemd hands it to the daemon as a credential, and no session can read it (every
+# session's user is in the silta group for the socket, so a group-readable file would
+# not do). After an edit: systemctl restart siltad
+
+# socket    = "/run/siltad/siltad.sock"   # the defaults, matching the units
+# state_dir = "/var/lib/siltad"
+replay_window_secs = 7200   # a message waits this long for its session, or is replayed after
+                            # a daemon restart, before it is dropped; a late answer beats a
+                            # lost one
+# inbox_max_age_days = 30   # a session's plugin deletes received files older than this
+# attachment_max_mb  = 100  # larger attachments are not downloaded or accepted
+# alert_grace_secs   = 600  # a session away this long, or silent this long after a
+                            # message, is reported to the owner's DM; 0 turns the alerts off
+
+[matrix]
+homeserver_url = "https://matrix.example.org"
+user_id        = "@silta:example.org"
+password       = "CHANGE-ME"      # used only for the first login; the saved session is used afterwards
+device_id      = "silta"        # the bot's one and only device
+device_name    = "Silta"
+
+# The people registry is the allowlist: nobody else reaches a session. The owner gets
+# the daemon's alerts in their DM.
+[[people]]
+name = "Bob"
+role = "owner"
+addresses = ["@bob:example.org"]
+
+[[people]]
+name = "Alice"
+role = "family"
+addresses = ["@alice:example.org"]
+
+# One session per person plus the hub for the shared rooms. `user` is the Unix user the
+# session's plugin connects as (silta-session-add creates silta-<name>); the daemon
+# refuses any other.
+[[sessions]]
+name = "hub"
+receive = "groups"
+send = "own"
+user = "silta-hub"
+
+[[sessions]]
+name = "bob"
+receive = { people = ["Bob"] }
+user = "silta-bob"
+
+[[sessions]]
+name = "alice"
+receive = { people = ["Alice"] }
+user = "silta-alice"

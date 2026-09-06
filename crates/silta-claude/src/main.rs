@@ -31,7 +31,7 @@ struct Args {
     session: String,
 
     /// Path of the daemon's Unix socket.
-    #[arg(long, env = "SILTA_SOCKET", default_value = "/run/silta/siltad.sock")]
+    #[arg(long, env = "SILTA_SOCKET", default_value = silta::config::DEFAULT_SOCKET)]
     socket: PathBuf,
 
     /// Directory attachments are written to, created if missing; relative to the

@@ -1,0 +1,40 @@
+#!/bin/sh
+# postinst for silta: users, directories, units. The daemon is enabled but not started
+# on a first install (the configuration has no password yet); an upgrade restarts a
+# running daemon. Session instances are never touched here: a session restart rewrites
+# its whole context, so it stays a deliberate step (silta-session-add <name>).
+set -e
+
+case "$1" in
+  configure)
+    systemd-sysusers silta.conf
+    systemd-tmpfiles --create silta.conf
+    if [ -d /run/systemd/system ]; then
+      systemctl --system daemon-reload >/dev/null || true
+      for unit in siltad.service silta-backup.timer; do
+        deb-systemd-helper unmask "$unit" >/dev/null || true
+        if deb-systemd-helper --quiet was-enabled "$unit"; then
+          deb-systemd-helper enable "$unit" >/dev/null || true
+        else
+          deb-systemd-helper update-state "$unit" >/dev/null || true
+        fi
+      done
+      deb-systemd-invoke start silta-backup.timer >/dev/null || true
+      if [ -n "$2" ]; then
+        deb-systemd-invoke try-restart siltad.service >/dev/null || true
+      else
+        cat <<'NOTE'
+silta: next steps, as root
+  1. install Claude Code once, as the claude user:
+       runuser -u claude -- bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+  2. edit /etc/silta/siltad.toml: the homeserver, the bot's password, the people, the sessions
+  3. install -m 0600 /dev/stdin /etc/silta/oauth-token    # paste the output of: claude setup-token
+  4. systemctl start siltad
+  5. silta-session-add hub, then silta-session-add <name> for each person
+See /usr/share/doc/silta/README.md.
+NOTE
+      fi
+    fi
+    ;;
+esac
+exit 0

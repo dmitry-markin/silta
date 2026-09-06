@@ -1,0 +1,17 @@
+#!/bin/sh
+# postrm for silta: unit bookkeeping. The state (/var/lib/siltad holds the Matrix
+# device's keys), the minds' homes, the backups, the Claude Code install and the users
+# are left in place on purpose.
+set -e
+if [ -d /run/systemd/system ]; then
+  systemctl --system daemon-reload >/dev/null || true
+fi
+if [ "$1" = remove ] && [ -x /usr/bin/deb-systemd-helper ]; then
+  deb-systemd-helper mask siltad.service silta-backup.timer >/dev/null || true
+fi
+if [ "$1" = purge ] && [ -x /usr/bin/deb-systemd-helper ]; then
+  deb-systemd-helper purge siltad.service silta-backup.timer >/dev/null || true
+  deb-systemd-helper unmask siltad.service silta-backup.timer >/dev/null || true
+  echo "silta: /var/lib/siltad, /var/lib/silta, /var/backups/silta, /opt/claude and the users silta, claude and silta-* were left in place"
+fi
+exit 0

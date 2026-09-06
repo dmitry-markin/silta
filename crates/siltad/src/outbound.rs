@@ -83,7 +83,7 @@ pub async fn typing(daemon: &Daemon, session: &str, id: u64, cmd: Typing) -> Cmd
     match writable_room(daemon, session, &cmd.room_id).await {
         Ok(room) => {
             info!(session, room = %room.room_id(), "typing indicator requested");
-            daemon.typing_start(session, room);
+            daemon.typing_start(session, room, false);
             CmdResult::done(id)
         }
         Err((code, message)) => CmdResult::err(id, code, message),
@@ -197,7 +197,7 @@ async fn after_send(daemon: &Daemon, session: &str, room: &Room, more: bool) {
     if more {
         let _ = room.typing_notice(false).await;
         let _ = room.typing_notice(true).await;
-        daemon.typing_start(session, room.clone());
+        daemon.typing_start(session, room.clone(), false);
     } else {
         stop_typing(daemon, room).await;
     }

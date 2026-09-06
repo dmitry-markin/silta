@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Runs one Silta session headless for silta-session@<name>.service.
 #
-# From the unit: SILTA_SESSION (the instance name), HOME (the state directory), and the
-# credential oauth-token. Overridable: SILTA_SOCKET, SILTA_PERSONA, SILTA_CLAUDE_BIN,
-# CLAUDE_BIN. The workspace is $HOME/workspace with inbox/ and out/; the session id of
-# the first start is saved in $HOME/session-id and resumed afterwards. Claude Code's
-# stdout (stream-json) goes to $HOME/session.log, its stderr to $HOME/session.err.
+# From the unit: SILTA_SESSION (the instance name), HOME (the state directory), the
+# credential oauth-token, and the pins SILTA_MODEL, SILTA_EFFORT, SILTA_FALLBACK_MODEL.
+# Overridable: SILTA_SOCKET, SILTA_PERSONA, SILTA_CLAUDE_BIN, SILTA_SESSION_LOG,
+# CLAUDE_BIN. The workspace is $HOME/workspace with inbox/ and out/. The session id is
+# chosen here on the first start (--session-id), saved in $HOME/session-id and resumed
+# afterwards as long as its transcript exists under $HOME/.claude/projects. Claude
+# Code's stdout (stream-json) goes through silta-session-log to the journal: the
+# operational lines stay, the conversation's texts do not. Its stderr goes to the
+# journal and to $HOME/session.err (truncated at every start), which decides after an
+# exit whether the saved id can still be resumed.
 #
 # stdin is a FIFO this script holds open, one initial user message
 # starts the first turn, channel events arrive as turns; closing the FIFO ends the
@@ -15,14 +20,18 @@ set -euo pipefail
 state="${HOME:?HOME must be the state directory of the session}"
 workspace="$state/workspace"
 persona="${SILTA_PERSONA:-/etc/silta/persona.md}"
-claude_bin="${CLAUDE_BIN:-claude}"
-export SILTA_CLAUDE_BIN="${SILTA_CLAUDE_BIN:-/usr/local/bin/silta-claude}"
+claude_bin="${CLAUDE_BIN:-/opt/claude/.local/bin/claude}"
+log_filter="${SILTA_SESSION_LOG:-/usr/lib/silta/silta-session-log}"
+export SILTA_CLAUDE_BIN="${SILTA_CLAUDE_BIN:-/usr/bin/silta-claude}"
 export SILTA_SOCKET="${SILTA_SOCKET:-/run/siltad/siltad.sock}"
 export SILTA_INBOX="$workspace/inbox"
+export DISABLE_AUTOUPDATER=1
 
 if [ -n "${CREDENTIALS_DIRECTORY:-}" ] && [ -r "$CREDENTIALS_DIRECTORY/oauth-token" ]; then
   CLAUDE_CODE_OAUTH_TOKEN=$(tr -d '[:space:]' < "$CREDENTIALS_DIRECTORY/oauth-token")
   export CLAUDE_CODE_OAUTH_TOKEN
+else
+  echo "no oauth-token credential: the session cannot authenticate (see /etc/silta/oauth-token)" >&2
 fi
 
 mkdir -p "$workspace/inbox" "$workspace/out"
@@ -30,34 +39,39 @@ cd "$workspace"
 fifo="$state/session.fifo"
 [ -p "$fifo" ] || mkfifo -m 0600 "$fifo"
 idfile="$state/session-id"
+errfile="$state/session.err"
+# Claude Code keeps one log file per start of an MCP server and never removes them.
+find "$state/.cache/claude-cli-nodejs" -type f -mtime +30 -delete 2>/dev/null || true
 
 # The prompt-less form; --channels last because it is variadic.
 args=(-p --input-format stream-json --output-format stream-json --verbose
       --permission-mode auto --permission-prompts none
       --append-system-prompt-file "$persona")
+[ -n "${SILTA_MODEL:-}" ] && args+=(--model "$SILTA_MODEL")
+[ -n "${SILTA_EFFORT:-}" ] && args+=(--effort "$SILTA_EFFORT")
+[ -n "${SILTA_FALLBACK_MODEL:-}" ] && args+=(--fallback-model "$SILTA_FALLBACK_MODEL")
+id=""
+[ -s "$idfile" ] && id=$(tr -d '[:space:]' < "$idfile")
 resumed=0
-if [ -s "$idfile" ]; then
-  args+=(--resume "$(cat "$idfile")"); resumed=1
+if [ -n "$id" ] && compgen -G "$state/.claude/projects/*/$id.jsonl" > /dev/null; then
+  args+=(--resume "$id")
+  resumed=1
+  echo "resuming session $id" >&2
 else
-  args+=(--name "silta-$SILTA_SESSION")
+  [ -n "$id" ] && echo "session $id has no transcript under $state/.claude/projects; starting a new one" >&2
+  id=$(cat /proc/sys/kernel/random/uuid)
+  echo "$id" > "$idfile"
+  args+=(--session-id "$id" --name "silta-$SILTA_SESSION")
+  echo "new session $id" >&2
 fi
 args+=(--channels plugin:silta-claude@silta-local)
 initial='{"type":"user","message":{"role":"user","content":"You are connected to the family chat through the silta channel. Wait for messages and answer each one through the reply tool."}}'
 
-: > "$state/session.log"
-"$claude_bin" "${args[@]}" < "$fifo" > "$state/session.log" 2> "$state/session.err" &
+: > "$errfile"
+"$claude_bin" "${args[@]}" < "$fifo" > >(exec "$log_filter") 2> >(exec tee -a "$errfile" >&2) &
 pid=$!
 exec 3> "$fifo"
 printf '%s\n' "$initial" >&3
-
-if [ "$resumed" = 0 ]; then
-  for _ in $(seq 1 60); do
-    id=$(grep -o '"session_id":"[^"]*"' "$state/session.log" 2>/dev/null | head -1 | cut -d'"' -f4 || true)
-    if [ -n "$id" ]; then echo "$id" > "$idfile"; echo "session id $id saved" >&2; break; fi
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 1
-  done
-fi
 
 stop() {
   exec 3>&-
@@ -68,14 +82,11 @@ stop() {
 trap stop INT TERM
 code=0
 wait "$pid" || code=$?
-if [ "$code" != 0 ]; then
-  echo "claude exited with $code; the end of $state/session.err:" >&2
-  tail -n 5 "$state/session.err" >&2
-fi
-# Only a saved id that no longer resumes is dropped, so that a start that fails for
-# any other reason (an expired token, the network) keeps the conversation.
-if [ "$resumed" = 1 ] && grep -q "No conversation found with session ID" "$state/session.err"; then
-  echo "session $(cat "$idfile") cannot be resumed; a new session starts on the next run" >&2
+[ "$code" != 0 ] && echo "claude exited with $code" >&2
+# Only a saved id that no longer resumes is dropped, so that a start that fails for any
+# other reason (an expired token, the network) keeps the conversation.
+if [ "$resumed" = 1 ] && grep -q "No conversation found with session ID" "$errfile"; then
+  echo "session $id cannot be resumed; a new session starts on the next run" >&2
   rm -f "$idfile"
 fi
 exit "$code"

@@ -1,11 +1,13 @@
 # One Silta session (a "mind") per instance: silta-session@alice.service runs as the
 # Unix user silta-alice with /var/lib/silta/alice as its home and state, and announces
-# itself to the daemon as session "alice". Overridable paths for a development host
-# are in a drop-in, see deploy/README.md.
+# itself to the daemon as session "alice". Instances are created with
+# silta-session-add. Per-instance overrides (a model, a version pin) go in a drop-in:
+# systemctl edit silta-session@alice.
 [Unit]
 Description=Silta session %i (Claude Code with the silta channel)
 After=network-online.target siltad.service
-Wants=siltad.service
+Wants=network-online.target siltad.service
+StartLimitIntervalSec=0
 
 [Service]
 User=silta-%i
@@ -18,14 +20,61 @@ Environment=HOME=/var/lib/silta/%i
 Environment=SILTA_SESSION=%i
 Environment=SILTA_SOCKET=/run/siltad/siltad.sock
 Environment=SILTA_PERSONA=/etc/silta/persona.md
-Environment=SILTA_CLAUDE_BIN=/usr/local/bin/silta-claude
-Environment=CLAUDE_BIN=/usr/local/bin/claude
+Environment=SILTA_CLAUDE_BIN=/usr/bin/silta-claude
+Environment=SILTA_SESSION_LOG=/usr/lib/silta/silta-session-log
+# Claude Code: the install owned by the claude user, read-only here, never updating
+# itself. CLAUDE_BIN may name /opt/claude/.local/share/claude/versions/<n> to pin one.
+Environment=CLAUDE_BIN=/opt/claude/.local/bin/claude
+Environment=DISABLE_AUTOUPDATER=1
+# Pinned by full name so nothing follows a moving alias.
+Environment=SILTA_MODEL=claude-opus-5
+Environment=SILTA_EFFORT=high
+Environment=SILTA_FALLBACK_MODEL=claude-sonnet-5
 LoadCredential=oauth-token:/etc/silta/oauth-token
-ExecStart=/usr/local/lib/silta/silta-session
-Restart=on-failure
+ExecStart=/usr/lib/silta/silta-session
+Restart=always
 RestartSec=10
+RestartSteps=6
+RestartMaxDelaySec=10min
 KillMode=mixed
 TimeoutStopSec=30
+MemoryMax=2G
+TasksMax=512
+
+# Hardening. What a mind needs: its state directory (HOME and the workspace, writable
+# through StateDirectory), a private /tmp, the daemon's socket (connecting works on a
+# read-only /run), the persona and the allowlist under /etc, the Claude Code install
+# under /opt/claude, the network for the model and for research, and the credential.
+# No MemoryDenyWriteExecute: the Claude Code binary is a JavaScript runtime with a JIT.
+# A denylist of privileged syscall groups rather than an allowlist, because a mind runs
+# arbitrary developer tools. RestrictNamespaces means Claude Code's optional bubblewrap
+# sandbox cannot be enabled in a mind, and PrivateTmp keeps Claude Code's messaging
+# socket (/tmp/cc-socks-<uid>) private to the mind. ProtectProc=invisible keeps minds
+# from seeing each other's processes.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=~@mount @reboot @swap @module @raw-io @obsolete @clock @debug @cpu-emulation
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

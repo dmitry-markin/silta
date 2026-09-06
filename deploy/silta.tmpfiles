@@ -1,0 +1,3 @@
+# The Claude Code install's home, traversable by the minds; the backup directory.
+d /opt/claude 0711 claude claude -
+d /var/backups/silta 0700 silta silta -

@@ -1,0 +1,11 @@
+#!/bin/sh
+# prerm for silta: on removal, stop every session instance, the timer and the daemon.
+set -e
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+  instances=$(systemctl list-units --plain --no-legend 'silta-session@*.service' 2>/dev/null | awk '{print $1}')
+  if [ -n "$instances" ]; then
+    deb-systemd-invoke stop $instances >/dev/null || true
+  fi
+  deb-systemd-invoke stop silta-backup.timer siltad.service >/dev/null || true
+fi
+exit 0

@@ -3467,7 +3467,7 @@ dependencies = [
 
 [[package]]
 name = "silta"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3481,7 +3481,7 @@ dependencies = [
 
 [[package]]
 name = "silta-claude"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3501,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "siltad"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3509,6 +3509,7 @@ dependencies = [
  "mime_guess",
  "nix",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "silta",

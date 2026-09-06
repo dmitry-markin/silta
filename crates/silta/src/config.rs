@@ -18,7 +18,11 @@ use crate::protocol::{Person, Role};
 /// The daemon configuration file (`siltad.toml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    /// The daemon's Unix socket; the sessions' plugins connect here.
+    #[serde(default = "default_socket")]
     pub socket: PathBuf,
+    /// The store, the saved session, the delivery watermarks and the spool.
+    #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
     pub matrix: MatrixConfig,
     #[serde(default)]
@@ -37,9 +41,30 @@ pub struct Config {
     /// downloaded (the message says so instead), a larger file from a session is refused.
     #[serde(default = "default_attachment_max_mb")]
     pub attachment_max_mb: u64,
+    /// A session disconnected for longer than this is reported to the owner's DM, and
+    /// so is one that shows no visible action after a delivered message. 0 turns the
+    /// alerts off.
+    #[serde(default = "default_alert_grace_secs")]
+    pub alert_grace_secs: u64,
     /// Reserved for speech recognition; accepted and ignored with a warning.
     #[serde(default)]
     pub asr: Option<toml::Value>,
+}
+
+/// Where the package's units put the socket and the state.
+pub const DEFAULT_SOCKET: &str = "/run/siltad/siltad.sock";
+pub const DEFAULT_STATE_DIR: &str = "/var/lib/siltad";
+
+fn default_socket() -> PathBuf {
+    PathBuf::from(DEFAULT_SOCKET)
+}
+
+fn default_state_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_STATE_DIR)
+}
+
+fn default_alert_grace_secs() -> u64 {
+    600
 }
 
 #[derive(Clone, Deserialize)]
@@ -662,6 +687,20 @@ name = "alice"
 receive = { people = ["Alice"] }
 user = "silta-alice"
 "#;
+
+    #[test]
+    fn socket_state_dir_and_alert_grace_default_to_the_package_paths() {
+        // BASE sets both paths; without them the package's paths apply.
+        let without_paths: String = BASE.lines().filter(|l| !l.starts_with("socket") && !l.starts_with("state_dir")).collect::<Vec<_>>().join("\n");
+        let c = Config::parse(&format!("{without_paths}\n{HUB_ONLY}")).unwrap();
+        assert_eq!(c.socket, PathBuf::from(DEFAULT_SOCKET));
+        assert_eq!(c.state_dir, PathBuf::from(DEFAULT_STATE_DIR));
+        assert_eq!(c.alert_grace_secs, 600);
+        let c = config(HUB_ONLY);
+        assert_eq!(c.socket, PathBuf::from("/run/silta/siltad.sock"));
+        let c = Config::parse(&format!("alert_grace_secs = 0\n{BASE}\n{HUB_ONLY}")).unwrap();
+        assert_eq!(c.alert_grace_secs, 0);
+    }
 
     #[test]
     fn replay_window_default_and_override() {

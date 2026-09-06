@@ -1,11 +1,13 @@
-# The silta daemon: the assistant's one Matrix device. Its socket in /run/siltad is
-# reachable by the silta group, which every session user belongs to. Written for
-# the packaged deployment; untested on the development host, where the daemon runs from
-# the repository.
+# The silta daemon: the family assistant's one Matrix device. Its socket in /run/siltad
+# is reachable by the silta group, which every session user belongs to. The
+# configuration is a credential: root-owned in /etc/silta, handed to the daemon by
+# systemd, never readable by the sessions (they share the silta group for the socket,
+# so a group-readable file would not do).
 [Unit]
 Description=silta daemon (the family assistant's Matrix device)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 User=silta
@@ -14,13 +16,48 @@ StateDirectory=siltad
 StateDirectoryMode=0700
 RuntimeDirectory=siltad
 RuntimeDirectoryMode=0750
-ExecStart=/usr/local/bin/siltad --config /etc/silta/siltad.toml
-Restart=on-failure
-RestartSec=5
+LoadCredential=siltad.toml:/etc/silta/siltad.toml
+ExecStart=/usr/bin/siltad --config %d/siltad.toml
+Restart=always
+RestartSec=10
+RestartSteps=6
+RestartMaxDelaySec=10min
+TimeoutStopSec=30
+MemoryMax=1G
+TasksMax=256
+
+# Hardening. What the daemon needs: its state directory (writable through
+# StateDirectory), the runtime directory for the socket, outbound HTTPS to the
+# homeserver, the credential, and the user database to resolve the sessions' users at
+# start (AF_NETLINK is for glibc's resolver, which enumerates interfaces with it). Not
+# PrivateUsers: the peer uid on the socket would map to nobody and the hello check
+# would refuse every session.
 NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

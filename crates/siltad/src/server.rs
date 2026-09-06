@@ -125,6 +125,10 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
         return;
     }
     info!(session, client = %hello.client, uid = ?peer_uid, "session connected");
+    if let Some(alert) = daemon.session_connected(&session) {
+        let daemon = daemon.clone();
+        tokio::spawn(async move { crate::alert::send(&daemon, alert).await });
+    }
 
     // Messages that arrived while the session was away, oldest first.
     let (queued, evicted) = daemon.registry.take_backlog(&session, now_ms());
@@ -251,6 +255,7 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
         let _ = tokio::fs::remove_file(&file.path).await;
     }
     daemon.typing_stop_session(&session);
+    daemon.session_disconnected(&session);
     info!(session, "session disconnected");
 }
 
@@ -378,7 +383,9 @@ user = "whoever"
         let spool = Spool::new(&dir, u64::MAX);
         spool.prepare().unwrap();
         let users = HashMap::from([("alice".to_owned(), nix::unistd::getuid().as_raw())]);
-        (Arc::new(Daemon::new(client, Routing::new(&config), &dir, 300, spool, 30, users)), dir)
+        let (silence, _) = tokio::sync::mpsc::unbounded_channel();
+        let settings = crate::daemon::Settings { replay_window_secs: 300, inbox_max_age_days: 30, alert_grace_secs: 600 };
+        (Arc::new(Daemon::new(client, Routing::new(&config), &dir, spool, users, settings, silence)), dir)
     }
 
     /// Alice's message `$ev` with one attachment, transfer `ev-1`, of `size` bytes.

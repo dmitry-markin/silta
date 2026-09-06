@@ -1,6 +1,6 @@
 [package]
 name = "siltad"
-description = "silta daemon: owns the bot's Matrix device and routes rooms to assistant sessions over a Unix socket"
+description = "silta daemon: the assistant's Matrix device, routing rooms to its sessions"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,7 @@ matrix-sdk.workspace = true
 mime_guess.workspace = true
 nix.workspace = true
 regex.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -22,3 +23,45 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# The Debian package `silta`: everything in one package, built by build-deb.sh with a
+# release build of the workspace first and `cargo deb -p siltad --no-build` after,
+# because cargo-deb builds only the crate it is pointed at. Units and users are handled
+# by the hand-written scripts in debian/ rather than cargo-deb's systemd-units option,
+# which expects debhelper naming and would enable and start the session template.
+# Files under etc/ are conffiles automatically.
+[package.metadata.deb]
+name = "silta"
+maintainer = "Dmitry Markin <dmitry@markin.tech>"
+copyright = "2026 Dmitry Markin"
+extended-description = """\
+Silta, the family assistant: siltad owns the bot's Matrix device and routes rooms to \
+Claude Code sessions ("minds") over a Unix socket; silta-claude is the channel plugin a \
+session runs. One systemd unit for the daemon, one template unit per mind, a helper that \
+adds a mind, a daily backup of the store."""
+section = "net"
+priority = "optional"
+depends = "$auto, systemd, passwd"
+recommends = "curl"
+maintainer-scripts = "debian"
+assets = [
+  ["target/release/siltad", "usr/bin/", "755"],
+  ["target/release/silta-claude", "usr/bin/", "755"],
+  ["target/release/silta-session-log", "usr/lib/silta/", "755"],
+  ["../../deploy/silta-session", "usr/lib/silta/", "755"],
+  ["../../deploy/silta-session-add", "usr/sbin/", "755"],
+  ["../../deploy/siltad.service", "usr/lib/systemd/system/", "644"],
+  ["../../deploy/silta-session@.service", "usr/lib/systemd/system/", "644"],
+  ["../../deploy/silta-backup.service", "usr/lib/systemd/system/", "644"],
+  ["../../deploy/silta-backup.timer", "usr/lib/systemd/system/", "644"],
+  ["../../deploy/silta.sysusers", "usr/lib/sysusers.d/silta.conf", "644"],
+  ["../../deploy/silta.tmpfiles", "usr/lib/tmpfiles.d/silta.conf", "644"],
+  ["../../deploy/siltad.example.toml", "etc/silta/siltad.toml", "600"],
+  ["../../assistant/persona.md", "etc/silta/persona.md", "644"],
+  ["../../assistant/managed-settings.json", "etc/claude-code/managed-settings.json", "644"],
+  ["../../assistant/marketplace/.claude-plugin/marketplace.json", "usr/share/silta/marketplace/.claude-plugin/", "644"],
+  ["../../assistant/marketplace/silta-claude/.claude-plugin/plugin.json", "usr/share/silta/marketplace/silta-claude/.claude-plugin/", "644"],
+  ["../../assistant/marketplace/silta-claude/.mcp.json", "usr/share/silta/marketplace/silta-claude/", "644"],
+  ["../../assistant/marketplace/silta-claude/README.md", "usr/share/silta/marketplace/silta-claude/", "644"],
+  ["../../deploy/siltad.example.toml", "usr/share/doc/silta/", "644"],
+]

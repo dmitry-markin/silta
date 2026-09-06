@@ -7,21 +7,24 @@ arguments and reads its configuration from the session's environment:
 | Variable | Required | Meaning |
 |---|---|---|
 | `SILTA_SESSION` | yes | Session name as configured in `siltad.toml` (`[[sessions]] name`) |
-| `SILTA_SOCKET` | no | Daemon socket, default `/run/silta/siltad.sock` |
-| `SILTA_CLAUDE_BIN` | no | Path of the binary; default `silta-claude` on `PATH` (`cargo install --path silta/silta-claude`) |
+| `SILTA_SOCKET` | no | Daemon socket, default `/run/siltad/siltad.sock` |
+| `SILTA_CLAUDE_BIN` | no | Path of the binary; default `silta-claude` on `PATH` (`/usr/bin/silta-claude` from the package) |
+| `SILTA_INBOX` | no | Where received files land; default `inbox` under the working directory |
 | `RUST_LOG` | no | Log filter, default `info`; the log goes to stderr, which Claude Code keeps under `~/.cache/claude-cli-nodejs/<cwd-slug>/mcp-logs-plugin-silta-claude-silta/` |
 
-Install from the repository's local marketplace, at project scope inside the session's
+Install from the local marketplace (this directory in the repository, or
+`/usr/share/silta/marketplace` from the package), at project scope inside the session's
 workspace, and run the session from there with the channel:
 
     claude plugin marketplace add /path/to/silta/assistant/marketplace   # once, registers silta-local
     cd /path/to/workspace && claude plugin install silta-claude@silta-local --scope project
-    SILTA_SESSION=hub claude --add-dir /var/lib/silta/inbox --channels plugin:silta-claude@silta-local
+    SILTA_SESSION=hub claude --channels plugin:silta-claude@silta-local
 
 Project scope matters: a user-scope install makes every Claude Code session on the host
 try to start the plugin, fail without `SILTA_SESSION`, and poison
-`~/.claude/mcp-needs-auth-cache.json`. `--add-dir` names the daemon's inbox, where
-attachments are downloaded, so the session may read them.
+`~/.claude/mcp-needs-auth-cache.json`. Attachments arrive through the socket and are
+written by the plugin into the workspace's `inbox/`, so no `--add-dir` is needed. On a
+production host `silta-session-add` does all of this for a mind.
 
 Tools: `reply`, `react`, `edit_message`, `send_file`, `fetch_messages`, `fetch_message`,
 `search_messages`. Events: messages

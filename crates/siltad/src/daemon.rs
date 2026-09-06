@@ -14,6 +14,7 @@ use matrix_sdk::{
     Client, Room,
 };
 use silta::{
+    alert::{Alert, Watch},
     backlog::Backlog,
     config::Routing,
     protocol::{Cmd, CmdKind, CmdResult, DaemonMessage, Event, EventKind, ResultError},
@@ -24,7 +25,7 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::{outbound, spool::Spool};
+use crate::{alert::Silence, outbound, spool::Spool};
 
 /// Messages kept for a session that is not connected, per session.
 const BACKLOG_MAX: usize = 100;
@@ -33,7 +34,7 @@ const TYPING_MAX: Duration = Duration::from_secs(600);
 /// The SDK re-sends a notice only after 3 s and the server expires it after 4 s; a
 /// 1 s poll keeps it continuous at no network cost between sends.
 const TYPING_POLL: Duration = Duration::from_secs(1);
-const MARKS_FILE: &str = "delivered.json";
+pub const MARKS_FILE: &str = "delivered.json";
 
 pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -50,12 +51,26 @@ pub struct Daemon {
     pub inbox_max_age_days: u64,
     /// The uid each session's plugin must connect as, by session name.
     pub users: HashMap<String, u32>,
+    /// Which sessions are away and what the owner has been told.
+    pub alerts: Mutex<Watch>,
+    /// Named in the alerts, so the owner knows which machine to look at.
+    pub hostname: String,
     marks: Marks,
     typing: Arc<Mutex<HashMap<OwnedRoomId, TypingTask>>>,
     typing_generation: Mutex<u64>,
+    /// A typing task reports here when its cap passes with no visible action.
+    silence: mpsc::UnboundedSender<Silence>,
 }
 
 pub type Shared = Arc<Daemon>;
+
+/// The configured limits the daemon carries.
+#[derive(Debug, Clone, Copy)]
+pub struct Settings {
+    pub replay_window_secs: u64,
+    pub inbox_max_age_days: u64,
+    pub alert_grace_secs: u64,
+}
 
 /// What happened to an inbound message.
 #[derive(Debug)]
@@ -71,12 +86,18 @@ impl Daemon {
         client: Client,
         routing: Routing,
         state_dir: &Path,
-        replay_window_secs: u64,
         spool: Spool,
-        inbox_max_age_days: u64,
         users: HashMap<String, u32>,
+        settings: Settings,
+        silence: mpsc::UnboundedSender<Silence>,
     ) -> Daemon {
-        let replay_window_ms = replay_window_secs.saturating_mul(1000);
+        let replay_window_ms = settings.replay_window_secs.saturating_mul(1000);
+        let alerts = Watch::new(routing.session_names().map(str::to_owned), settings.alert_grace_secs, now_ms());
+        let hostname = nix::unistd::gethostname()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "this host".to_owned());
         Daemon {
             client,
             routing,
@@ -84,12 +105,26 @@ impl Daemon {
             started_at_ms: now_ms(),
             replay_window_ms,
             spool,
-            inbox_max_age_days,
+            inbox_max_age_days: settings.inbox_max_age_days,
             users,
+            alerts: Mutex::new(alerts),
+            hostname,
             marks: Marks::load(state_dir.join(MARKS_FILE)),
             typing: Arc::new(Mutex::new(HashMap::new())),
             typing_generation: Mutex::new(0),
+            silence,
         }
+    }
+
+    /// A session completed its handshake; the note to send if the owner was told it
+    /// was away.
+    pub fn session_connected(&self, session: &str) -> Option<Alert> {
+        self.alerts.lock().unwrap().connected(session, now_ms())
+    }
+
+    /// A session's connection went away.
+    pub fn session_disconnected(&self, session: &str) {
+        self.alerts.lock().unwrap().disconnected(session, now_ms());
     }
 
     /// Execute one command on behalf of a connected session. `send_file` needs the
@@ -148,13 +183,15 @@ impl Daemon {
             return;
         }
         match RoomId::parse(&event.room_id).ok().and_then(|id| self.client.get_room(&id)) {
-            Some(room) => self.typing_start(session, room),
+            Some(room) => self.typing_start(session, room, true),
             None => debug!(room = %event.room_id, "no room object for the typing notice"),
         }
     }
 
     /// Keep sending the typing notice in a room until the reply goes out or the cap.
-    pub fn typing_start(&self, session: &str, room: Room) {
+    /// With `watch`, reaching the cap is reported as a silent session (a delivery
+    /// that got nothing back); a send with `more = true` restarts the notice without it.
+    pub fn typing_start(&self, session: &str, room: Room, watch: bool) {
         let mut tasks = self.typing.lock().unwrap();
         if tasks.contains_key(room.room_id()) {
             return;
@@ -169,8 +206,11 @@ impl Daemon {
         drop(tasks);
 
         let tasks = self.typing.clone();
+        let silence = self.silence.clone();
+        let session = session.to_owned();
         tokio::spawn(async move {
             let started = Instant::now();
+            let started_ms = now_ms();
             loop {
                 if let Err(err) = room.typing_notice(true).await {
                     debug!(room = %room.room_id(), "typing notice failed: {err}");
@@ -181,6 +221,9 @@ impl Daemon {
                 }
                 if started.elapsed() > TYPING_MAX {
                     debug!(room = %room.room_id(), "typing notice cap reached");
+                    if watch {
+                        let _ = silence.send(Silence { session, room_id: room.room_id().to_string(), delivered_ms: started_ms });
+                    }
                     break;
                 }
             }
