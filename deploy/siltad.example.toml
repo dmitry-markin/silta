@@ -19,6 +19,7 @@ user_id        = "@silta:example.org"
 password       = "CHANGE-ME"      # used only for the first login; the saved session is used afterwards
 device_id      = "silta"        # the bot's one and only device
 device_name    = "Silta"
+display_name   = "Silta"        # the account's name in clients, set at start when it differs
 
 # The people registry is the allowlist: nobody else reaches a session. The owner gets
 # the daemon's alerts in their DM.

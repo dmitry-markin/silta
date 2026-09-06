@@ -16,6 +16,7 @@ user_id        = "@silta:localhost"
 password       = "..."             # used only when state_dir/session.json is absent
 device_id      = "silta"
 device_name    = "Silta"
+display_name   = "Silta"        # the account's name in clients, set at start when it differs
 
 [[people]]
 name = "Bob"

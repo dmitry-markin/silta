@@ -98,6 +98,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         },
     )
     .await?;
+    if let Some(name) = &config.matrix.display_name {
+        session::ensure_display_name(&client, name).await;
+    }
 
     let spool = Spool::new(&config.state_dir, config.attachment_max_mb.saturating_mul(1024 * 1024));
     spool.prepare()?;

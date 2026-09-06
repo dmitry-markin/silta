@@ -172,3 +172,17 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
     file.write_all(contents.as_bytes())?;
     Ok(())
 }
+
+/// Set the account's display name when the profile differs from the configuration. A
+/// failure is logged, not fatal: the name is cosmetic and the daemon must still start.
+pub async fn ensure_display_name(client: &Client, name: &str) {
+    let account = client.account();
+    match account.get_display_name().await {
+        Ok(current) if current.as_deref() == Some(name) => {}
+        Ok(current) => match account.set_display_name(Some(name)).await {
+            Ok(()) => info!(from = ?current, "display name set to {name:?}"),
+            Err(err) => warn!("cannot set the display name to {name:?}: {err}"),
+        },
+        Err(err) => warn!("cannot read the display name: {err}"),
+    }
+}

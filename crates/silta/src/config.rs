@@ -77,6 +77,10 @@ pub struct MatrixConfig {
     pub device_id: String,
     #[serde(default = "default_device_name")]
     pub device_name: String,
+    /// The account's display name, what clients show next to the bot's messages; set
+    /// at every start when the profile differs. Absent: the profile is left alone.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 fn default_device_name() -> String {
@@ -103,6 +107,7 @@ impl fmt::Debug for MatrixConfig {
             .field("password", &"<redacted>")
             .field("device_id", &self.device_id)
             .field("device_name", &self.device_name)
+            .field("display_name", &self.display_name)
             .finish()
     }
 }
@@ -700,6 +705,13 @@ user = "silta-alice"
         assert_eq!(c.socket, PathBuf::from("/run/silta/siltad.sock"));
         let c = Config::parse(&format!("alert_grace_secs = 0\n{BASE}\n{HUB_ONLY}")).unwrap();
         assert_eq!(c.alert_grace_secs, 0);
+    }
+
+    #[test]
+    fn display_name_is_optional() {
+        assert_eq!(config(HUB_ONLY).matrix.display_name, None);
+        let text = format!("{BASE}\n{HUB_ONLY}").replace("device_name    = \"Silta\"", "device_name = \"d\"\ndisplay_name = \"Silta\"");
+        assert_eq!(Config::parse(&text).unwrap().matrix.display_name.as_deref(), Some("Silta"));
     }
 
     #[test]
