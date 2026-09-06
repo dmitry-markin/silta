@@ -87,6 +87,7 @@ impl Daemon {
             CmdKind::FetchMessages(fetch) => outbound::fetch_messages(self, session, cmd.id, fetch).await,
             CmdKind::FetchMessage(fetch) => outbound::fetch_message(self, session, cmd.id, fetch).await,
             CmdKind::SearchMessages(search) => outbound::search_messages(self, session, cmd.id, search).await,
+            CmdKind::Typing(typing) => outbound::typing(self, session, cmd.id, typing).await,
         }
     }
 

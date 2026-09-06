@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 use silta::protocol::{
     CmdKind, Edit, Event, EventKind, FetchMessage, FetchMessages, HistoryMessage, React, Reply, SearchMessages, SendFile,
+    Typing,
 };
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
@@ -41,7 +42,11 @@ have seen a message before a long task; edit_message replaces one of your own me
 when a correction or a progress update makes the chat clearer; send_file sends a file from \
 this host; fetch_messages reads recent room history when something has fallen out of your \
 context, with long texts shortened; search_messages searches it with a regular expression; \
-fetch_message reads one message whole by its event id. Terminal output never reaches the sender. After a tool has sent something, end the \
+fetch_message reads one message whole by its event id. Every sending tool has a required \
+`more` parameter: true when another message of yours will follow in that room in this turn \
+(a table and then a file, say), so the typing indicator stays on across the gap; false for \
+the last one, which ends the indicator. If you decide to send more only after a send with \
+more=false, call typing first. Terminal output never reaches the sender. After a tool has sent something, end the \
 turn without restating it.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -56,6 +61,8 @@ pub struct ReplyParams {
     /// Thread root to answer in (the thread attribute of the channel tag). Optional.
     #[serde(default)]
     pub thread: Option<String>,
+    /// Required: true when another message of yours will follow in this room in this turn (the typing indicator stays on), false when this is the last one.
+    pub more: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -66,6 +73,8 @@ pub struct ReactParams {
     pub event_id: String,
     /// One emoji.
     pub emoji: String,
+    /// Required: true when a message of yours will follow in this room in this turn (a 👀 before a long task), false when the reaction is the whole answer.
+    pub more: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -76,6 +85,8 @@ pub struct EditParams {
     pub event_id: String,
     /// The new text, in Markdown; must fit one message (8 KiB).
     pub text: String,
+    /// Required: true when another message of yours will follow in this room in this turn, false otherwise.
+    pub more: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -93,6 +104,14 @@ pub struct SendFileParams {
     /// Thread root to send in. Optional.
     #[serde(default)]
     pub thread: Option<String>,
+    /// Required: true when another message of yours will follow in this room in this turn, false when this is the last one.
+    pub more: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TypingParams {
+    /// The room: the room_id attribute of the channel tag.
+    pub room_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -144,18 +163,18 @@ impl SiltaChannel {
 
     #[tool(
         name = "reply",
-        description = "Send a text message to a Matrix room. Markdown is rendered; long text is split into several messages. Pass reply_to to quote a specific message and thread to answer inside a thread. Fails with a code: room_not_allowed (policy), room_unknown (the bot is not in that room), not_found (the quoted event does not exist), send_failed, daemon_unavailable (no daemon connection)."
+        description = "Send a text message to a Matrix room. Markdown is rendered; long text is split into several messages. Pass reply_to to quote a specific message and thread to answer inside a thread. `more` is required: true keeps the typing indicator on because another message of yours follows in this turn, false ends it. Fails with a code: room_not_allowed (policy), room_unknown (the bot is not in that room), not_found (the quoted event does not exist), send_failed, daemon_unavailable (no daemon connection)."
     )]
     async fn reply(&self, Parameters(p): Parameters<ReplyParams>) -> Result<CallToolResult, McpError> {
-        self.send(CmdKind::Reply(Reply { room_id: p.room_id, text: p.text, reply_to: p.reply_to, thread: p.thread })).await
+        self.send(CmdKind::Reply(Reply { room_id: p.room_id, text: p.text, reply_to: p.reply_to, thread: p.thread, more: p.more })).await
     }
 
     #[tool(
         name = "react",
-        description = "React to a message with an emoji. Use it when a reaction is the whole answer (a thumbs-up to a thank-you, say) or to mark that you have seen a message before starting a long task; the typing indicator stops once you react. Same failure codes as reply."
+        description = "React to a message with an emoji. Use it when a reaction is the whole answer (a thumbs-up to a thank-you, say) or to mark that you have seen a message before starting a long task, with more=true so the typing indicator stays on while you work. Same failure codes as reply."
     )]
     async fn react(&self, Parameters(p): Parameters<ReactParams>) -> Result<CallToolResult, McpError> {
-        self.send(CmdKind::React(React { room_id: p.room_id, event_id: p.event_id, emoji: p.emoji })).await
+        self.send(CmdKind::React(React { room_id: p.room_id, event_id: p.event_id, emoji: p.emoji, more: p.more })).await
     }
 
     #[tool(
@@ -163,7 +182,7 @@ impl SiltaChannel {
         description = "Replace the text of one of your own earlier messages (the event id a reply returned). Use it narrowly: a progress message that becomes the result, or a correction; never to rewrite a conversation. The new text must fit one message of 8 KiB. Fails with not_found when the event is not your own message, bad_request when the text is too long, plus the codes of reply."
     )]
     async fn edit_message(&self, Parameters(p): Parameters<EditParams>) -> Result<CallToolResult, McpError> {
-        self.send(CmdKind::Edit(Edit { room_id: p.room_id, event_id: p.event_id, text: p.text })).await
+        self.send(CmdKind::Edit(Edit { room_id: p.room_id, event_id: p.event_id, text: p.text, more: p.more })).await
     }
 
     #[tool(
@@ -177,8 +196,23 @@ impl SiltaChannel {
             caption: p.caption,
             reply_to: p.reply_to,
             thread: p.thread,
+            more: p.more,
         }))
         .await
+    }
+
+    #[tool(
+        name = "typing",
+        description = "Show the typing indicator in a room again. Use it when, after a send with more=false, you decide to send another message there after all; the indicator then runs until your next send or for at most ten minutes. Not needed when the previous send said more=true."
+    )]
+    async fn typing(&self, Parameters(p): Parameters<TypingParams>) -> Result<CallToolResult, McpError> {
+        match self.daemon.command(CmdKind::Typing(Typing { room_id: p.room_id })).await {
+            Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text("typing")])),
+            Err(err) => {
+                warn!("typing failed: {err}");
+                Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]))
+            }
+        }
     }
 
     #[tool(

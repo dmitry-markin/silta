@@ -26,7 +26,7 @@ use matrix_sdk::{
 use silta::{
     protocol::{
         CmdResult, Edit, FetchMessage, FetchMessages, HistoryAttachment, HistoryMessage, React, Reply, ResultError,
-        SearchMessages, SendFile,
+        SearchMessages, SendFile, Typing,
     },
     text::chunk_text,
     time::rfc3339_utc,
@@ -79,6 +79,19 @@ pub async fn fetch_messages(daemon: &Daemon, session: &str, id: u64, cmd: FetchM
 pub async fn search_messages(daemon: &Daemon, session: &str, id: u64, cmd: SearchMessages) -> CmdResult {
     match do_search_messages(daemon, session, cmd).await {
         Ok(scan) => CmdResult::history(id, scan.messages, scan.more).with_scan(scan.scanned, scan.until),
+        Err((code, message)) => CmdResult::err(id, code, message),
+    }
+}
+
+/// Bring the typing indicator back in a room the session may write to: for a session
+/// that decided to send another message after a send that ended the indicator.
+pub async fn typing(daemon: &Daemon, session: &str, id: u64, cmd: Typing) -> CmdResult {
+    match writable_room(daemon, session, &cmd.room_id).await {
+        Ok(room) => {
+            info!(session, room = %room.room_id(), "typing indicator requested");
+            daemon.typing_start(session, room);
+            CmdResult::done(id)
+        }
         Err((code, message)) => CmdResult::err(id, code, message),
     }
 }
@@ -181,6 +194,21 @@ async fn stop_typing(daemon: &Daemon, room: &Room) {
     let _ = room.typing_notice(false).await;
 }
 
+/// After a successful send: end the indicator, or keep it going when the session said
+/// another message is coming (`more`). The homeserver clears the sender's typing state
+/// when a message is sent, and the SDK would not repeat an unchanged notice for a few
+/// seconds, so the notice is sent off and on again at once; the refresh task (kept if
+/// already running, so its ten-minute cap still counts from the delivery) takes over.
+async fn after_send(daemon: &Daemon, session: &str, room: &Room, more: bool) {
+    if more {
+        let _ = room.typing_notice(false).await;
+        let _ = room.typing_notice(true).await;
+        daemon.typing_start(session, room.clone());
+    } else {
+        stop_typing(daemon, room).await;
+    }
+}
+
 async fn do_reply(daemon: &Daemon, session: &str, reply: Reply) -> Result<OwnedEventId, Fail> {
     if reply.text.trim().is_empty() {
         return Err(bad("text is empty"));
@@ -222,8 +250,8 @@ async fn do_reply(daemon: &Daemon, session: &str, reply: Reply) -> Result<OwnedE
             }
         }
     }
-    stop_typing(daemon, &room).await;
-    info!(session, room = %room.room_id(), chunks = chunks.len(), bytes = reply.text.len(), in_thread, "sent");
+    after_send(daemon, session, &room, reply.more).await;
+    info!(session, room = %room.room_id(), chunks = chunks.len(), bytes = reply.text.len(), in_thread, more = reply.more, "sent");
     Ok(last.expect("at least one chunk"))
 }
 
@@ -238,8 +266,8 @@ async fn do_react(daemon: &Daemon, session: &str, react: React) -> Result<OwnedE
         .send(content)
         .await
         .map_err(|e| (ResultError::SendFailed, format!("reacting in {} failed: {e}", room.room_id())))?;
-    stop_typing(daemon, &room).await;
-    info!(session, room = %room.room_id(), %target, emoji = %react.emoji, "reacted");
+    after_send(daemon, session, &room, react.more).await;
+    info!(session, room = %room.room_id(), %target, emoji = %react.emoji, more = react.more, "reacted");
     Ok(sent.response.event_id)
 }
 
@@ -279,8 +307,8 @@ async fn do_edit(daemon: &Daemon, session: &str, edit: Edit) -> Result<OwnedEven
         .send(content)
         .await
         .map_err(|e| (ResultError::SendFailed, format!("editing {target} in {} failed: {e}", room.room_id())))?;
-    stop_typing(daemon, &room).await;
-    info!(session, room = %room.room_id(), %target, bytes = edit.text.len(), "edited");
+    after_send(daemon, session, &room, edit.more).await;
+    info!(session, room = %room.room_id(), %target, bytes = edit.text.len(), more = edit.more, "edited");
     Ok(sent.response.event_id)
 }
 
@@ -335,8 +363,8 @@ async fn do_send_file(daemon: &Daemon, session: &str, cmd: SendFile) -> Result<O
         .send_attachment(&name, &mime, data, config)
         .await
         .map_err(|e| (ResultError::SendFailed, format!("sending {} to {} failed: {e}", path.display(), room.room_id())))?;
-    stop_typing(daemon, &room).await;
-    info!(session, room = %room.room_id(), name, bytes, mime = %mime, "file sent");
+    after_send(daemon, session, &room, cmd.more).await;
+    info!(session, room = %room.room_id(), name, bytes, mime = %mime, more = cmd.more, "file sent");
     Ok(response.event_id)
 }
 

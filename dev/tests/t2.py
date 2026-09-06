@@ -163,6 +163,28 @@ ok(r["ok"] and m and any(a["name"] == "shapes.png" for x in m for a in x["attach
 r = cmd("search_messages", room_id=dm, pattern="NOPE_[0-9]{9}"); ok(r["ok"] and not r.get("messages") and r.get("more") is None, "no match, scanned to the start of the room")
 r = cmd("search_messages", room_id=dm, pattern="("); ok(r.get("error") == "bad_request" and "regular expression" in (r.get("message") or ""), "invalid pattern: bad_request")
 r = cmd("search_messages", room_id=family, pattern="x"); ok(r.get("error") == "room_not_allowed", "a room the session does not own: room_not_allowed")
+
+print("13. the typing indicator across a multi-message answer")
+def typing_lines(since):
+    out = []
+    for l in open(f"{REPO}/dev/state/t2-watch.out"):
+        if "typing:" in l and dm in l:
+            hhmmss = l.split("] ")[1].split(" typing: ")[0]
+            if hhmmss >= since: out.append((hhmmss, "on" if "@silta" in l else "off"))
+    return out
+def now(): return time.strftime("%H:%M:%S", time.gmtime())
+alice("send", dm, "give me two parts please"); event()
+t_first = now(); r = cmd("reply", room_id=dm, text="part one", more=True); time.sleep(6)
+after_first = [x for x in typing_lines(t_first) if x[0] > t_first]
+ok(any(s == "on" for _, s in after_first) and not any(s == "off" for _, s in after_first), f"indicator kept on after a send with more=true ({after_first})")
+t_last = now(); r = cmd("reply", room_id=dm, text="part two", more=False); time.sleep(5)
+after_last = [x for x in typing_lines(t_last) if x[0] > t_last]
+ok(any(s == "off" for _, s in after_last), f"indicator ends after the last send ({after_last})")
+t_typing = now(); r = cmd("typing", room_id=dm); ok(r["ok"], "typing command accepted"); time.sleep(5)
+after_typing = [x for x in typing_lines(t_typing) if x[0] > t_typing]
+ok(any(s == "on" for _, s in after_typing), f"indicator back after the typing command ({after_typing})")
+r = cmd("reply", room_id=dm, text="part three, after a change of mind", more=False)
+r = cmd("typing", room_id=family); ok(r.get("error") == "room_not_allowed", "typing in a room the session may not write to: room_not_allowed")
 time.sleep(4)
 watch.terminate(); watch.wait(timeout=10); watch_out.close()
 print("--- watch (Alice's view, last 16 lines) ---")

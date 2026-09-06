@@ -164,7 +164,7 @@ pub struct Cmd {
 }
 
 /// The command payload, externally tagged so the command name is the key.
-/// Still reserved and rejected with `bad_request`: `typing`, `permission_request`.
+/// Still reserved and rejected with `bad_request`: `permission_request`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CmdKind {
@@ -175,6 +175,7 @@ pub enum CmdKind {
     FetchMessages(FetchMessages),
     FetchMessage(FetchMessage),
     SearchMessages(SearchMessages),
+    Typing(Typing),
 }
 
 impl CmdKind {
@@ -187,6 +188,7 @@ impl CmdKind {
             CmdKind::FetchMessages(_) => "fetch_messages",
             CmdKind::FetchMessage(_) => "fetch_message",
             CmdKind::SearchMessages(_) => "search_messages",
+            CmdKind::Typing(_) => "typing",
         }
     }
 }
@@ -201,6 +203,10 @@ pub struct Reply {
     /// Thread root to answer in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
+    /// Another message will follow in this room in the same turn: the daemon keeps the
+    /// typing indicator on after the send instead of ending it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more: bool,
 }
 
 /// React to a message with an emoji.
@@ -209,6 +215,10 @@ pub struct React {
     pub room_id: String,
     pub event_id: String,
     pub emoji: String,
+    /// Another message will follow in this room in the same turn: the daemon keeps the
+    /// typing indicator on after the send instead of ending it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more: bool,
 }
 
 /// Replace the text of one of the bot's own messages.
@@ -217,6 +227,10 @@ pub struct Edit {
     pub room_id: String,
     pub event_id: String,
     pub text: String,
+    /// Another message will follow in this room in the same turn: the daemon keeps the
+    /// typing indicator on after the send instead of ending it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more: bool,
 }
 
 /// Send a file from the daemon's host into a room.
@@ -231,6 +245,17 @@ pub struct SendFile {
     pub reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
+    /// Another message will follow in this room in the same turn: the daemon keeps the
+    /// typing indicator on after the send instead of ending it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more: bool,
+}
+
+/// Show the typing indicator in a room again, for a session that decided to send
+/// another message after a send that ended it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Typing {
+    pub room_id: String,
 }
 
 /// Fetch recent messages of a room, newest first.
@@ -306,6 +331,11 @@ impl CmdResult {
             scanned: None,
             until: None,
         }
+    }
+
+    /// A command that produced no event (`typing`).
+    pub fn done(id: u64) -> Self {
+        Self { id, ok: true, event_id: None, error: None, message: None, messages: None, more: None, scanned: None, until: None }
     }
 
     pub fn history(id: u64, messages: Vec<HistoryMessage>, more: Option<String>) -> Self {
@@ -561,6 +591,25 @@ mod tests {
         let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
         let CmdKind::Reply(r) = cmd.kind else { panic!("not reply") };
         assert_eq!(r.thread.as_deref(), Some("$root"));
+        assert!(!r.more, "absent means false, so an older plugin's replies still parse");
+
+        let msg = roundtrip_client(r#"{"cmd":{"id":10,"reply":{"room_id":"!abc:silta.test","text":"part 1","more":true}}}"#);
+        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        let CmdKind::Reply(r) = cmd.kind else { panic!("not reply") };
+        assert!(r.more);
+    }
+
+    #[test]
+    fn typing_command_and_result() {
+        let msg = roundtrip_client(r#"{"cmd":{"id":11,"typing":{"room_id":"!r"}}}"#);
+        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        assert_eq!(cmd.kind.name(), "typing");
+        assert_eq!(roundtrip_daemon(r#"{"result":{"id":11,"ok":true}}"#), DaemonMessage::Result(CmdResult::done(11)));
+        // `more` on the other sending commands, absent when false.
+        let msg = roundtrip_client(r#"{"cmd":{"id":12,"react":{"room_id":"!r","event_id":"$e","emoji":"👀","more":true}}}"#);
+        assert!(matches!(msg, ClientMessage::Cmd(Cmd { kind: CmdKind::React(React { more: true, .. }), .. })));
+        let msg = roundtrip_client(r#"{"cmd":{"id":13,"send_file":{"room_id":"!r","path":"/a","more":true}}}"#);
+        assert!(matches!(msg, ClientMessage::Cmd(Cmd { kind: CmdKind::SendFile(SendFile { more: true, .. }), .. })));
     }
 
     #[test]
@@ -670,11 +719,11 @@ mod tests {
         assert!(matches!(good, Incoming::Message(ClientMessage::Hello(_))));
 
         // A reserved command with an id: bad_request.
-        let reserved = parse_client_line(r#"{"cmd":{"id":3,"typing":{"room_id":"!r","on":true}}}"#).unwrap();
+        let reserved = parse_client_line(r#"{"cmd":{"id":3,"permission_request":{"request_id":"abcde"}}}"#).unwrap();
         match reserved {
             Incoming::BadRequest { id, message } => {
                 assert_eq!(id, 3);
-                assert!(message.contains("typing"), "{message}");
+                assert!(message.contains("permission_request"), "{message}");
             }
             other => panic!("unexpected {other:?}"),
         }
