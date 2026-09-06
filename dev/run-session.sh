@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
-# Run the hub session headless with the silta-claude channel plugin.
+# Run one session headless with the silta-claude channel plugin, as this user.
 #
-#   dev/run-session.sh              new session (named silta-hub)
-#   dev/run-session.sh <session-id> resume an earlier session
+#   dev/run-session.sh                        new hub session (named silta-hub)
+#   SILTA_SESSION=bob dev/run-session.sh   new session announcing itself as bob
+#   dev/run-session.sh <session-id>           resume an earlier session
 #
 # stdin is a FIFO held open by this script; one initial user message
 # starts the first turn, after which channel events arrive as turns. SILTA_SESSION picks
 # the session (default hub); the persona comes from assistant/persona.md. Output goes to
-# dev/state/hub.log (stream-json) and dev/state/hub.err (Claude Code's stderr). The
-# session id is printed and saved to dev/state/hub.session-id for later resume.
+# dev/state/<session>.log (stream-json) and dev/state/<session>.err (Claude Code's
+# stderr). The session id is printed and saved to dev/state/<session>.session-id for
+# later resume.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 state=$repo/dev/state
 mkdir -p "$state"
-fifo=$state/hub.fifo
+export SILTA_SESSION="${SILTA_SESSION:-hub}"
+fifo=$state/$SILTA_SESSION.fifo
 [ -p "$fifo" ] || mkfifo "$fifo"
 
-export SILTA_SESSION="${SILTA_SESSION:-hub}"
 export SILTA_SOCKET="${SILTA_SOCKET:-$state/siltad.sock}"
 export SILTA_CLAUDE_BIN="${SILTA_CLAUDE_BIN:-$repo/target/release/silta-claude}"
 if [ ! -x "$SILTA_CLAUDE_BIN" ]; then
@@ -30,7 +32,7 @@ args=(-p --input-format stream-json --output-format stream-json --verbose
 if [ $# -ge 1 ]; then
   args+=(--resume "$1")
 else
-  args+=(--name silta-hub)
+  args+=(--name "silta-$SILTA_SESSION")
 fi
 # One persona for every session, in the system prompt; no CLAUDE.md in the workspace.
 # Attachments land in the workspace's inbox, written by the plugin.
@@ -50,8 +52,8 @@ for v in $(env | grep -E '^CLAUDE' | cut -d= -f1); do
 done
 
 cd "$repo/dev/workspace"
-: > "$state/hub.log"
-claude "${args[@]}" < "$fifo" > "$state/hub.log" 2> "$state/hub.err" &
+: > "$state/$SILTA_SESSION.log"
+claude "${args[@]}" < "$fifo" > "$state/$SILTA_SESSION.log" 2> "$state/$SILTA_SESSION.err" &
 pid=$!
 exec 3> "$fifo"
 printf '%s\n' "$initial" >&3
@@ -60,18 +62,18 @@ id=""
 [ $# -ge 1 ] && id=$1   # a resumed session prints no init line
 for _ in $(seq 1 60); do
   [ -n "$id" ] && break
-  id=$(grep -o '"session_id":"[^"]*"' "$state/hub.log" 2>/dev/null | head -1 | cut -d'"' -f4 || true)
+  id=$(grep -o '"session_id":"[^"]*"' "$state/$SILTA_SESSION.log" 2>/dev/null | head -1 | cut -d'"' -f4 || true)
   [ -n "$id" ] && break
   kill -0 "$pid" 2>/dev/null || break
   sleep 1
 done
 if [ -n "$id" ]; then
   echo "session id: $id"
-  echo "$id" > "$state/hub.session-id"
+  echo "$id" > "$state/$SILTA_SESSION.session-id"
 else
-  echo "no session id seen in $state/hub.log yet" >&2
+  echo "no session id seen in $state/$SILTA_SESSION.log yet" >&2
 fi
-echo "claude pid $pid; log $state/hub.log; press Ctrl-C to stop"
+echo "claude pid $pid; log $state/$SILTA_SESSION.log; press Ctrl-C to stop"
 # Stop by closing stdin (EOF ends a -p session cleanly); SIGTERM makes Claude Code
 # linger for minutes with a FIFO on stdin, and resuming the same session id while the
 # old process is still alive leaves the channel unregistered in the new one.
