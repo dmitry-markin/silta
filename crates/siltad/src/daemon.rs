@@ -46,6 +46,10 @@ pub struct Daemon {
     pub started_at_ms: u64,
     pub replay_window_ms: u64,
     pub inbox: InboxConfig,
+    /// Resolved paths `send_file` refuses: the daemon's state directory (the access
+    /// token, the encryption store) and its configuration file (the password). The
+    /// inbox inside the state directory is exempt.
+    pub private_paths: Vec<PathBuf>,
     marks: Marks,
     typing: Arc<Mutex<HashMap<OwnedRoomId, TypingTask>>>,
     typing_generation: Mutex<u64>,
@@ -63,7 +67,14 @@ pub enum Dispatch {
 }
 
 impl Daemon {
-    pub fn new(client: Client, routing: Routing, state_dir: &Path, replay_window_secs: u64, inbox: InboxConfig) -> Daemon {
+    pub fn new(
+        client: Client,
+        routing: Routing,
+        state_dir: &Path,
+        replay_window_secs: u64,
+        inbox: InboxConfig,
+        private_paths: Vec<PathBuf>,
+    ) -> Daemon {
         Daemon {
             client,
             routing,
@@ -71,6 +82,7 @@ impl Daemon {
             started_at_ms: now_ms(),
             replay_window_ms: replay_window_secs.saturating_mul(1000),
             inbox,
+            private_paths,
             marks: Marks::load(state_dir.join(MARKS_FILE)),
             typing: Arc::new(Mutex::new(HashMap::new())),
             typing_generation: Mutex::new(0),

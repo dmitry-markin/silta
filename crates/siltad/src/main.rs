@@ -57,12 +57,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
         config.inbox_max_age_days,
         config.socket.display()
     );
-    let inbox_config = inbox::InboxConfig {
-        dir: config.state_dir.join("inbox"),
-        max_age: Duration::from_secs(config.inbox_max_age_days.saturating_mul(86_400)),
-        max_bytes: config.inbox_max_file_mb.saturating_mul(1024 * 1024),
-    };
-
     let client = session::build_client(&config.matrix.homeserver_url, &config.state_dir).await?;
     session::login_or_restore(
         &client,
@@ -77,8 +71,24 @@ async fn run(args: Args) -> anyhow::Result<()> {
     )
     .await?;
 
+    // Resolved paths, so `send_file` can tell the daemon's own files from everything
+    // else whatever symlinks a path goes through (see `outbound.rs`).
+    let state_dir = std::fs::canonicalize(&config.state_dir)?;
+    let config_path = std::fs::canonicalize(&args.config)?;
+    let inbox_config = inbox::InboxConfig {
+        dir: state_dir.join("inbox"),
+        max_age: Duration::from_secs(config.inbox_max_age_days.saturating_mul(86_400)),
+        max_bytes: config.inbox_max_file_mb.saturating_mul(1024 * 1024),
+    };
     inbox::prepare(&inbox_config.dir)?;
-    let daemon = Arc::new(Daemon::new(client, Routing::new(&config), &config.state_dir, config.replay_window_secs, inbox_config));
+    let daemon = Arc::new(Daemon::new(
+        client,
+        Routing::new(&config),
+        &state_dir,
+        config.replay_window_secs,
+        inbox_config,
+        vec![state_dir.clone(), config_path],
+    ));
     matrix::register_handlers(&daemon);
 
     let cancel = CancellationToken::new();

@@ -1,7 +1,7 @@
 //! Outbound commands: policy checks, Markdown rendering, chunking, reactions, edits,
 //! files and history.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use matrix_sdk::{
     attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo},
@@ -322,6 +322,11 @@ async fn do_send_file(daemon: &Daemon, session: &str, cmd: SendFile) -> Result<O
     if !meta.is_file() {
         return Err(file_error(format!("{} is not a regular file", path.display())));
     }
+    let real = tokio::fs::canonicalize(path).await.map_err(|e| file_error(format!("cannot resolve {}: {e}", path.display())))?;
+    if is_private(&real, &daemon.private_paths, &daemon.inbox.dir) {
+        warn!(session, path = %path.display(), "send_file refused: the daemon's own state or configuration");
+        return Err(file_error(format!("{} belongs to the daemon's own state or configuration and is never sent", path.display())));
+    }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_owned();
     let reply_to = parse_optional_event_id(cmd.reply_to.as_deref())?;
     let thread = parse_optional_event_id(cmd.thread.as_deref())?;
@@ -366,6 +371,14 @@ async fn do_send_file(daemon: &Daemon, session: &str, cmd: SendFile) -> Result<O
     after_send(daemon, session, &room, cmd.more).await;
     info!(session, room = %room.room_id(), name, bytes, mime = %mime, more = cmd.more, "file sent");
     Ok(response.event_id)
+}
+
+/// Whether a resolved path is one of the daemon's own files, which no session may send
+/// whatever a message asked for: the state directory holds the access token and the
+/// encryption store, the configuration file the password. The inbox is inside the
+/// state directory and is fine to send from (a received file forwarded to another room).
+fn is_private(real: &Path, private: &[PathBuf], inbox: &Path) -> bool {
+    !real.starts_with(inbox) && private.iter().any(|p| real.starts_with(p))
 }
 
 /// Raw pages read for one history command at most, so a room full of reactions
@@ -515,4 +528,24 @@ fn history_message(daemon: &Daemon, event: &matrix_sdk::deserialized_responses::
         match_start: None,
         attachments,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_daemons_own_files_are_private_but_the_inbox_is_not() {
+        let state = PathBuf::from("/var/lib/silta");
+        let config = PathBuf::from("/etc/silta/siltad.toml");
+        let private = [state.clone(), config.clone()];
+        let inbox = state.join("inbox");
+        assert!(is_private(&state.join("session.json"), &private, &inbox));
+        assert!(is_private(&state.join("store/matrix-sdk-crypto.sqlite3"), &private, &inbox));
+        assert!(is_private(&config, &private, &inbox));
+        assert!(!is_private(&inbox.join("abc-photo.jpg"), &private, &inbox));
+        assert!(!is_private(Path::new("/home/dev/workspace/assistant/out/report.md"), &private, &inbox));
+        // A sibling whose name merely starts the same is not inside.
+        assert!(!is_private(Path::new("/var/lib/silta-backup/x"), &private, &inbox));
+    }
 }
