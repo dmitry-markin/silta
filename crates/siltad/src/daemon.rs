@@ -16,7 +16,7 @@ use matrix_sdk::{
 use silta::{
     backlog::Backlog,
     config::Routing,
-    protocol::{Cmd, CmdKind, CmdResult, DaemonMessage, Event, EventKind},
+    protocol::{Cmd, CmdKind, CmdResult, DaemonMessage, Event, EventKind, ResultError},
     replay::Watermark,
 };
 use thiserror::Error;
@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::{inbox::InboxConfig, outbound};
+use crate::{outbound, spool::Spool};
 
 /// Messages kept for a session that is not connected, per session.
 const BACKLOG_MAX: usize = 100;
@@ -45,11 +45,11 @@ pub struct Daemon {
     pub registry: Registry,
     pub started_at_ms: u64,
     pub replay_window_ms: u64,
-    pub inbox: InboxConfig,
-    /// Resolved paths `send_file` refuses: the daemon's state directory (the access
-    /// token, the encryption store) and its configuration file (the password). The
-    /// inbox inside the state directory is exempt.
-    pub private_paths: Vec<PathBuf>,
+    pub spool: Spool,
+    /// Told to every session in `welcome`: how long its plugin keeps received files.
+    pub inbox_max_age_days: u64,
+    /// The uid each session's plugin must connect as, by session name.
+    pub users: HashMap<String, u32>,
     marks: Marks,
     typing: Arc<Mutex<HashMap<OwnedRoomId, TypingTask>>>,
     typing_generation: Mutex<u64>,
@@ -72,8 +72,9 @@ impl Daemon {
         routing: Routing,
         state_dir: &Path,
         replay_window_secs: u64,
-        inbox: InboxConfig,
-        private_paths: Vec<PathBuf>,
+        spool: Spool,
+        inbox_max_age_days: u64,
+        users: HashMap<String, u32>,
     ) -> Daemon {
         Daemon {
             client,
@@ -81,21 +82,23 @@ impl Daemon {
             registry: Registry::default(),
             started_at_ms: now_ms(),
             replay_window_ms: replay_window_secs.saturating_mul(1000),
-            inbox,
-            private_paths,
+            spool,
+            inbox_max_age_days,
+            users,
             marks: Marks::load(state_dir.join(MARKS_FILE)),
             typing: Arc::new(Mutex::new(HashMap::new())),
             typing_generation: Mutex::new(0),
         }
     }
 
-    /// Execute one command on behalf of a connected session.
+    /// Execute one command on behalf of a connected session. `send_file` needs the
+    /// transfer the connection received and is dispatched by the server instead.
     pub async fn execute(&self, session: &str, cmd: Cmd) -> CmdResult {
         match cmd.kind {
             CmdKind::Reply(reply) => outbound::reply(self, session, cmd.id, reply).await,
             CmdKind::React(react) => outbound::react(self, session, cmd.id, react).await,
             CmdKind::Edit(edit) => outbound::edit(self, session, cmd.id, edit).await,
-            CmdKind::SendFile(file) => outbound::send_file(self, session, cmd.id, file).await,
+            CmdKind::SendFile(_) => CmdResult::err(cmd.id, ResultError::BadRequest, "send_file is handled per connection"),
             CmdKind::FetchMessages(fetch) => outbound::fetch_messages(self, session, cmd.id, fetch).await,
             CmdKind::FetchMessage(fetch) => outbound::fetch_message(self, session, cmd.id, fetch).await,
             CmdKind::SearchMessages(search) => outbound::search_messages(self, session, cmd.id, search).await,

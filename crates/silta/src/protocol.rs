@@ -1,4 +1,4 @@
-//! Socket protocol v1 between `siltad` (server) and a session plugin (client).
+//! Socket protocol v2 between `siltad` (server) and a session plugin (client).
 //!
 //! JSON lines over a Unix stream socket, one object per line, UTF-8, `\n` terminated,
 //! at most [`MAX_LINE_BYTES`] per line. The wire format is pinned by the tests at the
@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
 /// Protocol revision carried in `hello` and `welcome`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Hard cap on one line, a guard against a runaway peer rather than a buffer size.
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -19,6 +19,10 @@ pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub enum ClientMessage {
     Hello(Hello),
     Cmd(Cmd),
+    /// A file for a `send_file` command that follows, see [`FileHeader`].
+    File(FileHeader),
+    Chunk(FileChunk),
+    FileEnd(FileEnd),
 }
 
 /// Messages from the daemon to a plugin.
@@ -29,6 +33,33 @@ pub enum DaemonMessage {
     Error(ProtocolError),
     Event(Event),
     Result(CmdResult),
+    /// An attachment of an event that follows, see [`FileHeader`].
+    File(FileHeader),
+    Chunk(FileChunk),
+    FileEnd(FileEnd),
+}
+
+/// A file crossing the socket: this header, then `chunk` lines carrying the bytes in
+/// order as base64, then `file_end`, then the event or command that refers to the
+/// transfer id. Transfer ids are unique per connection and direction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHeader {
+    pub transfer: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChunk {
+    pub transfer: String,
+    /// Standard base64 with padding, at most [`crate::transfer::CHUNK_BYTES`] of file.
+    pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEnd {
+    pub transfer: String,
 }
 
 /// First line on a connection: which session this client is.
@@ -46,7 +77,10 @@ pub struct Welcome {
     pub session: String,
     /// The bot's Matrix user id.
     pub user_id: String,
+    /// The people this session receives from.
     pub people: Vec<Person>,
+    /// How long the plugin keeps received files in the session's inbox.
+    pub inbox_max_age_days: u64,
 }
 
 /// A registered person as announced in `welcome`.
@@ -87,6 +121,8 @@ pub enum ErrorCode {
     UnknownSession,
     SessionBusy,
     BadRequest,
+    /// The connecting process runs as a Unix user other than the session's.
+    WrongUser,
 }
 
 impl ErrorCode {
@@ -96,6 +132,7 @@ impl ErrorCode {
             ErrorCode::UnknownSession => "unknown_session",
             ErrorCode::SessionBusy => "session_busy",
             ErrorCode::BadRequest => "bad_request",
+            ErrorCode::WrongUser => "wrong_user",
         }
     }
 }
@@ -125,7 +162,8 @@ pub struct Event {
     /// The text; an emote arrives as `/me <text>`; a reaction carries its emoji.
     pub text: String,
     pub transcribed: bool,
-    /// Files the daemon downloaded into its inbox; always present.
+    /// Files sent with the message, each transferred over the socket before the event;
+    /// always present.
     pub attachments: Vec<Attachment>,
 }
 
@@ -145,13 +183,14 @@ impl EventKind {
     }
 }
 
-/// A file the daemon downloaded into its inbox.
+/// A file of an event, sent over the socket just before the event as the transfer
+/// named here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
+    pub transfer: String,
     pub name: String,
     pub mime: String,
     pub size: u64,
-    pub path: String,
 }
 
 /// A command from the plugin. `id` is chosen by the client, unique per connection;
@@ -233,12 +272,11 @@ pub struct Edit {
     pub more: bool,
 }
 
-/// Send a file from the daemon's host into a room.
+/// Send a file into a room: the transfer the plugin streamed just before this command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendFile {
     pub room_id: String,
-    /// Absolute path of a regular file.
-    pub path: String,
+    pub transfer: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -498,11 +536,11 @@ mod tests {
 
     #[test]
     fn hello() {
-        let msg = roundtrip_client(r#"{"hello":{"protocol":1,"session":"hub","client":"silta-claude/0.1.0"}}"#);
+        let msg = roundtrip_client(r#"{"hello":{"protocol":2,"session":"hub","client":"silta-claude/0.1.0"}}"#);
         assert_eq!(
             msg,
             ClientMessage::Hello(Hello {
-                protocol: 1,
+                protocol: 2,
                 session: "hub".into(),
                 client: "silta-claude/0.1.0".into()
             })
@@ -512,16 +550,17 @@ mod tests {
     #[test]
     fn welcome() {
         let msg = roundtrip_daemon(
-            r#"{"welcome":{"protocol":1,"session":"hub","user_id":"@silta:silta.test","people":[{"name":"Bob","role":"owner"},{"name":"Alice","role":"family"}]}}"#,
+            r#"{"welcome":{"protocol":2,"session":"hub","user_id":"@silta:silta.test","people":[{"name":"Bob","role":"owner"},{"name":"Alice","role":"family"}],"inbox_max_age_days":30}}"#,
         );
         let DaemonMessage::Welcome(w) = msg else { panic!("not welcome") };
         assert_eq!(w.people[0].role, Role::Owner);
         assert_eq!(w.people[1], Person { name: "Alice".into(), role: Role::Family });
+        assert_eq!(w.inbox_max_age_days, 30);
     }
 
     #[test]
     fn handshake_errors() {
-        for code in ["protocol_mismatch", "unknown_session", "session_busy", "bad_request"] {
+        for code in ["protocol_mismatch", "unknown_session", "session_busy", "bad_request", "wrong_user"] {
             let json = format!(r#"{{"error":{{"code":"{code}","message":"..."}}}}"#);
             let msg = roundtrip_daemon(&json);
             let DaemonMessage::Error(e) = msg else { panic!("not error") };
@@ -550,11 +589,11 @@ mod tests {
 
     #[test]
     fn event_with_attachments() {
-        let json = r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","event_id":"$xyz","ts":"2026-09-05T18:02:11Z","text":"","transcribed":true,"attachments":[{"name":"a.ogg","mime":"audio/ogg","size":12,"path":"/var/lib/silta/inbox/a.ogg"}]}}"#;
+        let json = r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","event_id":"$xyz","ts":"2026-09-05T18:02:11Z","text":"","transcribed":true,"attachments":[{"transfer":"xyz-1","name":"a.ogg","mime":"audio/ogg","size":12}]}}"#;
         let msg = roundtrip_daemon(json);
         let DaemonMessage::Event(e) = msg else { panic!("not event") };
         assert_eq!(e.attachments[0].size, 12);
-        assert_eq!(e.attachments[0].path, "/var/lib/silta/inbox/a.ogg");
+        assert_eq!(e.attachments[0].transfer, "xyz-1");
     }
 
     #[test]
@@ -608,7 +647,7 @@ mod tests {
         // `more` on the other sending commands, absent when false.
         let msg = roundtrip_client(r#"{"cmd":{"id":12,"react":{"room_id":"!r","event_id":"$e","emoji":"👀","more":true}}}"#);
         assert!(matches!(msg, ClientMessage::Cmd(Cmd { kind: CmdKind::React(React { more: true, .. }), .. })));
-        let msg = roundtrip_client(r#"{"cmd":{"id":13,"send_file":{"room_id":"!r","path":"/a","more":true}}}"#);
+        let msg = roundtrip_client(r#"{"cmd":{"id":13,"send_file":{"room_id":"!r","transfer":"t3","more":true}}}"#);
         assert!(matches!(msg, ClientMessage::Cmd(Cmd { kind: CmdKind::SendFile(SendFile { more: true, .. }), .. })));
     }
 
@@ -625,12 +664,12 @@ mod tests {
         assert_eq!(cmd.kind.name(), "edit");
 
         let msg = roundtrip_client(
-            r#"{"cmd":{"id":3,"send_file":{"room_id":"!r","path":"/abs/report.md","caption":"the report","reply_to":"$e","thread":"$root"}}}"#,
+            r#"{"cmd":{"id":3,"send_file":{"room_id":"!r","transfer":"t1","caption":"the report","reply_to":"$e","thread":"$root"}}}"#,
         );
         let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
         let CmdKind::SendFile(f) = cmd.kind else { panic!("not send_file") };
         assert_eq!(f.caption.as_deref(), Some("the report"));
-        let msg = roundtrip_client(r#"{"cmd":{"id":4,"send_file":{"room_id":"!r","path":"/abs/a.png"}}}"#);
+        let msg = roundtrip_client(r#"{"cmd":{"id":4,"send_file":{"room_id":"!r","transfer":"t2"}}}"#);
         assert!(matches!(msg, ClientMessage::Cmd(Cmd { kind: CmdKind::SendFile(_), .. })));
 
         let msg = roundtrip_client(r#"{"cmd":{"id":5,"fetch_messages":{"room_id":"!r","limit":20,"from":"t1"}}}"#);
@@ -715,7 +754,7 @@ mod tests {
 
     #[test]
     fn classify_client_lines() {
-        let good = parse_client_line(r#"{"hello":{"protocol":1,"session":"hub","client":"x"}}"#).unwrap();
+        let good = parse_client_line(r#"{"hello":{"protocol":2,"session":"hub","client":"x"}}"#).unwrap();
         assert!(matches!(good, Incoming::Message(ClientMessage::Hello(_))));
 
         // A reserved command with an id: bad_request.
@@ -745,10 +784,24 @@ mod tests {
     }
 
     #[test]
+    fn file_transfer_lines() {
+        let header = r#"{"file":{"transfer":"abc-1","name":"photo.jpg","mime":"image/jpeg","size":3}}"#;
+        let DaemonMessage::File(h) = roundtrip_daemon(header) else { panic!("not file") };
+        assert_eq!((h.transfer.as_str(), h.size), ("abc-1", 3));
+        let DaemonMessage::Chunk(c) = roundtrip_daemon(r#"{"chunk":{"transfer":"abc-1","data":"AQID"}}"#) else { panic!("not chunk") };
+        assert_eq!(c.data, "AQID");
+        assert!(matches!(roundtrip_daemon(r#"{"file_end":{"transfer":"abc-1"}}"#), DaemonMessage::FileEnd(_)));
+        // The same three lines go the other way before a send_file command.
+        assert!(matches!(roundtrip_client(r#"{"file":{"transfer":"t1","name":"a.md","mime":"text/markdown","size":9}}"#), ClientMessage::File(_)));
+        assert!(matches!(roundtrip_client(r#"{"chunk":{"transfer":"t1","data":"AQID"}}"#), ClientMessage::Chunk(_)));
+        assert!(matches!(roundtrip_client(r#"{"file_end":{"transfer":"t1"}}"#), ClientMessage::FileEnd(_)));
+    }
+
+    #[test]
     fn extra_fields_are_tolerated() {
         // A newer plugin may add fields; the daemon must not disconnect over them.
         let msg: ClientMessage =
-            serde_json::from_str(r#"{"hello":{"protocol":1,"session":"hub","client":"x","features":["a"]}}"#).unwrap();
+            serde_json::from_str(r#"{"hello":{"protocol":2,"session":"hub","client":"x","features":["a"]}}"#).unwrap();
         assert!(matches!(msg, ClientMessage::Hello(_)));
         let msg: DaemonMessage = serde_json::from_str(
             r#"{"event":{"kind":"message","person":"A","role":"owner","sender":"@a:x","room_id":"!r","event_id":"$e","ts":"t","text":"x","transcribed":false,"attachments":[],"thread":"$t"}}"#,

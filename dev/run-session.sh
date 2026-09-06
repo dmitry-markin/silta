@@ -5,7 +5,8 @@
 #   dev/run-session.sh <session-id> resume an earlier session
 #
 # stdin is a FIFO held open by this script; one initial user message
-# starts the first turn, after which channel events arrive as turns. Output goes to
+# starts the first turn, after which channel events arrive as turns. SILTA_SESSION picks
+# the session (default hub); the persona comes from assistant/persona.md. Output goes to
 # dev/state/hub.log (stream-json) and dev/state/hub.err (Claude Code's stderr). The
 # session id is printed and saved to dev/state/hub.session-id for later resume.
 set -euo pipefail
@@ -31,10 +32,14 @@ if [ $# -ge 1 ]; then
 else
   args+=(--name silta-hub)
 fi
-# The daemon writes attachments under its state directory, outside the workspace; the
-# session may read them only because the directory is allowed here.
-args+=(--add-dir "$state/silta/inbox")
+# One persona for every session, in the system prompt; no CLAUDE.md in the workspace.
+# Attachments land in the workspace's inbox, written by the plugin.
+export SILTA_INBOX="${SILTA_INBOX:-$repo/dev/workspace/inbox}"
+args+=(--append-system-prompt-file "$repo/assistant/persona.md")
 args+=(--channels plugin:silta-claude@silta-local)
+
+# Set Opus 5 high for now.
+args+=(--model opus --effort high)
 
 initial='{"type":"user","message":{"role":"user","content":"You are connected to the family chat through the silta channel. Wait for messages and answer each one through the reply tool."}}'
 

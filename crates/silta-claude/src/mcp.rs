@@ -1,6 +1,6 @@
 //! The MCP server: channel capability, the tools, and the notification pump.
 
-use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -15,13 +15,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use silta::protocol::{
-    CmdKind, Edit, Event, EventKind, FetchMessage, FetchMessages, HistoryMessage, React, Reply, SearchMessages, SendFile,
-    Typing,
+    CmdKind, Edit, EventKind, FetchMessage, FetchMessages, HistoryMessage, React, Reply, SearchMessages, SendFile, Typing,
 };
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::daemon::DaemonClient;
+use crate::daemon::{DaemonClient, Inbound};
 
 const CHANNEL_NOTIFICATION: &str = "notifications/claude/channel";
 
@@ -34,7 +33,7 @@ Optional attributes: in_reply_to=\"$...\" when the message quotes another messag
 thread=\"$...\" when the message is in a thread (pass the same value as thread to reply or \
 send_file to stay in it); attachment_1_path, attachment_1_name, attachment_1_mime and \
 attachment_1_size (then attachment_2_...) for each file the person sent, already downloaded \
-and decrypted on this host: read it with the Read tool, which shows images and PDFs directly. \
+and decrypted into this session's inbox: read it with the Read tool, which shows images and PDFs directly. \
 A text starting with /me is an emote. kind=\"reaction\" with reacts_to=\"$...\" means the \
 person reacted with the emoji in the text to that message of yours; it usually needs no reply. \
 Tools: reply sends text; react sends an emoji, as the whole answer or as a mark that you \
@@ -93,7 +92,7 @@ pub struct EditParams {
 pub struct SendFileParams {
     /// The room: the room_id attribute of the channel tag.
     pub room_id: String,
-    /// Absolute path of an existing file on this host.
+    /// Absolute path of an existing file this session can read.
     pub path: String,
     /// Text shown with the file, in Markdown. Optional.
     #[serde(default)]
@@ -151,13 +150,13 @@ pub struct SearchMessagesParams {
 #[derive(Clone)]
 pub struct SiltaChannel {
     daemon: DaemonClient,
-    events: Arc<Mutex<Option<mpsc::Receiver<Event>>>>,
+    events: Arc<Mutex<Option<mpsc::Receiver<Inbound>>>>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl SiltaChannel {
-    pub fn new(daemon: DaemonClient, events: mpsc::Receiver<Event>) -> Self {
+    pub fn new(daemon: DaemonClient, events: mpsc::Receiver<Inbound>) -> Self {
         SiltaChannel { daemon, events: Arc::new(Mutex::new(Some(events))), tool_router: Self::tool_router() }
     }
 
@@ -187,18 +186,17 @@ impl SiltaChannel {
 
     #[tool(
         name = "send_file",
-        description = "Send a file from this host into a room: an absolute path of an existing file. Images, audio and video are shown as such, everything else as a file. Optional caption (Markdown), reply_to and thread as for reply. Fails with file_error when the path is not a readable regular file or the file is larger than the server accepts, plus the codes of reply."
+        description = "Send a file from this host into a room: an absolute path of an existing file this session can read. Images, audio and video are shown as such, everything else as a file. Optional caption (Markdown), reply_to and thread as for reply. Fails with file_error when the path is not a readable regular file or the file is larger than the server accepts, plus the codes of reply."
     )]
     async fn send_file(&self, Parameters(p): Parameters<SendFileParams>) -> Result<CallToolResult, McpError> {
-        self.send(CmdKind::SendFile(SendFile {
-            room_id: p.room_id,
-            path: p.path,
-            caption: p.caption,
-            reply_to: p.reply_to,
-            thread: p.thread,
-            more: p.more,
-        }))
-        .await
+        let cmd = SendFile { room_id: p.room_id, transfer: String::new(), caption: p.caption, reply_to: p.reply_to, thread: p.thread, more: p.more };
+        match self.daemon.send_file(PathBuf::from(p.path), cmd).await {
+            Ok(result) => Ok(CallToolResult::success(vec![ContentBlock::text(format!("sent: {}", result.event_id.unwrap_or_default()))])),
+            Err(err) => {
+                warn!("send_file failed: {err}");
+                Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]))
+            }
+        }
     }
 
     #[tool(
@@ -353,8 +351,10 @@ fn history_line(m: &HistoryMessage, max_chars: Option<usize>) -> String {
     serde_json::to_string(&line).unwrap_or_default()
 }
 
-/// The `<channel>` tag for an event: its attributes and its body.
-fn channel_params(event: &Event) -> serde_json::Value {
+/// The `<channel>` tag for an event: its attributes and its body. An attachment whose
+/// transfer did not arrive has no path attribute and is named in the text instead.
+fn channel_params(inbound: &Inbound) -> serde_json::Value {
+    let event = &inbound.event;
     let mut meta = serde_json::Map::new();
     if event.kind != EventKind::Message {
         meta.insert("kind".into(), json!(event.kind.as_str()));
@@ -374,18 +374,30 @@ fn channel_params(event: &Event) -> serde_json::Value {
     if let Some(reacts_to) = &event.reacts_to {
         meta.insert("reacts_to".into(), json!(reacts_to));
     }
+    let mut missing = Vec::new();
     for (i, attachment) in event.attachments.iter().enumerate() {
         let n = i + 1;
         meta.insert(format!("attachment_{n}_name"), json!(attachment.name));
         meta.insert(format!("attachment_{n}_mime"), json!(attachment.mime));
         meta.insert(format!("attachment_{n}_size"), json!(attachment.size.to_string()));
-        meta.insert(format!("attachment_{n}_path"), json!(attachment.path));
+        match inbound.paths.get(i).and_then(|p| p.as_ref()) {
+            Some(path) => {
+                meta.insert(format!("attachment_{n}_path"), json!(path.to_string_lossy()));
+            }
+            None => missing.push(format!("[attachment \"{}\" was not received; ask for it again]", attachment.name)),
+        }
     }
-    let content = if event.text.is_empty() && !event.attachments.is_empty() {
+    let mut content = if event.text.is_empty() && !event.attachments.is_empty() {
         event.attachments.iter().map(|a| format!("[attachment: {}]", a.name)).collect::<Vec<_>>().join("\n")
     } else {
         event.text.clone()
     };
+    for line in missing {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&line);
+    }
     json!({ "content": content, "meta": meta })
 }
 
@@ -414,10 +426,10 @@ impl ServerHandler for SiltaChannel {
         info!("client initialized, starting the notification pump");
         let peer = context.peer.clone();
         tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                let notification = CustomNotification::new(CHANNEL_NOTIFICATION, Some(channel_params(&event)));
+            while let Some(inbound) = events.recv().await {
+                let notification = CustomNotification::new(CHANNEL_NOTIFICATION, Some(channel_params(&inbound)));
                 match peer.send_notification(ServerNotification::CustomNotification(notification)).await {
-                    Ok(()) => debug!(kind = event.kind.as_str(), "channel notification delivered"),
+                    Ok(()) => debug!(kind = inbound.event.kind.as_str(), "channel notification delivered"),
                     Err(err) => {
                         warn!("cannot deliver channel notification, stopping the pump: {err}");
                         return;
@@ -437,7 +449,7 @@ impl ServerHandler for SiltaChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use silta::protocol::{Attachment, Role};
+    use silta::protocol::{Attachment, Event, Role};
 
     fn event() -> Event {
         Event {
@@ -460,14 +472,21 @@ mod tests {
     #[test]
     fn attachments_become_numbered_attributes_and_a_body() {
         let mut e = event();
-        e.attachments.push(Attachment { name: "photo.jpg".into(), mime: "image/jpeg".into(), size: 1234, path: "/inbox/x-photo.jpg".into() });
-        let params = channel_params(&e);
+        e.attachments.push(Attachment { transfer: "e-1".into(), name: "photo.jpg".into(), mime: "image/jpeg".into(), size: 1234 });
+        let inbound = Inbound { event: e.clone(), paths: vec![Some(PathBuf::from("/inbox/e-1-photo.jpg"))] };
+        let params = channel_params(&inbound);
         assert_eq!(params["content"], "[attachment: photo.jpg]");
-        assert_eq!(params["meta"]["attachment_1_path"], "/inbox/x-photo.jpg");
+        assert_eq!(params["meta"]["attachment_1_path"], "/inbox/e-1-photo.jpg");
         assert_eq!(params["meta"]["attachment_1_size"], "1234");
         assert!(params["meta"].get("kind").is_none());
         e.text = "look at this".into();
-        assert_eq!(channel_params(&e)["content"], "look at this");
+        let inbound = Inbound { event: e.clone(), paths: vec![Some(PathBuf::from("/inbox/e-1-photo.jpg"))] };
+        assert_eq!(channel_params(&inbound)["content"], "look at this");
+        // A transfer that never arrived: no path, and the text says so.
+        let inbound = Inbound { event: e, paths: vec![None] };
+        let params = channel_params(&inbound);
+        assert!(params["meta"].get("attachment_1_path").is_none());
+        assert_eq!(params["content"], "look at this\n[attachment \"photo.jpg\" was not received; ask for it again]");
     }
 
     #[test]
@@ -531,7 +550,7 @@ mod tests {
         e.kind = EventKind::Reaction;
         e.reacts_to = Some("$bot".into());
         e.text = "👍".into();
-        let params = channel_params(&e);
+        let params = channel_params(&Inbound { event: e, paths: Vec::new() });
         assert_eq!(params["meta"]["kind"], "reaction");
         assert_eq!(params["meta"]["reacts_to"], "$bot");
         assert_eq!(params["content"], "👍");
@@ -539,7 +558,7 @@ mod tests {
         let mut e = event();
         e.thread = Some("$root".into());
         e.in_reply_to = Some("$q".into());
-        let params = channel_params(&e);
+        let params = channel_params(&Inbound { event: e, paths: Vec::new() });
         assert_eq!(params["meta"]["thread"], "$root");
         assert_eq!(params["meta"]["in_reply_to"], "$q");
     }

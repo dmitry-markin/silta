@@ -1,24 +1,35 @@
-//! The Unix socket server: one connection per session, hello handshake, then
-//! commands in and events out.
+//! The Unix socket server: one connection per session, hello handshake with a check
+//! of the peer's Unix user, then commands and files in, events and files out.
 
-use std::{fs, os::unix::fs::{FileTypeExt, PermissionsExt}, path::PathBuf, time::Duration};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    fs,
+    io,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::{bail, Context, Result};
 use silta::{
     line::{write_line, LineReader},
     protocol::{
-        ClientMessage, CmdResult, DaemonMessage, ErrorCode, Hello, Incoming, ProtocolError, ResultError,
-        Welcome, PROTOCOL_VERSION,
+        ClientMessage, Cmd, CmdKind, CmdResult, DaemonMessage, ErrorCode, Event, FileHeader, Hello, Incoming,
+        ProtocolError, ResultError, Welcome, PROTOCOL_VERSION,
     },
+    transfer::{self, Piece, Received, Receiver},
 };
 use tokio::{
     net::{unix::OwnedWriteHalf, UnixListener, UnixStream},
     time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::daemon::{now_ms, Shared};
+use crate::{
+    daemon::{now_ms, Daemon, Shared},
+    outbound,
+};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -59,6 +70,14 @@ pub async fn run(daemon: Shared, path: PathBuf, cancel: CancellationToken) -> Re
 }
 
 async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
+    // Who is on the other end, from the kernel, before any byte is trusted.
+    let peer_uid = match stream.peer_cred() {
+        Ok(cred) => Some(cred.uid()),
+        Err(err) => {
+            warn!("cannot read the peer credentials of a connection: {err}");
+            None
+        }
+    };
     let (read_half, mut writer) = stream.into_split();
     let mut reader = LineReader::new(read_half);
 
@@ -78,6 +97,17 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
         refuse(&mut writer, ErrorCode::UnknownSession, format!("no session {session:?} in the daemon configuration")).await;
         return;
     }
+    match (daemon.users.get(&session), peer_uid) {
+        (Some(&uid), Some(peer)) if uid == peer => {}
+        (Some(&uid), Some(peer)) => {
+            refuse(&mut writer, ErrorCode::WrongUser, format!("session {session:?} runs as uid {uid}, the connecting process as uid {peer}")).await;
+            return;
+        }
+        _ => {
+            refuse(&mut writer, ErrorCode::WrongUser, format!("cannot verify the user behind session {session:?}")).await;
+            return;
+        }
+    }
     let Some((mut outbound, _claim)) = daemon.registry.claim(&session) else {
         refuse(&mut writer, ErrorCode::SessionBusy, format!("session {session:?} is already connected")).await;
         return;
@@ -87,12 +117,13 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
         session: session.clone(),
         user_id: daemon.routing.bot_user_id().to_owned(),
         people: daemon.routing.people_for(&session),
+        inbox_max_age_days: daemon.inbox_max_age_days,
     });
     if let Err(err) = write_line(&mut writer, &welcome).await {
         warn!(session, "cannot send welcome: {err}");
         return;
     }
-    info!(session, client = %hello.client, "session connected");
+    info!(session, client = %hello.client, uid = ?peer_uid, "session connected");
 
     // Messages that arrived while the session was away, oldest first.
     let (queued, evicted) = daemon.registry.take_backlog(&session, now_ms());
@@ -101,7 +132,7 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
     }
     let count = queued.len();
     for (ts_ms, event) in queued {
-        if let Err(err) = write_line(&mut writer, &DaemonMessage::Event(event.clone())).await {
+        if let Err(err) = write_event(&daemon, &mut writer, &session, &event).await {
             warn!(session, "write failed while delivering the backlog: {err}");
             return;
         }
@@ -111,12 +142,21 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
         info!(session, count, "delivered the messages queued while the session was away");
     }
 
+    // Files the session streams for `send_file`, spooled until the command names them.
+    let mut receiver = Receiver::new(daemon.spool.outbox.clone(), format!("{session}-"), daemon.spool.max_bytes);
+    let mut received: HashMap<String, Received> = HashMap::new();
+    let mut failed: HashMap<String, String> = HashMap::new();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             message = outbound.recv() => match message {
                 Some(message) => {
-                    if let Err(err) = write_line(&mut writer, &message).await {
+                    let written = match &message {
+                        DaemonMessage::Event(event) => write_event(&daemon, &mut writer, &session, event).await,
+                        other => write_line(&mut writer, other).await,
+                    };
+                    if let Err(err) = written {
                         warn!(session, "write failed: {err}");
                         break;
                     }
@@ -126,10 +166,52 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
             line = reader.next_line() => match line {
                 Ok(Some(line)) => match silta::protocol::parse_client_line(&line) {
                     Ok(Incoming::Message(ClientMessage::Cmd(cmd))) => {
-                        let result = daemon.execute(&session, cmd).await;
+                        let result = match cmd.kind {
+                            CmdKind::SendFile(file) => match received.remove(&file.transfer) {
+                                Some(file_received) => outbound::send_file(&daemon, &session, cmd.id, file, file_received).await,
+                                None => {
+                                    let why = failed.remove(&file.transfer).unwrap_or_else(|| "no such transfer was received before the command".to_owned());
+                                    CmdResult::err(cmd.id, ResultError::FileError, format!("transfer {:?}: {why}", file.transfer))
+                                }
+                            },
+                            kind => daemon.execute(&session, Cmd { id: cmd.id, kind }).await,
+                        };
                         if let Err(err) = write_line(&mut writer, &DaemonMessage::Result(result)).await {
                             warn!(session, "write failed: {err}");
                             break;
+                        }
+                    }
+                    Ok(Incoming::Message(ClientMessage::File(header))) => {
+                        debug!(session, transfer = %header.transfer, name = %header.name, size = header.size, "file transfer begins");
+                        let transfer = header.transfer.clone();
+                        if let Err(err) = receiver.begin(header).await {
+                            warn!(session, transfer, "file transfer refused: {err}");
+                            failed.insert(transfer, err.to_string());
+                        }
+                    }
+                    Ok(Incoming::Message(ClientMessage::Chunk(chunk))) => {
+                        let transfer = chunk.transfer.clone();
+                        if let Err(err) = receiver.chunk(chunk).await {
+                            // Logged once per transfer, not once per chunk.
+                            if let Entry::Vacant(slot) = failed.entry(transfer) {
+                                warn!(session, transfer = %slot.key(), "file transfer failed: {err}");
+                                slot.insert(err.to_string());
+                            }
+                        }
+                    }
+                    Ok(Incoming::Message(ClientMessage::FileEnd(end))) => {
+                        let transfer = end.transfer.clone();
+                        match receiver.end(end).await {
+                            Ok(done) => {
+                                debug!(session, transfer, bytes = done.header.size, "file transfer complete");
+                                received.insert(transfer, done);
+                            }
+                            Err(err) => {
+                                if let Entry::Vacant(slot) = failed.entry(transfer) {
+                                    warn!(session, transfer = %slot.key(), "file transfer failed: {err}");
+                                    slot.insert(err.to_string());
+                                }
+                            }
                         }
                     }
                     Ok(Incoming::Message(ClientMessage::Hello(_))) => {
@@ -159,8 +241,47 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
             },
         }
     }
+    receiver.abort_all().await;
+    for (_, file) in received.drain() {
+        let _ = tokio::fs::remove_file(&file.path).await;
+    }
     daemon.typing_stop_session(&session);
     info!(session, "session disconnected");
+}
+
+fn wrap(piece: Piece) -> DaemonMessage {
+    match piece {
+        Piece::Header(h) => DaemonMessage::File(h),
+        Piece::Chunk(c) => DaemonMessage::Chunk(c),
+        Piece::End(e) => DaemonMessage::FileEnd(e),
+    }
+}
+
+/// Write an event to a session: each attachment streams from the spool first (and
+/// leaves it), then the event line. An attachment missing from the spool (swept, or
+/// the daemon restarted meanwhile) is logged and the event goes without it; the
+/// plugin tells the model.
+async fn write_event(daemon: &Daemon, writer: &mut OwnedWriteHalf, session: &str, event: &Event) -> io::Result<()> {
+    for attachment in &event.attachments {
+        let path = daemon.spool.inbox_path(&attachment.transfer);
+        let header = FileHeader {
+            transfer: attachment.transfer.clone(),
+            name: attachment.name.clone(),
+            mime: attachment.mime.clone(),
+            size: attachment.size,
+        };
+        match transfer::send(writer, header, &path, wrap).await {
+            Ok(()) => {
+                debug!(session, transfer = %attachment.transfer, bytes = attachment.size, "attachment transferred");
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                warn!(session, transfer = %attachment.transfer, "attachment is gone from the spool; the event goes without it");
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    write_line(writer, &DaemonMessage::Event(event.clone())).await
 }
 
 async fn handshake(reader: &mut LineReader<tokio::net::unix::OwnedReadHalf>, writer: &mut OwnedWriteHalf) -> Result<Hello> {

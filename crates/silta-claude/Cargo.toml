@@ -12,6 +12,7 @@ silta.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
+mime_guess.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true

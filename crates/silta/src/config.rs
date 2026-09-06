@@ -33,9 +33,10 @@ pub struct Config {
     /// Downloaded attachments older than this are deleted from the inbox.
     #[serde(default = "default_inbox_max_age_days")]
     pub inbox_max_age_days: u64,
-    /// Attachments larger than this are not downloaded; the message says so instead.
-    #[serde(default = "default_inbox_max_file_mb")]
-    pub inbox_max_file_mb: u64,
+    /// The cap on one attachment in either direction: a larger file from a room is not
+    /// downloaded (the message says so instead), a larger file from a session is refused.
+    #[serde(default = "default_attachment_max_mb")]
+    pub attachment_max_mb: u64,
     /// Reserved for speech recognition; accepted and ignored with a warning.
     #[serde(default)]
     pub asr: Option<toml::Value>,
@@ -65,7 +66,7 @@ fn default_inbox_max_age_days() -> u64 {
     30
 }
 
-fn default_inbox_max_file_mb() -> u64 {
+fn default_attachment_max_mb() -> u64 {
     100
 }
 
@@ -95,16 +96,21 @@ pub struct SessionConfig {
     pub receive: Receive,
     #[serde(default)]
     pub send: SendPolicy,
+    /// The Unix user the session's plugin runs as; a `hello` from any other user is
+    /// refused. Resolved to a uid when the daemon starts.
+    pub user: String,
     /// Reserved for later; accepted and ignored with a warning.
     #[serde(default)]
     pub relay_permissions: Option<toml::Value>,
 }
 
-/// Which inbound rooms a session owns: everything not claimed by another session, or
-/// an explicit list of people and room ids.
+/// Which inbound rooms a session owns: everything not claimed by another session, the
+/// group rooms (two or more registered people in them), or an explicit list of people
+/// and room ids. A listed room always goes to the session listing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Receive {
     All,
+    Groups,
     Selective { people: Vec<String>, rooms: Vec<String> },
 }
 
@@ -116,12 +122,14 @@ impl<'de> Deserialize<'de> for Receive {
             type Value = Receive;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str(r#"the string "all" or a table { people = [...], rooms = [...] }"#)
+                f.write_str(r#"the string "all" or "groups", or a table { people = [...], rooms = [...] }"#)
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Receive, E> {
                 if v == "all" {
                     Ok(Receive::All)
+                } else if v == "groups" {
+                    Ok(Receive::Groups)
                 } else {
                     Err(E::invalid_value(de::Unexpected::Str(v), &self))
                 }
@@ -215,8 +223,8 @@ impl Config {
         if self.inbox_max_age_days == 0 {
             return invalid("inbox_max_age_days must be at least 1".into());
         }
-        if self.inbox_max_file_mb == 0 {
-            return invalid("inbox_max_file_mb must be at least 1".into());
+        if self.attachment_max_mb == 0 {
+            return invalid("attachment_max_mb must be at least 1".into());
         }
 
         let mut names = HashSet::new();
@@ -243,6 +251,7 @@ impl Config {
 
         let mut session_names = HashSet::new();
         let mut all_session: Option<&str> = None;
+        let mut groups_session: Option<&str> = None;
         let mut room_owner: HashMap<&str, &str> = HashMap::new();
         let mut person_owner: HashMap<&str, &str> = HashMap::new();
         for session in &self.sessions {
@@ -252,7 +261,19 @@ impl Config {
             if !session_names.insert(session.name.as_str()) {
                 return invalid(format!("session {:?} is listed twice", session.name));
             }
+            if session.user.is_empty() {
+                return invalid(format!("session {:?} has no user", session.name));
+            }
             match &session.receive {
+                Receive::Groups => {
+                    if let Some(first) = groups_session {
+                        return invalid(format!(
+                            "sessions {first:?} and {:?} both have receive = \"groups\"; only one may",
+                            session.name
+                        ));
+                    }
+                    groups_session = Some(&session.name);
+                }
                 Receive::All => {
                     if let Some(first) = all_session {
                         return invalid(format!(
@@ -334,7 +355,8 @@ pub enum DropReason {
     OwnMessage,
     /// The sender is not in the registry.
     UnknownSender,
-    /// No session owns this room or person, and there is no `all` session.
+    /// No session owns this room or person (or, for a group room, no session receives
+    /// groups), and there is no `all` session.
     NoSession,
 }
 
@@ -374,6 +396,7 @@ pub struct Routing {
     by_room: HashMap<String, usize>,
     by_person: HashMap<String, usize>,
     all: Option<usize>,
+    groups: Option<usize>,
 }
 
 impl Routing {
@@ -388,10 +411,12 @@ impl Routing {
         let mut by_room = HashMap::new();
         let mut by_person = HashMap::new();
         let mut all = None;
+        let mut groups = None;
         for (i, session) in config.sessions.iter().enumerate() {
             by_name.insert(session.name.clone(), i);
             match &session.receive {
                 Receive::All => all = Some(i),
+                Receive::Groups => groups = Some(i),
                 Receive::Selective { people, rooms } => {
                     for person in people {
                         by_person.insert(person.clone(), i);
@@ -411,6 +436,7 @@ impl Routing {
             by_room,
             by_person,
             all,
+            groups,
         }
     }
 
@@ -435,28 +461,66 @@ impl Routing {
         self.sessions.iter().map(|s| s.name.as_str())
     }
 
-    /// The people announced to a session in `welcome`. For now it announces everyone;
-    /// per-session filtering comes with per-person sessions.
-    pub fn people_for(&self, _session: &str) -> Vec<Person> {
-        self.people.iter().map(|p| Person { name: p.name.clone(), role: p.role }).collect()
+    /// Every session with the Unix user it runs as.
+    pub fn session_users(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.sessions.iter().map(|s| (s.name.as_str(), s.user.as_str()))
     }
 
-    /// Decide who gets an inbound message: the session listing the room, else the one
-    /// listing the person, else the `all` session, else nobody.
-    pub fn inbound(&self, sender: &str, room_id: &str) -> Inbound<'_> {
+    /// The people announced to a session in `welcome`: the ones it receives from, so a
+    /// mind does not learn about other people from the handshake. A session that
+    /// receives groups, everything, or listed rooms hears about everyone.
+    pub fn people_for(&self, session: &str) -> Vec<Person> {
+        let listed: Option<&Vec<String>> = match self.session(session).map(|s| &s.receive) {
+            Some(Receive::Selective { people, rooms }) if rooms.is_empty() => Some(people),
+            _ => None,
+        };
+        self.people
+            .iter()
+            .filter(|p| listed.is_none_or(|l| l.contains(&p.name)))
+            .map(|p| Person { name: p.name.clone(), role: p.role })
+            .collect()
+    }
+
+    /// The registered people among a room's members other than the bot, and whether
+    /// every such member is registered.
+    fn people_in<'m>(&self, members: impl IntoIterator<Item = &'m str>) -> (HashSet<&str>, bool) {
+        let mut people = HashSet::new();
+        let mut all_registered = true;
+        for member in members {
+            if self.is_bot(member) {
+                continue;
+            }
+            match self.person_for(member) {
+                Some(person) => {
+                    people.insert(person.name.as_str());
+                }
+                None => all_registered = false,
+            }
+        }
+        (people, all_registered)
+    }
+
+    /// Decide who gets an inbound message. `members` are the user ids in the room. The
+    /// session listing the room wins; otherwise a group room (two or more registered
+    /// people) goes to the `groups` session and a DM to the person's session; the
+    /// `all` session takes what is left, and without one the message is dropped.
+    pub fn inbound<'m>(&self, sender: &str, room_id: &str, members: impl IntoIterator<Item = &'m str>) -> Inbound<'_> {
         if self.is_bot(sender) {
             return Inbound::Drop(DropReason::OwnMessage);
         }
         let Some(person) = self.person_for(sender) else {
             return Inbound::Drop(DropReason::UnknownSender);
         };
-        let owner = self
-            .by_room
-            .get(room_id)
-            .or_else(|| self.by_person.get(&person.name))
-            .or(self.all.as_ref());
+        let owner = match self.by_room.get(room_id) {
+            Some(&i) => Some(i),
+            None => {
+                let (people, _) = self.people_in(members);
+                let specific = if people.len() >= 2 { self.groups } else { self.by_person.get(&person.name).copied() };
+                specific.or(self.all)
+            }
+        };
         match owner {
-            Some(&i) => Inbound::Deliver { session: &self.sessions[i].name, person },
+            Some(i) => Inbound::Deliver { session: &self.sessions[i].name, person },
             None => Inbound::Drop(DropReason::NoSession),
         }
     }
@@ -497,28 +561,22 @@ impl Routing {
     }
 
     /// A session owns a room it lists, and any room whose members other than the bot
-    /// are all people it receives from.
+    /// are all registered people it receives from: everyone for `all`, two or more
+    /// people for `groups`, the listed people otherwise.
     fn owns_room<'m>(&self, i: usize, room_id: &str, members: impl IntoIterator<Item = &'m str>) -> Result<(), SendDenied> {
         if self.by_room.get(room_id) == Some(&i) {
             return Ok(());
         }
-        let config = &self.sessions[i];
-        let receives_from = |person: &PersonConfig| match &config.receive {
-            Receive::All => true,
-            Receive::Selective { people, .. } => people.contains(&person.name),
-        };
-        let mut any = false;
-        for member in members {
-            if self.is_bot(member) {
-                continue;
-            }
-            any = true;
-            match self.person_for(member) {
-                Some(person) if receives_from(person) => {}
-                _ => return Err(SendDenied::NotAllowed),
-            }
+        let (people, all_registered) = self.people_in(members);
+        if people.is_empty() || !all_registered {
+            return Err(SendDenied::NotAllowed);
         }
-        if any {
+        let owned = match &self.sessions[i].receive {
+            Receive::All => true,
+            Receive::Groups => people.len() >= 2,
+            Receive::Selective { people: listed, .. } => people.iter().all(|p| listed.iter().any(|l| l == p)),
+        };
+        if owned {
             Ok(())
         } else {
             Err(SendDenied::NotAllowed)
@@ -569,6 +627,7 @@ addresses = ["@alice:silta.test", "@alice2:silta.test"]
 name = "hub"
 receive = "all"
 send = "any"
+user = "silta-hub"
 "#;
 
     const SPLIT: &str = r#"
@@ -576,11 +635,32 @@ send = "any"
 name = "hub"
 receive = { people = ["Bob"], rooms = ["!family:silta.test"] }
 send = "any"
+user = "silta-hub"
 
 [[sessions]]
 name = "alice"
 receive = { people = ["Alice"] }
 send = "own"
+user = "silta-alice"
+"#;
+
+    /// The production shape: minds per person, the hub for group rooms.
+    const MINDS: &str = r#"
+[[sessions]]
+name = "hub"
+receive = "groups"
+send = "own"
+user = "silta-hub"
+
+[[sessions]]
+name = "bob"
+receive = { people = ["Bob"] }
+user = "silta-bob"
+
+[[sessions]]
+name = "alice"
+receive = { people = ["Alice"] }
+user = "silta-alice"
 "#;
 
     #[test]
@@ -594,10 +674,10 @@ send = "own"
     fn inbox_defaults_and_limits() {
         let c = config(HUB_ONLY);
         assert_eq!(c.inbox_max_age_days, 30);
-        assert_eq!(c.inbox_max_file_mb, 100);
-        let c = Config::parse(&format!("inbox_max_age_days = 7\ninbox_max_file_mb = 5\n{BASE}\n{HUB_ONLY}")).unwrap();
-        assert_eq!((c.inbox_max_age_days, c.inbox_max_file_mb), (7, 5));
-        for bad in ["inbox_max_age_days = 0", "inbox_max_file_mb = 0"] {
+        assert_eq!(c.attachment_max_mb, 100);
+        let c = Config::parse(&format!("inbox_max_age_days = 7\nattachment_max_mb = 5\n{BASE}\n{HUB_ONLY}")).unwrap();
+        assert_eq!((c.inbox_max_age_days, c.attachment_max_mb), (7, 5));
+        for bad in ["inbox_max_age_days = 0", "attachment_max_mb = 0"] {
             match Config::parse(&format!("{bad}\n{BASE}\n{HUB_ONLY}")) {
                 Err(ConfigError::Invalid(msg)) => assert!(msg.contains("at least 1"), "{msg}"),
                 other => panic!("expected Invalid for {bad}, got {other:?}"),
@@ -611,6 +691,7 @@ send = "own"
         assert_eq!(c.sessions[0].receive, Receive::All);
         assert_eq!(c.sessions[0].send, SendPolicy::Any);
         assert_eq!(c.people[1].role, Role::Family);
+        assert_eq!(c.sessions[0].user, "silta-hub");
         assert!(c.warnings().is_empty(), "{:?}", c.warnings());
         assert!(!format!("{:?}", c.matrix).contains("secret"));
     }
@@ -636,6 +717,7 @@ url = "http://127.0.0.1:5092/v1/"
 name = "hub"
 receive = "all"
 send = "any"
+user = "silta-hub"
 relay_permissions = true
 "#
         ))
@@ -671,9 +753,11 @@ addresses = ["@alice:silta.test"]
 [[sessions]]
 name = "a"
 receive = "all"
+user = "u"
 [[sessions]]
 name = "b"
 receive = "all"
+user = "u"
 "#
         )
         .contains("both have receive"));
@@ -683,9 +767,11 @@ receive = "all"
 [[sessions]]
 name = "a"
 receive = { rooms = ["!x:silta.test"] }
+user = "u"
 [[sessions]]
 name = "b"
 receive = { rooms = ["!x:silta.test"] }
+user = "u"
 "#
         )
         .contains("room"));
@@ -695,9 +781,11 @@ receive = { rooms = ["!x:silta.test"] }
 [[sessions]]
 name = "a"
 receive = { people = ["Alice"] }
+user = "u"
 [[sessions]]
 name = "b"
 receive = { people = ["Alice"] }
+user = "u"
 "#
         )
         .contains("person"));
@@ -707,6 +795,7 @@ receive = { people = ["Alice"] }
 [[sessions]]
 name = "a"
 receive = { people = ["Nobody"] }
+user = "u"
 "#
         )
         .contains("unknown person"));
@@ -716,38 +805,60 @@ receive = { people = ["Nobody"] }
 [[sessions]]
 name = "a"
 receive = "all"
+user = "u"
 [[sessions]]
 name = "a"
 receive = { people = ["Alice"] }
+user = "u"
 "#
         )
         .contains("session"));
 
         assert!(matches!(
-            Config::parse(&format!("{BASE}\n[[sessions]]\nname = \"a\"\nreceive = \"some\"\n")),
+            Config::parse(&format!("{BASE}\n[[sessions]]\nname = \"a\"\nreceive = \"some\"\nuser = \"u\"\n")),
             Err(ConfigError::Parse { .. })
         ));
+        // A session without a user cannot be checked at hello, so it is refused at start.
+        assert!(matches!(
+            Config::parse(&format!("{BASE}\n[[sessions]]\nname = \"a\"\nreceive = \"all\"\n")),
+            Err(ConfigError::Parse { .. })
+        ));
+        assert!(parse_err(
+            r#"
+[[sessions]]
+name = "a"
+receive = "groups"
+user = "u"
+[[sessions]]
+name = "b"
+receive = "groups"
+user = "u"
+"#
+        )
+        .contains("both have receive"));
     }
 
     #[test]
     fn inbound_routing_precedence() {
         let r = Routing::new(&config(SPLIT));
+        let bot = "@silta:silta.test";
+        let dm = ["@alice:silta.test", bot];
         // Room beats person: Alice in the family room goes to the hub.
         assert_eq!(
-            r.inbound("@alice:silta.test", "!family:silta.test"),
+            r.inbound("@alice:silta.test", "!family:silta.test", dm),
             Inbound::Deliver { session: "hub", person: &r.people[1] }
         );
         // Person otherwise, through any of their addresses.
         assert_eq!(
-            r.inbound("@alice2:silta.test", "!dm:silta.test"),
+            r.inbound("@alice2:silta.test", "!dm:silta.test", ["@alice2:silta.test", bot]),
             Inbound::Deliver { session: "alice", person: &r.people[1] }
         );
         assert_eq!(
-            r.inbound("@bob:silta.test", "!dm2:silta.test"),
+            r.inbound("@bob:silta.test", "!dm2:silta.test", ["@bob:silta.test", bot]),
             Inbound::Deliver { session: "hub", person: &r.people[0] }
         );
-        assert_eq!(r.inbound("@mallory:silta.test", "!dm:silta.test"), Inbound::Drop(DropReason::UnknownSender));
-        assert_eq!(r.inbound("@silta:silta.test", "!dm:silta.test"), Inbound::Drop(DropReason::OwnMessage));
+        assert_eq!(r.inbound("@mallory:silta.test", "!dm:silta.test", dm), Inbound::Drop(DropReason::UnknownSender));
+        assert_eq!(r.inbound("@silta:silta.test", "!dm:silta.test", dm), Inbound::Drop(DropReason::OwnMessage));
 
         // Without an `all` session, an unlisted person is dropped.
         let r = Routing::new(&config(
@@ -755,15 +866,55 @@ receive = { people = ["Alice"] }
 [[sessions]]
 name = "alice"
 receive = { people = ["Alice"] }
+user = "u"
 "#,
         ));
-        assert_eq!(r.inbound("@bob:silta.test", "!x:silta.test"), Inbound::Drop(DropReason::NoSession));
+        assert_eq!(r.inbound("@bob:silta.test", "!x:silta.test", ["@bob:silta.test", bot]), Inbound::Drop(DropReason::NoSession));
 
         // The `all` session is the fallback for everyone registered.
         let r = Routing::new(&config(HUB_ONLY));
-        assert!(matches!(r.inbound("@bob:silta.test", "!any:silta.test"), Inbound::Deliver { session: "hub", .. }));
-        assert!(matches!(r.inbound("@alice:silta.test", "!any:silta.test"), Inbound::Deliver { session: "hub", .. }));
+        assert!(matches!(r.inbound("@bob:silta.test", "!any:silta.test", ["@bob:silta.test"]), Inbound::Deliver { session: "hub", .. }));
+        assert!(matches!(r.inbound("@alice:silta.test", "!any:silta.test", ["@alice:silta.test"]), Inbound::Deliver { session: "hub", .. }));
         assert_eq!(r.people_for("hub").len(), 2);
+    }
+
+    #[test]
+    fn group_rooms_go_to_the_hub_and_dms_to_the_minds() {
+        let r = Routing::new(&config(MINDS));
+        let bot = "@silta:silta.test";
+        let family = ["@alice:silta.test", "@bob:silta.test", bot];
+        let alice_dm = ["@alice:silta.test", bot];
+        // Alice's message in the family room reaches the hub, in her DM her mind.
+        assert!(matches!(r.inbound("@alice:silta.test", "!family:silta.test", family), Inbound::Deliver { session: "hub", .. }));
+        assert!(matches!(r.inbound("@alice:silta.test", "!dm:silta.test", alice_dm), Inbound::Deliver { session: "alice", .. }));
+        // Two addresses of one person are still a DM.
+        assert!(matches!(
+            r.inbound("@alice:silta.test", "!dm:silta.test", ["@alice:silta.test", "@alice2:silta.test", bot]),
+            Inbound::Deliver { session: "alice", .. }
+        ));
+        // A stranger in the room does not make it a group.
+        assert!(matches!(
+            r.inbound("@alice:silta.test", "!odd:silta.test", ["@alice:silta.test", "@mallory:silta.test", bot]),
+            Inbound::Deliver { session: "alice", .. }
+        ));
+        // The hub owns the family room and never a DM; a mind owns its DM only.
+        assert_eq!(r.may_send("hub", "!family:silta.test", family), Ok(()));
+        assert_eq!(r.may_read("hub", "!family:silta.test", family), Ok(()));
+        assert_eq!(r.may_send("hub", "!dm:silta.test", alice_dm), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_read("hub", "!dm:silta.test", alice_dm), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_send("alice", "!dm:silta.test", alice_dm), Ok(()));
+        assert_eq!(r.may_send("alice", "!family:silta.test", family), Err(SendDenied::NotAllowed));
+        // A group room with a stranger belongs to nobody.
+        assert_eq!(r.may_send("hub", "!odd:silta.test", ["@alice:silta.test", "@bob:silta.test", "@mallory:silta.test"]), Err(SendDenied::NotAllowed));
+        // Without a groups session a group room is dropped, unless an `all` session exists.
+        let r = Routing::new(&config(SPLIT));
+        assert!(matches!(r.inbound("@alice:silta.test", "!other:silta.test", family), Inbound::Drop(DropReason::NoSession)));
+        // The welcome names the people a session receives from.
+        let r = Routing::new(&config(MINDS));
+        assert_eq!(r.people_for("alice").iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Alice"]);
+        assert_eq!(r.people_for("hub").len(), 2);
+        assert_eq!(r.people_for("bob").iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Bob"]);
+        assert_eq!(r.session_users().collect::<Vec<_>>(), [("hub", "silta-hub"), ("bob", "silta-bob"), ("alice", "silta-alice")]);
     }
 
     #[test]
@@ -793,6 +944,7 @@ receive = { people = ["Alice"] }
 name = "fam"
 receive = { rooms = ["!family:silta.test"] }
 send = "own"
+user = "u"
 "#,
         ));
         assert_eq!(r.may_send("fam", "!family:silta.test", ["@mallory:silta.test"]), Ok(()));
@@ -805,6 +957,7 @@ send = "own"
 name = "hub"
 receive = "all"
 send = "own"
+user = "u"
 "#,
         ));
         assert_eq!(r.may_send("hub", "!x:silta.test", ["@alice:silta.test", "@bob:silta.test"]), Ok(()));

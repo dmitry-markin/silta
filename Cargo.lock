@@ -2270,6 +2270,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3458,6 +3470,8 @@ name = "silta"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "mime_guess",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -3472,6 +3486,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "mime_guess",
  "rmcp",
  "schemars",
  "serde",
@@ -3492,6 +3507,7 @@ dependencies = [
  "clap",
  "matrix-sdk",
  "mime_guess",
+ "nix",
  "regex",
  "serde",
  "serde_json",

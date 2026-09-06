@@ -1,8 +1,6 @@
 //! Outbound commands: policy checks, Markdown rendering, chunking, reactions, edits,
 //! files and history.
 
-use std::path::{Path, PathBuf};
-
 use matrix_sdk::{
     attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo},
     room::{
@@ -30,6 +28,7 @@ use silta::{
     },
     text::chunk_text,
     time::rfc3339_utc,
+    transfer::{human_size, safe_name, Received},
 };
 use regex::RegexBuilder;
 use tracing::{info, warn};
@@ -37,7 +36,6 @@ use tracing::{info, warn};
 use crate::{
     content::{self, Body},
     daemon::Daemon,
-    inbox::human_size,
 };
 
 /// Matrix events are capped at 64 KiB, and a Markdown reply is sent twice in one event:
@@ -63,10 +61,6 @@ pub async fn react(daemon: &Daemon, session: &str, id: u64, react: React) -> Cmd
 
 pub async fn edit(daemon: &Daemon, session: &str, id: u64, edit: Edit) -> CmdResult {
     finish(id, do_edit(daemon, session, edit).await)
-}
-
-pub async fn send_file(daemon: &Daemon, session: &str, id: u64, cmd: SendFile) -> CmdResult {
-    finish(id, do_send_file(daemon, session, cmd).await)
 }
 
 pub async fn fetch_messages(daemon: &Daemon, session: &str, id: u64, cmd: FetchMessages) -> CmdResult {
@@ -123,7 +117,7 @@ fn joined_room(daemon: &Daemon, room_id: &str) -> Result<Room, Fail> {
     Ok(room)
 }
 
-async fn member_ids(room: &Room) -> Result<Vec<String>, Fail> {
+pub async fn member_ids(room: &Room) -> Result<Vec<String>, Fail> {
     let members = room
         .members(RoomMemberships::ACTIVE)
         .await
@@ -312,51 +306,42 @@ async fn do_edit(daemon: &Daemon, session: &str, edit: Edit) -> Result<OwnedEven
     Ok(sent.response.event_id)
 }
 
-async fn do_send_file(daemon: &Daemon, session: &str, cmd: SendFile) -> Result<OwnedEventId, Fail> {
-    let path = Path::new(&cmd.path);
+/// Upload a file a session streamed over the socket. The spool copy is deleted
+/// afterwards whatever happened.
+pub async fn send_file(daemon: &Daemon, session: &str, id: u64, cmd: SendFile, received: Received) -> CmdResult {
+    let result = do_send_file(daemon, session, cmd, &received).await;
+    let _ = tokio::fs::remove_file(&received.path).await;
+    finish(id, result)
+}
+
+async fn do_send_file(daemon: &Daemon, session: &str, cmd: SendFile, received: &Received) -> Result<OwnedEventId, Fail> {
     let file_error = |message: String| (ResultError::FileError, message);
-    if !path.is_absolute() {
-        return Err(file_error(format!("{} is not an absolute path", path.display())));
-    }
-    let meta = tokio::fs::metadata(path).await.map_err(|e| file_error(format!("cannot read {}: {e}", path.display())))?;
-    if !meta.is_file() {
-        return Err(file_error(format!("{} is not a regular file", path.display())));
-    }
-    let real = tokio::fs::canonicalize(path).await.map_err(|e| file_error(format!("cannot resolve {}: {e}", path.display())))?;
-    if is_private(&real, &daemon.private_paths, &daemon.inbox.dir) {
-        warn!(session, path = %path.display(), "send_file refused: the daemon's own state or configuration");
-        return Err(file_error(format!("{} belongs to the daemon's own state or configuration and is never sent", path.display())));
-    }
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_owned();
+    let name = safe_name(&received.header.name, &received.header.mime);
     let reply_to = parse_optional_event_id(cmd.reply_to.as_deref())?;
     let thread = parse_optional_event_id(cmd.thread.as_deref())?;
     let room = writable_room(daemon, session, &cmd.room_id).await?;
 
+    let size = received.header.size;
     match daemon.client.load_or_fetch_max_upload_size().await {
         Ok(max) => {
             let max = u64::from(max);
-            if meta.len() > max {
-                return Err(file_error(format!(
-                    "{} is {} and the server accepts at most {}",
-                    path.display(),
-                    human_size(meta.len()),
-                    human_size(max)
-                )));
+            if size > max {
+                return Err(file_error(format!("{name} is {} and the server accepts at most {}", human_size(size), human_size(max))));
             }
         }
         Err(e) => warn!("cannot learn the server's upload limit, sending anyway: {e}"),
     }
-    let data = tokio::fs::read(path).await.map_err(|e| file_error(format!("cannot read {}: {e}", path.display())))?;
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let data = tokio::fs::read(&received.path).await.map_err(|e| file_error(format!("cannot read the received file: {e}")))?;
+    let mime: mime_guess::Mime = received.header.mime.parse().unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM);
 
     // The size in the event's `info`, so history and clients can show it; the SDK
     // ignores an info whose kind does not match the content type.
-    let size = UInt::new(data.len() as u64);
+    let info_size = UInt::new(data.len() as u64);
     let info = match mime.type_() {
-        mime_guess::mime::IMAGE => AttachmentInfo::Image(BaseImageInfo { size, ..Default::default() }),
-        mime_guess::mime::AUDIO => AttachmentInfo::Audio(BaseAudioInfo { size, ..Default::default() }),
-        mime_guess::mime::VIDEO => AttachmentInfo::Video(BaseVideoInfo { size, ..Default::default() }),
-        _ => AttachmentInfo::File(BaseFileInfo { size }),
+        mime_guess::mime::IMAGE => AttachmentInfo::Image(BaseImageInfo { size: info_size, ..Default::default() }),
+        mime_guess::mime::AUDIO => AttachmentInfo::Audio(BaseAudioInfo { size: info_size, ..Default::default() }),
+        mime_guess::mime::VIDEO => AttachmentInfo::Video(BaseVideoInfo { size: info_size, ..Default::default() }),
+        _ => AttachmentInfo::File(BaseFileInfo { size: info_size }),
     };
     let mut config = AttachmentConfig::new().info(info);
     if let Some(caption) = cmd.caption.filter(|c| !c.trim().is_empty()) {
@@ -367,18 +352,10 @@ async fn do_send_file(daemon: &Daemon, session: &str, cmd: SendFile) -> Result<O
     let response = room
         .send_attachment(&name, &mime, data, config)
         .await
-        .map_err(|e| (ResultError::SendFailed, format!("sending {} to {} failed: {e}", path.display(), room.room_id())))?;
+        .map_err(|e| (ResultError::SendFailed, format!("sending {name} to {} failed: {e}", room.room_id())))?;
     after_send(daemon, session, &room, cmd.more).await;
     info!(session, room = %room.room_id(), name, bytes, mime = %mime, more = cmd.more, "file sent");
     Ok(response.event_id)
-}
-
-/// Whether a resolved path is one of the daemon's own files, which no session may send
-/// whatever a message asked for: the state directory holds the access token and the
-/// encryption store, the configuration file the password. The inbox is inside the
-/// state directory and is fine to send from (a received file forwarded to another room).
-fn is_private(real: &Path, private: &[PathBuf], inbox: &Path) -> bool {
-    !real.starts_with(inbox) && private.iter().any(|p| real.starts_with(p))
 }
 
 /// Raw pages read for one history command at most, so a room full of reactions
@@ -530,22 +507,3 @@ fn history_message(daemon: &Daemon, event: &matrix_sdk::deserialized_responses::
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_daemons_own_files_are_private_but_the_inbox_is_not() {
-        let state = PathBuf::from("/var/lib/silta");
-        let config = PathBuf::from("/etc/silta/siltad.toml");
-        let private = [state.clone(), config.clone()];
-        let inbox = state.join("inbox");
-        assert!(is_private(&state.join("session.json"), &private, &inbox));
-        assert!(is_private(&state.join("store/matrix-sdk-crypto.sqlite3"), &private, &inbox));
-        assert!(is_private(&config, &private, &inbox));
-        assert!(!is_private(&inbox.join("abc-photo.jpg"), &private, &inbox));
-        assert!(!is_private(Path::new("/home/dev/workspace/assistant/out/report.md"), &private, &inbox));
-        // A sibling whose name merely starts the same is not inside.
-        assert!(!is_private(Path::new("/var/lib/silta-backup/x"), &private, &inbox));
-    }
-}

@@ -2,7 +2,7 @@
 
 pub mod content;
 pub mod daemon;
-pub mod inbox;
+pub mod spool;
 pub mod matrix;
 pub mod outbound;
 pub mod server;

@@ -4,8 +4,8 @@
 socket    = "/ABSOLUTE/PATH/TO/silta/dev/state/siltad.sock"
 state_dir = "/ABSOLUTE/PATH/TO/silta/dev/state/silta"
 replay_window_secs = 300   # optional; messages from a downtime this old are still delivered
-inbox_max_age_days = 30    # optional; downloaded attachments older than this are deleted
-inbox_max_file_mb  = 100   # optional; larger attachments are not downloaded, the message says so
+inbox_max_age_days = 30    # optional; a session's plugin deletes received files older than this
+attachment_max_mb  = 100   # optional; larger attachments are not downloaded or accepted
 
 [matrix]
 homeserver_url = "http://localhost"
@@ -24,7 +24,20 @@ name = "Alice"
 role = "family"
 addresses = ["@alice:localhost"]
 
+# One session per person, the hub for group rooms. `user` is the Unix user the
+# session's plugin connects as; the daemon refuses any other.
 [[sessions]]
 name = "hub"
-receive = "all"
-send = "any"
+receive = "groups"
+send = "own"
+user = "bob"
+
+[[sessions]]
+name = "bob"
+receive = { people = ["Bob"] }
+user = "bob"
+
+[[sessions]]
+name = "alice"
+receive = { people = ["Alice"] }
+user = "silta-alice"

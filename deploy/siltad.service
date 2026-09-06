@@ -1,0 +1,26 @@
+# The silta daemon: the assistant's one Matrix device. Its socket in /run/siltad is
+# reachable by the silta group, which every session user belongs to. Written for
+# the packaged deployment; untested on the development host, where the daemon runs from
+# the repository.
+[Unit]
+Description=silta daemon (the family assistant's Matrix device)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=silta
+Group=silta
+StateDirectory=siltad
+StateDirectoryMode=0700
+RuntimeDirectory=siltad
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/bin/siltad --config /etc/silta/siltad.toml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

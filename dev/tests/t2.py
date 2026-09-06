@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """T2: the daemon against conduit. This script is the `test` session on the socket; Alice is the test client.
 
-Needs: the daemon running with a `test` session that receives from Alice with send = "own" and
-inbox_max_file_mb = 1 in dev/siltad.toml, the test client built (cargo build -p siltad --examples),
-and dev/state/accounts.env. Test files are generated under dev/state/testfiles."""
-import json, os, queue, socket, subprocess, sys, threading, time, filecmp
+Needs: the daemon running with a `test` session that receives from Alice with send = "own",
+user = "bob" and attachment_max_mb = 1 in dev/siltad.toml, the test client built
+(cargo build -p siltad --examples), and dev/state/accounts.env. Test files are generated under
+dev/state/testfiles. Attachments arrive as chunked transfers and are kept in memory here."""
+import base64, json, os, queue, socket, subprocess, sys, threading, time
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SOCK = f"{REPO}/dev/state/siltad.sock"
 TC = f"{REPO}/target/debug/examples/testclient"
@@ -51,23 +52,35 @@ time.sleep(4)
 
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(SOCK); f = s.makefile("rw", encoding="utf-8")
 events, results = queue.Queue(), queue.Queue()
+received, partial = {}, {}
 def reader():
     for line in f:
         o = json.loads(line)
-        (events if "event" in o else results).put(o)
+        if "file" in o: partial[o["file"]["transfer"]] = [o["file"], bytearray()]
+        elif "chunk" in o: partial[o["chunk"]["transfer"]][1] += base64.b64decode(o["chunk"]["data"])
+        elif "file_end" in o: received[o["file_end"]["transfer"]] = partial.pop(o["file_end"]["transfer"])
+        else: (events if "event" in o else results).put(o)
 threading.Thread(target=reader, daemon=True).start()
 def send(o): f.write(json.dumps(o, ensure_ascii=False) + "\n"); f.flush()
-send({"hello": {"protocol": 1, "session": "test", "client": "t2/0"}})
+send({"hello": {"protocol": 2, "session": "test", "client": "t2/0"}})
 print("welcome:", json.dumps(results.get(timeout=5))[:120])
 n = 0
 def cmd(kind, **args):
     global n; n += 1
     send({"cmd": {"id": n, kind: args}})
-    r = results.get(timeout=60)["result"]; assert r["id"] == n
+    r = results.get(timeout=120)["result"]; assert r["id"] == n
     short = {k: v for k, v in r.items() if k not in ("id", "messages")}
     if "messages" in r: short["messages"] = len(r["messages"])
     print(f"  {kind} -> {json.dumps(short, ensure_ascii=False)[:220]}")
     return r
+tn = 0
+def send_file(path, declared=None, **args):
+    """Stream a file as a transfer, then the send_file command for it."""
+    global tn; tn += 1; t = f"t{tn}"; data = open(path, "rb").read()
+    send({"file": {"transfer": t, "name": os.path.basename(path), "mime": {"md": "text/markdown", "png": "image/png"}.get(path.rsplit(".", 1)[-1], "application/octet-stream"), "size": declared if declared is not None else len(data)}})
+    for i in range(0, len(data), 1024 * 1024): send({"chunk": {"transfer": t, "data": base64.b64encode(data[i:i + 1024 * 1024]).decode()}})
+    send({"file_end": {"transfer": t}})
+    return cmd("send_file", transfer=t, **args)
 def event(timeout=25):
     try: e = events.get(timeout=timeout)["event"]
     except queue.Empty: return None
@@ -78,8 +91,8 @@ print("1. photo with a caption")
 eid_photo = alice("sendfile", dm, f"{FILES}/shapes.png", "a picture")
 e = event(); a = e["attachments"][0] if e and e["attachments"] else None
 ok(e and e["text"] == "a picture" and a and a["mime"] == "image/png" and a["name"] == "shapes.png", "caption, mime and name")
-ok(a and os.path.exists(a["path"]) and filecmp.cmp(a["path"], f"{FILES}/shapes.png", shallow=False), "file in the inbox is byte-identical to the original (decrypted)")
-ok(a and oct(os.stat(a["path"]).st_mode & 0o777) == "0o600", "inbox file is 0600")
+got = received.get(a["transfer"]) if a else None
+ok(got and bytes(got[1]) == open(f"{FILES}/shapes.png", "rb").read() and got[0]["size"] == a["size"], "file arrived as a transfer before the event, byte-identical to the original (decrypted)")
 
 print("2. audio without a caption")
 alice("sendfile", dm, f"{FILES}/voice.ogg")
@@ -116,14 +129,12 @@ r = cmd("edit", room_id=dm, event_id=bot_eid, text="x" * 9000); ok(r.get("error"
 r = cmd("edit", room_id=dm, event_id="$nonexistent:localhost", text="x"); ok(r.get("error") == "not_found", "unknown event refused with not_found")
 
 print("8. files from the bot")
-r = cmd("send_file", room_id=dm, path=f"{FILES}/notes.md", caption="the *notes*", reply_to=eid_photo); ok(r["ok"], "text file with caption and quote sent")
-r = cmd("send_file", room_id=dm, path=f"{FILES}/shapes.png"); ok(r["ok"], "image sent")
-r = cmd("send_file", room_id=dm, path="relative.txt"); ok(r.get("error") == "file_error", "relative path refused")
-r = cmd("send_file", room_id=dm, path="/nonexistent/x.txt"); ok(r.get("error") == "file_error", "missing file refused")
-r = cmd("send_file", room_id=dm, path=FILES); ok(r.get("error") == "file_error", "directory refused")
-huge = f"{FILES}/huge.bin"
-if not os.path.exists(huge): open(huge, "wb").write(os.urandom(25 * 1024 * 1024))
-r = cmd("send_file", room_id=dm, path=huge); print("  (25 MB file:", r.get("error"), (r.get("message") or "")[:100] + ")")
+r = send_file(f"{FILES}/notes.md", room_id=dm, caption="the *notes*", reply_to=eid_photo); ok(r["ok"], "text file with caption and quote sent through a transfer")
+r = send_file(f"{FILES}/shapes.png", room_id=dm); ok(r["ok"], "image sent through a transfer")
+r = cmd("send_file", room_id=dm, transfer="never-sent"); ok(r.get("error") == "file_error" and "no such transfer" in r.get("message", ""), "a command without its transfer refused")
+r = send_file(f"{FILES}/notes.md", declared=10, room_id=dm); ok(r.get("error") == "file_error" and "declared size" in r.get("message", ""), "a transfer whose size does not match its header refused")
+r = send_file(f"{FILES}/big.bin", room_id=dm); ok(r.get("error") == "file_error" and "limit" in r.get("message", ""), "a 2 MB transfer refused by the 1 MB cap")
+spool_out = os.listdir(f"{REPO}/dev/state/silta/outbox"); ok(not spool_out, f"outbox spool empty after the sends ({spool_out})")
 
 print("9. history")
 r = cmd("fetch_messages", room_id=dm, limit=5); m = r.get("messages", [])
@@ -178,7 +189,7 @@ t_first = now(); r = cmd("reply", room_id=dm, text="part one", more=True); time.
 after_first = [x for x in typing_lines(t_first) if x[0] > t_first]
 ok(any(s == "on" for _, s in after_first) and not any(s == "off" for _, s in after_first), f"indicator kept on after a send with more=true ({after_first})")
 t_last = now(); r = cmd("reply", room_id=dm, text="part two", more=False); time.sleep(5)
-after_last = [x for x in typing_lines(t_last) if x[0] > t_last]
+after_last = [x for x in typing_lines(t_last) if x[0] >= t_last]  # the off can land in the same second as the send
 ok(any(s == "off" for _, s in after_last), f"indicator ends after the last send ({after_last})")
 t_typing = now(); r = cmd("typing", room_id=dm); ok(r["ok"], "typing command accepted"); time.sleep(5)
 after_typing = [x for x in typing_lines(t_typing) if x[0] > t_typing]
@@ -190,4 +201,4 @@ watch.terminate(); watch.wait(timeout=10); watch_out.close()
 print("--- watch (Alice's view, last 16 lines) ---")
 lines = [l for l in open(f"{REPO}/dev/state/t2-watch.out") if "typing" not in l]
 print("".join(lines[-16:]))
-print("--- inbox ---"); print(subprocess.run(["ls", "-la", f"{REPO}/dev/state/silta/inbox"], capture_output=True, text=True).stdout)
+spool_in = os.listdir(f"{REPO}/dev/state/silta/inbox"); ok(not spool_in, f"inbox spool empty after the transfers ({spool_in})")

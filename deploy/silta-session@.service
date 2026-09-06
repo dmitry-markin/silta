@@ -1,0 +1,31 @@
+# One Silta session (a "mind") per instance: silta-session@alice.service runs as the
+# Unix user silta-alice with /var/lib/silta/alice as its home and state, and announces
+# itself to the daemon as session "alice". Overridable paths for a development host
+# are in a drop-in, see deploy/README.md.
+[Unit]
+Description=Silta session %i (Claude Code with the silta channel)
+After=network-online.target siltad.service
+Wants=siltad.service
+
+[Service]
+User=silta-%i
+Group=silta-%i
+SupplementaryGroups=silta
+StateDirectory=silta/%i
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/silta/%i
+Environment=HOME=/var/lib/silta/%i
+Environment=SILTA_SESSION=%i
+Environment=SILTA_SOCKET=/run/siltad/siltad.sock
+Environment=SILTA_PERSONA=/etc/silta/persona.md
+Environment=SILTA_CLAUDE_BIN=/usr/local/bin/silta-claude
+Environment=CLAUDE_BIN=/usr/local/bin/claude
+LoadCredential=oauth-token:/etc/silta/oauth-token
+ExecStart=/usr/local/lib/silta/silta-session
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

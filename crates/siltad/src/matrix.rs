@@ -24,6 +24,7 @@ use silta::{
     protocol::{Attachment, Event, EventKind},
     replay::{verdict, Verdict},
     time::rfc3339_utc,
+    transfer::{human_size, safe_id},
 };
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -32,7 +33,8 @@ use tracing::{debug, info, warn};
 use crate::{
     content::{self, Body, Media},
     daemon::{Daemon, Dispatch, Shared},
-    inbox::{self, human_size, DownloadError},
+    outbound::member_ids,
+    spool::{self, DownloadError},
 };
 
 /// A download that has not finished by then is given up.
@@ -84,10 +86,19 @@ async fn on_invite(event: StrippedRoomMemberEvent, room: Room, client: Client, C
 }
 
 /// The routing and replay decisions shared by messages and reactions: the registered
-/// sender, the owning session, and whether an earlier run delivered the event already.
-/// `None` means drop, already logged.
-fn admit<'a>(daemon: &'a Daemon, room_id: &str, sender: &str, event_id: &str, ts: u64, what: &str) -> Option<(&'a str, &'a PersonConfig)> {
-    let (session, person) = match daemon.routing.inbound(sender, room_id) {
+/// sender, the owning session (a group room goes to the hub, a DM to the person's
+/// mind, so the room's members decide), and whether an earlier run delivered the event
+/// already. `None` means drop, already logged.
+async fn admit<'a>(daemon: &'a Daemon, room: &Room, sender: &str, event_id: &str, ts: u64, what: &str) -> Option<(&'a str, &'a PersonConfig)> {
+    let room_id = room.room_id().as_str();
+    let members = match member_ids(room).await {
+        Ok(members) => members,
+        Err((_, message)) => {
+            warn!(room = room_id, "{message}; routing the {what} as a DM");
+            Vec::new()
+        }
+    };
+    let (session, person) = match daemon.routing.inbound(sender, room_id, members.iter().map(String::as_str)) {
         Inbound::Drop(reason) => {
             info!(room = room_id, sender, "dropping a {what}: {reason}");
             return None;
@@ -135,7 +146,7 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, Ctx(daemon)
         }
         Body::Text(_) | Body::Media(_) => {}
     }
-    let Some((session, person)) = admit(&daemon, room_id, sender, event_id, ts, "message") else {
+    let Some((session, person)) = admit(&daemon, &room, sender, event_id, ts, "message").await else {
         return;
     };
 
@@ -172,11 +183,11 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, Ctx(daemon)
     }
 }
 
-/// Download one attachment into the inbox and record it on the event, or explain in
-/// the text why the file is not there.
+/// Download one attachment into the spool and record it on the event as a transfer,
+/// or explain in the text why the file is not there.
 async fn fetch_attachment(daemon: &Daemon, message: &mut Event, media: Media) {
     let Media { name, mime, size, source, .. } = media;
-    let max = daemon.inbox.max_bytes;
+    let max = daemon.spool.max_bytes;
     let describe = |detail: &str| -> String {
         let size = size.map(|s| format!(", {}", human_size(s))).unwrap_or_default();
         format!("[attachment \"{name}\" ({mime}{size}) {detail}]")
@@ -186,12 +197,13 @@ async fn fetch_attachment(daemon: &Daemon, message: &mut Event, media: Media) {
         note(message, describe(&format!("not downloaded: over the {} limit", human_size(max))));
         return;
     }
-    let path = inbox::path_for(&daemon.inbox.dir, &message.event_id, &name, &mime);
-    match timeout(DOWNLOAD_TIMEOUT, inbox::download(&daemon.client, source, &path, max)).await {
+    // One attachment per Matrix message, so the transfer id is the event id.
+    let transfer = format!("{}-1", safe_id(&message.event_id));
+    let path = daemon.spool.inbox_path(&transfer);
+    match timeout(DOWNLOAD_TIMEOUT, spool::download(&daemon.client, source, &path, max)).await {
         Ok(Ok(bytes)) => {
-            info!(room = %message.room_id, name, bytes, "attachment downloaded to {}", path.display());
-            let path = path.to_string_lossy().into_owned();
-            message.attachments.push(Attachment { name, mime, size: bytes, path });
+            info!(room = %message.room_id, name, bytes, "attachment downloaded to the spool as {transfer}");
+            message.attachments.push(Attachment { transfer, name, mime, size: bytes });
         }
         Ok(Err(DownloadError::TooLarge(bytes))) => {
             info!(room = %message.room_id, name, bytes, "attachment not downloaded: over the {} limit", human_size(max));
@@ -231,7 +243,7 @@ async fn on_reaction(event: OriginalSyncReactionEvent, room: Room, Ctx(daemon): 
     let target = event.content.relates_to.event_id.clone();
     let key = event.content.relates_to.key.clone();
 
-    let Some((session, person)) = admit(&daemon, room_id, sender, event_id, ts, "reaction") else {
+    let Some((session, person)) = admit(&daemon, &room, sender, event_id, ts, "reaction").await else {
         return;
     };
     match room.load_or_fetch_event(&target, None).await {

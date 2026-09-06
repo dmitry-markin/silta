@@ -30,6 +30,11 @@ struct Args {
     /// Path of the daemon's Unix socket.
     #[arg(long, env = "SILTA_SOCKET", default_value = "/run/silta/siltad.sock")]
     socket: PathBuf,
+
+    /// Directory attachments are written to, created if missing; relative to the
+    /// working directory.
+    #[arg(long, env = "SILTA_INBOX", default_value = "inbox")]
+    inbox: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -105,9 +110,14 @@ async fn run(args: Args, parent: libc::pid_t) -> i32 {
         }
     });
 
-    info!(session = %args.session, socket = %args.socket.display(), "silta-claude {} starting", env!("CARGO_PKG_VERSION"));
+    let inbox = std::env::current_dir().map(|cwd| cwd.join(&args.inbox)).unwrap_or(args.inbox);
+    if let Err(err) = std::fs::create_dir_all(&inbox) {
+        error!("cannot create the inbox {}: {err}", inbox.display());
+        return 1;
+    }
+    info!(session = %args.session, socket = %args.socket.display(), inbox = %inbox.display(), "silta-claude {} starting", env!("CARGO_PKG_VERSION"));
     let (events_tx, events_rx) = mpsc::channel(256);
-    let daemon = daemon::DaemonClient::start(args.socket, args.session, events_tx, cancel.clone());
+    let daemon = daemon::DaemonClient::start(args.socket, args.session, inbox, events_tx, cancel.clone());
     let handler = mcp::SiltaChannel::new(daemon, events_rx);
 
     // The handshake waits for the client's initialize request; a shutdown signal must

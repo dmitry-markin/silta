@@ -1,11 +1,11 @@
 //! `siltad`: owns the bot's Matrix device and routes rooms to assistant sessions.
 
-use std::{path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
 use silta::config::{Config, Routing};
-use siltad::{daemon::Daemon, inbox, matrix, server, session};
+use siltad::{daemon::Daemon, matrix, server, session, spool::{self, Spool}};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -47,13 +47,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
     for warning in config.warnings() {
         warn!("{warning}");
     }
+    let routing = Routing::new(&config);
+    let users = resolve_users(&routing)?;
     info!(
-        "siltad {} starting: {} people, {} sessions, replay window {} s, inbox files up to {} MB kept {} days, socket {}",
+        "siltad {} starting: {} people, {} sessions ({}), replay window {} s, attachments up to {} MB, inbox files kept {} days, socket {}",
         env!("CARGO_PKG_VERSION"),
         config.people.len(),
         config.sessions.len(),
+        routing.session_users().map(|(s, u)| format!("{s} as {u}")).collect::<Vec<_>>().join(", "),
         config.replay_window_secs,
-        config.inbox_max_file_mb,
+        config.attachment_max_mb,
         config.inbox_max_age_days,
         config.socket.display()
     );
@@ -71,28 +74,21 @@ async fn run(args: Args) -> anyhow::Result<()> {
     )
     .await?;
 
-    // Resolved paths, so `send_file` can tell the daemon's own files from everything
-    // else whatever symlinks a path goes through (see `outbound.rs`).
-    let state_dir = std::fs::canonicalize(&config.state_dir)?;
-    let config_path = std::fs::canonicalize(&args.config)?;
-    let inbox_config = inbox::InboxConfig {
-        dir: state_dir.join("inbox"),
-        max_age: Duration::from_secs(config.inbox_max_age_days.saturating_mul(86_400)),
-        max_bytes: config.inbox_max_file_mb.saturating_mul(1024 * 1024),
-    };
-    inbox::prepare(&inbox_config.dir)?;
+    let spool = Spool::new(&config.state_dir, config.attachment_max_mb.saturating_mul(1024 * 1024));
+    spool.prepare()?;
     let daemon = Arc::new(Daemon::new(
         client,
-        Routing::new(&config),
-        &state_dir,
+        routing,
+        &config.state_dir,
         config.replay_window_secs,
-        inbox_config,
-        vec![state_dir.clone(), config_path],
+        spool,
+        config.inbox_max_age_days,
+        users,
     ));
     matrix::register_handlers(&daemon);
 
     let cancel = CancellationToken::new();
-    inbox::spawn_sweeper(daemon.inbox.dir.clone(), daemon.inbox.max_age, cancel.clone());
+    spool::spawn_sweeper(daemon.spool.clone(), cancel.clone());
     tokio::spawn({
         let cancel = cancel.clone();
         async move {
@@ -124,4 +120,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
     sync?;
     info!("stopped");
     Ok(())
+}
+
+/// The uid behind each session's `user`, looked up once: a session whose user does not
+/// exist on this host cannot be checked at `hello`, so the daemon does not start.
+fn resolve_users(routing: &Routing) -> anyhow::Result<HashMap<String, u32>> {
+    let mut users = HashMap::new();
+    for (session, user) in routing.session_users() {
+        let entry = nix::unistd::User::from_name(user)
+            .with_context(|| format!("cannot look up user {user:?} of session {session:?}"))?
+            .with_context(|| format!("session {session:?} runs as user {user:?}, which does not exist on this host"))?;
+        users.insert(session.to_owned(), entry.uid.as_raw());
+    }
+    Ok(users)
 }

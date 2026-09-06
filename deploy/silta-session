@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Runs one Silta session headless for silta-session@<name>.service.
+#
+# From the unit: SILTA_SESSION (the instance name), HOME (the state directory), and the
+# credential oauth-token. Overridable: SILTA_SOCKET, SILTA_PERSONA, SILTA_CLAUDE_BIN,
+# CLAUDE_BIN. The workspace is $HOME/workspace with inbox/ and out/; the session id of
+# the first start is saved in $HOME/session-id and resumed afterwards.
+#
+# stdin is a FIFO this script holds open, one initial user message
+# starts the first turn, channel events arrive as turns; closing the FIFO ends the
+# session cleanly.
+set -euo pipefail
+: "${SILTA_SESSION:?SILTA_SESSION must be set}"
+state="${HOME:?HOME must be the state directory of the session}"
+workspace="$state/workspace"
+persona="${SILTA_PERSONA:-/etc/silta/persona.md}"
+claude_bin="${CLAUDE_BIN:-claude}"
+export SILTA_CLAUDE_BIN="${SILTA_CLAUDE_BIN:-/usr/local/bin/silta-claude}"
+export SILTA_SOCKET="${SILTA_SOCKET:-/run/siltad/siltad.sock}"
+export SILTA_INBOX="$workspace/inbox"
+
+if [ -n "${CREDENTIALS_DIRECTORY:-}" ] && [ -r "$CREDENTIALS_DIRECTORY/oauth-token" ]; then
+  CLAUDE_CODE_OAUTH_TOKEN=$(tr -d '[:space:]' < "$CREDENTIALS_DIRECTORY/oauth-token")
+  export CLAUDE_CODE_OAUTH_TOKEN
+fi
+
+mkdir -p "$workspace/inbox" "$workspace/out"
+cd "$workspace"
+fifo="$state/session.fifo"
+[ -p "$fifo" ] || mkfifo -m 0600 "$fifo"
+idfile="$state/session-id"
+
+# The prompt-less form; --channels last because it is variadic.
+args=(-p --input-format stream-json --output-format stream-json --verbose
+      --permission-mode auto --permission-prompts none
+      --append-system-prompt-file "$persona")
+resumed=0
+if [ -s "$idfile" ]; then
+  args+=(--resume "$(cat "$idfile")"); resumed=1
+else
+  args+=(--name "silta-$SILTA_SESSION")
+fi
+args+=(--channels plugin:silta-claude@silta-local)
+initial='{"type":"user","message":{"role":"user","content":"You are connected to the family chat through the silta channel. Wait for messages and answer each one through the reply tool."}}'
+
+started=$(date +%s)
+: > "$state/session.log"
+"$claude_bin" "${args[@]}" < "$fifo" > "$state/session.log" &
+pid=$!
+exec 3> "$fifo"
+printf '%s\n' "$initial" >&3
+
+if [ "$resumed" = 0 ]; then
+  for _ in $(seq 1 60); do
+    id=$(grep -o '"session_id":"[^"]*"' "$state/session.log" 2>/dev/null | head -1 | cut -d'"' -f4 || true)
+    if [ -n "$id" ]; then echo "$id" > "$idfile"; echo "session id $id saved" >&2; break; fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+fi
+
+stop() {
+  exec 3>&-
+  for _ in $(seq 1 150); do kill -0 "$pid" 2>/dev/null || exit 0; sleep 0.1; done
+  echo "claude did not exit on stdin EOF within 15 s, killing it" >&2
+  kill -9 "$pid" 2>/dev/null || true
+}
+trap stop INT TERM
+code=0
+wait "$pid" || code=$?
+# A resume that dies at once (the saved id no longer resumes): start fresh next time.
+if [ "$resumed" = 1 ] && [ "$code" != 0 ] && [ $(( $(date +%s) - started )) -lt 20 ]; then
+  echo "resume of $(cat "$idfile") failed at once; a new session starts on the next run" >&2
+  rm -f "$idfile"
+fi
+exit "$code"
