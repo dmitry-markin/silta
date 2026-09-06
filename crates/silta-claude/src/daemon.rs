@@ -11,13 +11,16 @@ use std::{
 use silta::{
     line::{write_line, LineReader},
     protocol::{
-        Cmd, CmdKind, CmdResult, ClientMessage, DaemonMessage, Event, Hello, Reply, ResultError,
-        PROTOCOL_VERSION,
+        parse_daemon_line, Cmd, CmdKind, CmdResult, ClientMessage, DaemonMessage, Event, Hello, Reply,
+        ResultError, Welcome, PROTOCOL_VERSION,
     },
 };
 use thiserror::Error;
 use tokio::{
-    net::{unix::OwnedWriteHalf, UnixStream},
+    net::{
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+        UnixStream,
+    },
     sync::{mpsc, oneshot},
     time,
 };
@@ -105,7 +108,7 @@ async fn run(
             return;
         }
         match connect(&socket, &session).await {
-            Ok((stream, welcome)) => {
+            Ok((reader, writer, welcome)) => {
                 info!(
                     session = %welcome.session,
                     bot = %welcome.user_id,
@@ -113,7 +116,7 @@ async fn run(
                     "connected to daemon"
                 );
                 backoff.reset();
-                let reason = serve(stream, &events, &mut rx, &cancel).await;
+                let reason = serve(reader, writer, &events, &mut rx, &cancel).await;
                 if cancel.is_cancelled() {
                     return;
                 }
@@ -142,30 +145,32 @@ async fn run(
     }
 }
 
-async fn connect(socket: &Path, session: &str) -> Result<(UnixStream, silta::protocol::Welcome), String> {
-    let mut stream = UnixStream::connect(socket).await.map_err(|e| e.to_string())?;
+type Reader = LineReader<OwnedReadHalf>;
+
+/// Connect and complete the handshake. The reader that read the `welcome` is handed
+/// on: the daemon may follow the welcome with queued events at once, and a throwaway
+/// buffered reader would swallow them.
+async fn connect(socket: &Path, session: &str) -> Result<(Reader, OwnedWriteHalf, Welcome), String> {
+    let stream = UnixStream::connect(socket).await.map_err(|e| e.to_string())?;
+    let (read_half, mut writer) = stream.into_split();
+    let mut reader = LineReader::new(read_half);
     let hello = ClientMessage::Hello(Hello {
         protocol: PROTOCOL_VERSION,
         session: session.to_owned(),
         client: CLIENT_NAME.to_owned(),
     });
-    write_line(&mut stream, &hello).await.map_err(|e| format!("cannot send hello: {e}"))?;
+    write_line(&mut writer, &hello).await.map_err(|e| format!("cannot send hello: {e}"))?;
 
-    // Peek at the first line without splitting the stream: a short-lived reader over a
-    // mutable borrow, dropped before the stream is handed on.
-    let first = {
-        let mut reader = LineReader::new(&mut stream);
-        time::timeout(WELCOME_TIMEOUT, reader.next_json::<DaemonMessage>())
-            .await
-            .map_err(|_| "no welcome within the timeout".to_owned())?
-            .map_err(|e| format!("bad first line from daemon: {e}"))?
-    };
+    let first = time::timeout(WELCOME_TIMEOUT, reader.next_json::<DaemonMessage>())
+        .await
+        .map_err(|_| "no welcome within the timeout".to_owned())?
+        .map_err(|e| format!("bad first line from daemon: {e}"))?;
     match first {
         Some(DaemonMessage::Welcome(welcome)) => {
             if welcome.protocol != PROTOCOL_VERSION {
                 return Err(format!("daemon speaks protocol {}, this plugin speaks {PROTOCOL_VERSION}", welcome.protocol));
             }
-            Ok((stream, welcome))
+            Ok((reader, writer, welcome))
         }
         Some(DaemonMessage::Error(err)) => {
             error!(code = err.code.as_str(), "daemon refused the session: {}", err.message);
@@ -178,36 +183,40 @@ async fn connect(socket: &Path, session: &str) -> Result<(UnixStream, silta::pro
 
 /// Multiplex one live connection until it breaks. Returns the reason.
 async fn serve(
-    stream: UnixStream,
+    mut reader: Reader,
+    mut write_half: OwnedWriteHalf,
     events: &mpsc::Sender<Event>,
     rx: &mut mpsc::Receiver<Outgoing>,
     cancel: &CancellationToken,
 ) -> String {
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = LineReader::new(read_half);
     let mut pending: HashMap<u64, oneshot::Sender<Result<CmdResult, DaemonError>>> = HashMap::new();
     let mut next_id: u64 = 1;
 
     let reason = loop {
         tokio::select! {
             _ = cancel.cancelled() => break "shutdown".to_owned(),
-            line = reader.next_json::<DaemonMessage>() => match line {
-                Ok(Some(DaemonMessage::Event(event))) => {
-                    debug!(room = %event.room_id, person = %event.person, "event");
-                    if events.send(event).await.is_err() {
-                        break "event consumer gone".to_owned();
+            line = reader.next_line() => match line {
+                Ok(Some(line)) => match parse_daemon_line(&line) {
+                    Ok(DaemonMessage::Event(event)) => {
+                        debug!(room = %event.room_id, person = %event.person, "event");
+                        if events.send(event).await.is_err() {
+                            break "event consumer gone".to_owned();
+                        }
                     }
-                }
-                Ok(Some(DaemonMessage::Result(result))) => match pending.remove(&result.id) {
-                    Some(done) => {
-                        let _ = done.send(Ok(result));
+                    Ok(DaemonMessage::Result(result)) => match pending.remove(&result.id) {
+                        Some(done) => {
+                            let _ = done.send(Ok(result));
+                        }
+                        None => warn!(id = result.id, "result for an unknown command"),
+                    },
+                    Ok(DaemonMessage::Error(err)) => {
+                        break format!("daemon error {}: {}", err.code.as_str(), err.message);
                     }
-                    None => warn!(id = result.id, "result for an unknown command"),
+                    Ok(DaemonMessage::Welcome(_)) => warn!("unexpected second welcome"),
+                    // A newer daemon may send messages this plugin does not know (a new
+                    // event kind, say); that is no reason to drop the connection.
+                    Err(err) => warn!("ignoring a daemon message this plugin cannot parse: {err}"),
                 },
-                Ok(Some(DaemonMessage::Error(err))) => {
-                    break format!("daemon error {}: {}", err.code.as_str(), err.message);
-                }
-                Ok(Some(DaemonMessage::Welcome(_))) => warn!("unexpected second welcome"),
                 Ok(None) => break "daemon closed the connection".to_owned(),
                 Err(err) => break format!("read error: {err}"),
             },

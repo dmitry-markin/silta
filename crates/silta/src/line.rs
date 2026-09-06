@@ -38,8 +38,10 @@ impl<R: AsyncRead + Unpin> LineReader<R> {
 
     /// The next line without its terminator, `None` at EOF. A final unterminated line
     /// is returned as a line.
+    ///
+    /// Cancellation safe: the callers poll this inside `select!`, and a partial line
+    /// read before the future was dropped is kept for the next call.
     pub async fn next_line(&mut self) -> Result<Option<String>, LineError> {
-        self.buf.clear();
         loop {
             let available = self.inner.fill_buf().await?;
             if available.is_empty() {
@@ -120,6 +122,18 @@ mod tests {
         let input = b"12345678\n".as_slice();
         let mut r = LineReader::with_max(input, 8);
         assert_eq!(r.next_line().await.unwrap().as_deref(), Some("12345678"));
+    }
+
+    #[tokio::test]
+    async fn keeps_a_partial_line_across_a_dropped_future() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut r = LineReader::new(server);
+        client.write_all(b"hel").await.unwrap();
+        // The first attempt reads "hel", then waits for more and is dropped by the timeout.
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), r.next_line()).await.is_err());
+        client.write_all(b"lo\nnext\n").await.unwrap();
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("hello"));
+        assert_eq!(r.next_line().await.unwrap().as_deref(), Some("next"));
     }
 
     #[tokio::test]

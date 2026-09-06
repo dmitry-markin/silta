@@ -87,7 +87,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
         }
     });
 
-    let server = tokio::spawn(server::run(daemon.clone(), config.socket.clone(), cancel.clone()));
+    // Either task ending ends the daemon: a socket that cannot be bound is as fatal as a
+    // rejected token, and must not leave a syncing daemon that no session can reach.
+    let server = tokio::spawn({
+        let daemon = daemon.clone();
+        let socket = config.socket.clone();
+        let cancel = cancel.clone();
+        async move {
+            let result = server::run(daemon, socket, cancel.clone()).await;
+            cancel.cancel();
+            result
+        }
+    });
     let sync = matrix::sync_loop(daemon.clone(), cancel.clone()).await;
     cancel.cancel();
     server.await.context("socket server task failed")??;

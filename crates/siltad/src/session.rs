@@ -10,6 +10,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
+    config::RequestConfig,
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     ruma::api::error::ErrorKind,
     Client,
@@ -50,6 +51,11 @@ pub async fn build_client(homeserver_url: &str, state_dir: &Path) -> Result<Clie
     let client = Client::builder()
         .homeserver_url(homeserver_url)
         .respect_login_well_known(false)
+        // The SDK's default retries a transient HTTP error (a 5xx from a reverse proxy, a
+        // 429) for up to 15 minutes inside one request; a reply that hangs that long
+        // blocks its session's socket for as long. A few attempts, then a `send_failed`
+        // result the session can act on; the sync loop has its own retry.
+        .request_config(RequestConfig::short_retry())
         .sqlite_store(state_dir.join(STORE_DIR), None)
         .with_encryption_settings(EncryptionSettings {
             auto_enable_cross_signing: true,
