@@ -30,9 +30,12 @@ pub struct Config {
     /// maximum age of a message queued for a session that is not connected.
     #[serde(default = "default_replay_window_secs")]
     pub replay_window_secs: u64,
-    /// Reserved for later; accepted and ignored with a warning.
-    #[serde(default)]
-    pub inbox_max_age_days: Option<toml::Value>,
+    /// Downloaded attachments older than this are deleted from the inbox.
+    #[serde(default = "default_inbox_max_age_days")]
+    pub inbox_max_age_days: u64,
+    /// Attachments larger than this are not downloaded; the message says so instead.
+    #[serde(default = "default_inbox_max_file_mb")]
+    pub inbox_max_file_mb: u64,
     /// Reserved for later; accepted and ignored with a warning.
     #[serde(default)]
     pub asr: Option<toml::Value>,
@@ -56,6 +59,14 @@ fn default_device_name() -> String {
 
 fn default_replay_window_secs() -> u64 {
     300
+}
+
+fn default_inbox_max_age_days() -> u64 {
+    30
+}
+
+fn default_inbox_max_file_mb() -> u64 {
+    100
 }
 
 impl fmt::Debug for MatrixConfig {
@@ -201,6 +212,12 @@ impl Config {
         if m.device_id.is_empty() {
             return invalid("matrix.device_id must be set".into());
         }
+        if self.inbox_max_age_days == 0 {
+            return invalid("inbox_max_age_days must be at least 1".into());
+        }
+        if self.inbox_max_file_mb == 0 {
+            return invalid("inbox_max_file_mb must be at least 1".into());
+        }
 
         let mut names = HashSet::new();
         let mut addresses = HashSet::new();
@@ -280,9 +297,6 @@ impl Config {
     /// Non-fatal observations for the startup log.
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
-        if self.inbox_max_age_days.is_some() {
-            warnings.push("inbox_max_age_days is reserved and ignored".into());
-        }
         if self.asr.is_some() {
             warnings.push("[asr] is reserved and ignored".into());
         }
@@ -458,34 +472,56 @@ impl Routing {
         let Some(&i) = self.by_name.get(session) else {
             return Err(SendDenied::UnknownSession);
         };
-        let config = &self.sessions[i];
-        match config.send {
+        match self.sessions[i].send {
             SendPolicy::Any => Ok(()),
-            SendPolicy::Own => {
-                if self.by_room.get(room_id) == Some(&i) {
-                    return Ok(());
-                }
-                let receives_from = |person: &PersonConfig| match &config.receive {
-                    Receive::All => true,
-                    Receive::Selective { people, .. } => people.contains(&person.name),
-                };
-                let mut any = false;
-                for member in members {
-                    if self.is_bot(member) {
-                        continue;
-                    }
-                    any = true;
-                    match self.person_for(member) {
-                        Some(person) if receives_from(person) => {}
-                        _ => return Err(SendDenied::NotAllowed),
-                    }
-                }
-                if any {
-                    Ok(())
-                } else {
-                    Err(SendDenied::NotAllowed)
-                }
+            SendPolicy::Own => self.owns_room(i, room_id, members),
+        }
+    }
+
+    /// Whether a session may read a room's history: the `all` session reads any room,
+    /// another session the rooms it owns. Never the send policy, so a hub that may
+    /// write into every room still cannot read another mind's rooms.
+    pub fn may_read<'m>(
+        &self,
+        session: &str,
+        room_id: &str,
+        members: impl IntoIterator<Item = &'m str>,
+    ) -> Result<(), SendDenied> {
+        let Some(&i) = self.by_name.get(session) else {
+            return Err(SendDenied::UnknownSession);
+        };
+        if self.all == Some(i) {
+            return Ok(());
+        }
+        self.owns_room(i, room_id, members)
+    }
+
+    /// A session owns a room it lists, and any room whose members other than the bot
+    /// are all people it receives from.
+    fn owns_room<'m>(&self, i: usize, room_id: &str, members: impl IntoIterator<Item = &'m str>) -> Result<(), SendDenied> {
+        if self.by_room.get(room_id) == Some(&i) {
+            return Ok(());
+        }
+        let config = &self.sessions[i];
+        let receives_from = |person: &PersonConfig| match &config.receive {
+            Receive::All => true,
+            Receive::Selective { people, .. } => people.contains(&person.name),
+        };
+        let mut any = false;
+        for member in members {
+            if self.is_bot(member) {
+                continue;
             }
+            any = true;
+            match self.person_for(member) {
+                Some(person) if receives_from(person) => {}
+                _ => return Err(SendDenied::NotAllowed),
+            }
+        }
+        if any {
+            Ok(())
+        } else {
+            Err(SendDenied::NotAllowed)
         }
     }
 }
@@ -555,6 +591,21 @@ send = "own"
     }
 
     #[test]
+    fn inbox_defaults_and_limits() {
+        let c = config(HUB_ONLY);
+        assert_eq!(c.inbox_max_age_days, 30);
+        assert_eq!(c.inbox_max_file_mb, 100);
+        let c = Config::parse(&format!("inbox_max_age_days = 7\ninbox_max_file_mb = 5\n{BASE}\n{HUB_ONLY}")).unwrap();
+        assert_eq!((c.inbox_max_age_days, c.inbox_max_file_mb), (7, 5));
+        for bad in ["inbox_max_age_days = 0", "inbox_max_file_mb = 0"] {
+            match Config::parse(&format!("{bad}\n{BASE}\n{HUB_ONLY}")) {
+                Err(ConfigError::Invalid(msg)) => assert!(msg.contains("at least 1"), "{msg}"),
+                other => panic!("expected Invalid for {bad}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn parses_the_plan_example() {
         let c = config(HUB_ONLY);
         assert_eq!(c.sessions[0].receive, Receive::All);
@@ -576,9 +627,8 @@ send = "own"
 
     #[test]
     fn reserved_keys_load_with_warnings() {
-        // Top-level keys must precede the tables in TOML, hence the explicit assembly.
         let c = Config::parse(&format!(
-            "inbox_max_age_days = 30\n{BASE}\n{}",
+            "{BASE}\n{}",
             r#"
 [asr]
 url = "http://127.0.0.1:5092/v1/"
@@ -591,7 +641,7 @@ relay_permissions = true
         ))
         .expect("valid config");
         let w = c.warnings();
-        assert_eq!(w.len(), 3, "{w:?}");
+        assert_eq!(w.len(), 2, "{w:?}");
     }
 
     #[test]
@@ -759,5 +809,25 @@ send = "own"
         ));
         assert_eq!(r.may_send("hub", "!x:silta.test", ["@alice:silta.test", "@bob:silta.test"]), Ok(()));
         assert_eq!(r.may_send("hub", "!x:silta.test", ["@alice:silta.test", "@mallory:silta.test"]), Err(SendDenied::NotAllowed));
+    }
+
+    #[test]
+    fn read_policy_follows_ownership_not_send() {
+        let r = Routing::new(&config(SPLIT));
+        let bot = "@silta:silta.test";
+        // The hub may write into Alice's DM (`any`) but not read it.
+        assert_eq!(r.may_send("hub", "!dm:silta.test", ["@alice:silta.test", bot]), Ok(()));
+        assert_eq!(r.may_read("hub", "!dm:silta.test", ["@alice:silta.test", bot]), Err(SendDenied::NotAllowed));
+        // It reads the rooms it lists and the rooms of the people it receives from.
+        assert_eq!(r.may_read("hub", "!family:silta.test", ["@alice:silta.test", "@bob:silta.test", bot]), Ok(()));
+        assert_eq!(r.may_read("hub", "!dm2:silta.test", ["@bob:silta.test", bot]), Ok(()));
+        // Alice's mind reads her DM only.
+        assert_eq!(r.may_read("alice", "!dm:silta.test", ["@alice:silta.test", bot]), Ok(()));
+        assert_eq!(r.may_read("alice", "!family:silta.test", ["@alice:silta.test", "@bob:silta.test", bot]), Err(SendDenied::NotAllowed));
+        assert_eq!(r.may_read("ghost", "!dm:silta.test", [bot]), Err(SendDenied::UnknownSession));
+
+        // The `all` session reads every room, whoever is in it.
+        let r = Routing::new(&config(HUB_ONLY));
+        assert_eq!(r.may_read("hub", "!x:silta.test", ["@alice:silta.test", "@mallory:silta.test"]), Ok(()));
     }
 }

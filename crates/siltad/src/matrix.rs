@@ -8,31 +8,42 @@ use matrix_sdk::{
     event_handler::Ctx,
     ruma::{
         api::error::ErrorKind,
-        events::room::{
-            encrypted::OriginalSyncRoomEncryptedEvent,
-            member::{MembershipState, StrippedRoomMemberEvent},
-            message::{sanitize::remove_plain_reply_fallback, MessageType, OriginalSyncRoomMessageEvent, Relation},
+        events::{
+            reaction::OriginalSyncReactionEvent,
+            room::{
+                encrypted::OriginalSyncRoomEncryptedEvent,
+                member::{MembershipState, StrippedRoomMemberEvent},
+                message::OriginalSyncRoomMessageEvent,
+            },
         },
     },
     Client, Room, RoomState,
 };
 use silta::{
-    config::Inbound,
-    protocol::{Event, EventKind},
+    config::{Inbound, PersonConfig},
+    protocol::{Attachment, Event, EventKind},
     replay::{verdict, Verdict},
     time::rfc3339_utc,
 };
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::daemon::{Dispatch, Shared};
+use crate::{
+    content::{self, Body, Media},
+    daemon::{Daemon, Dispatch, Shared},
+    inbox::{self, human_size, DownloadError},
+};
+
+/// A download that has not finished by then is given up.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub fn register_handlers(daemon: &Shared) {
     let client = daemon.client.clone();
     client.add_event_handler_context(daemon.clone());
     client.add_event_handler(on_invite);
     client.add_event_handler(on_message);
+    client.add_event_handler(on_reaction);
     client.add_event_handler(on_undecryptable);
 }
 
@@ -72,8 +83,37 @@ async fn on_invite(event: StrippedRoomMemberEvent, room: Room, client: Client, C
     });
 }
 
-/// Deliver text messages and emotes from registered people to the session that owns
-/// the room; queue them while the session is away; skip what an earlier run delivered.
+/// The routing and replay decisions shared by messages and reactions: the registered
+/// sender, the owning session, and whether an earlier run delivered the event already.
+/// `None` means drop, already logged.
+fn admit<'a>(daemon: &'a Daemon, room_id: &str, sender: &str, event_id: &str, ts: u64, what: &str) -> Option<(&'a str, &'a PersonConfig)> {
+    let (session, person) = match daemon.routing.inbound(sender, room_id) {
+        Inbound::Drop(reason) => {
+            info!(room = room_id, sender, "dropping a {what}: {reason}");
+            return None;
+        }
+        Inbound::Deliver { session, person } => (session, person),
+    };
+    match verdict(ts, event_id, daemon.watermark(room_id).as_ref(), daemon.started_at_ms, daemon.replay_window_ms) {
+        Verdict::AlreadyDelivered => {
+            debug!(room = room_id, event_id, "skipping a {what} delivered by an earlier run");
+            None
+        }
+        Verdict::TooOld => {
+            debug!(room = room_id, event_id, "skipping a {what} older than the replay window");
+            None
+        }
+        Verdict::Deliver { behind_start_ms: 0 } => Some((session, person)),
+        Verdict::Deliver { behind_start_ms } => {
+            info!(room = room_id, person = %person.name, "{what} from {} s before the daemon started, within the replay window", behind_start_ms / 1000);
+            Some((session, person))
+        }
+    }
+}
+
+/// Deliver text, emotes and attachments from registered people to the session that
+/// owns the room; queue them while the session is away; skip what an earlier run
+/// delivered. Attachments are downloaded first, off the sync loop.
 async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, Ctx(daemon): Ctx<Shared>) {
     if room.state() != RoomState::Joined {
         return;
@@ -83,48 +123,23 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, Ctx(daemon)
     let sender = event.sender.as_str();
     let event_id = event.event_id.as_str();
 
-    if let Some(Relation::Replacement(_)) = &event.content.relates_to {
-        debug!(room = room_id, sender, "skipping an edit");
+    let parsed = content::parse(&event.content);
+    match &parsed.body {
+        Body::Edit => {
+            debug!(room = room_id, sender, "skipping an edit");
+            return;
+        }
+        Body::Other(msgtype) => {
+            info!(room = room_id, sender, msgtype, "skipping a message type the bridge does not carry");
+            return;
+        }
+        Body::Text(_) | Body::Media(_) => {}
+    }
+    let Some((session, person)) = admit(&daemon, room_id, sender, event_id, ts, "message") else {
         return;
-    }
-    let in_reply_to = match &event.content.relates_to {
-        Some(Relation::Reply(reply)) => Some(reply.in_reply_to.event_id.to_string()),
-        _ => None,
-    };
-    let text: String = match &event.content.msgtype {
-        MessageType::Text(text) if in_reply_to.is_some() => remove_plain_reply_fallback(&text.body).to_owned(),
-        MessageType::Text(text) => text.body.clone(),
-        MessageType::Emote(emote) => format!("/me {}", emote.body),
-        other => {
-            info!(room = room_id, sender, msgtype = other.msgtype(), "skipping a non-text message");
-            return;
-        }
     };
 
-    let (session, person) = match daemon.routing.inbound(sender, room_id) {
-        Inbound::Drop(reason) => {
-            info!(room = room_id, sender, "dropping a message: {reason}");
-            return;
-        }
-        Inbound::Deliver { session, person } => (session, person),
-    };
-
-    match verdict(ts, event_id, daemon.watermark(room_id).as_ref(), daemon.started_at_ms, daemon.replay_window_ms) {
-        Verdict::AlreadyDelivered => {
-            debug!(room = room_id, event_id, "skipping a message delivered by an earlier run");
-            return;
-        }
-        Verdict::TooOld => {
-            debug!(room = room_id, event_id, "skipping a message older than the replay window");
-            return;
-        }
-        Verdict::Deliver { behind_start_ms: 0 } => {}
-        Verdict::Deliver { behind_start_ms } => {
-            info!(room = room_id, person = %person.name, "message from {} s before the daemon started, within the replay window", behind_start_ms / 1000);
-        }
-    }
-
-    let message = Event {
+    let mut message = Event {
         kind: EventKind::Message,
         person: person.name.clone(),
         role: person.role,
@@ -132,17 +147,134 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, Ctx(daemon)
         room_id: room_id.to_owned(),
         event_id: event_id.to_owned(),
         ts: rfc3339_utc(ts),
-        in_reply_to,
-        text: text.clone(),
+        in_reply_to: parsed.in_reply_to,
+        thread: parsed.thread,
+        reacts_to: None,
+        text: String::new(),
         transcribed: false,
         attachments: Vec::new(),
     };
-    match daemon.dispatch(session, &room, message, ts) {
-        Dispatch::Delivered => info!(room = room_id, person = %person.name, session, bytes = text.len(), "delivered"),
-        Dispatch::Queued(waiting) => {
-            warn!(room = room_id, person = %person.name, session, waiting, "session is not connected, message queued")
+    match parsed.body {
+        Body::Text(text) => {
+            message.text = text;
+            deliver(&daemon, session, &room, message, ts);
         }
-        Dispatch::Dropped(why) => warn!(room = room_id, person = %person.name, session, "dropping a message: {why}"),
+        Body::Media(media) => {
+            message.text = media.caption.clone();
+            let session = session.to_owned();
+            let daemon = daemon.clone();
+            tokio::spawn(async move {
+                fetch_attachment(&daemon, &mut message, media).await;
+                deliver(&daemon, &session, &room, message, ts);
+            });
+        }
+        Body::Edit | Body::Other(_) => {}
+    }
+}
+
+/// Download one attachment into the inbox and record it on the event, or explain in
+/// the text why the file is not there.
+async fn fetch_attachment(daemon: &Daemon, message: &mut Event, media: Media) {
+    let Media { name, mime, size, source, .. } = media;
+    let max = daemon.inbox.max_bytes;
+    let describe = |detail: &str| -> String {
+        let size = size.map(|s| format!(", {}", human_size(s))).unwrap_or_default();
+        format!("[attachment \"{name}\" ({mime}{size}) {detail}]")
+    };
+    if size.is_some_and(|s| s > max) {
+        info!(room = %message.room_id, name, "attachment not downloaded: over the {} limit", human_size(max));
+        note(message, describe(&format!("not downloaded: over the {} limit", human_size(max))));
+        return;
+    }
+    let path = inbox::path_for(&daemon.inbox.dir, &message.event_id, &name, &mime);
+    match timeout(DOWNLOAD_TIMEOUT, inbox::download(&daemon.client, source, &path, max)).await {
+        Ok(Ok(bytes)) => {
+            info!(room = %message.room_id, name, bytes, "attachment downloaded to {}", path.display());
+            let path = path.to_string_lossy().into_owned();
+            message.attachments.push(Attachment { name, mime, size: bytes, path });
+        }
+        Ok(Err(DownloadError::TooLarge(bytes))) => {
+            info!(room = %message.room_id, name, bytes, "attachment not downloaded: over the {} limit", human_size(max));
+            note(message, describe(&format!("not downloaded: {} is over the {} limit", human_size(bytes), human_size(max))));
+        }
+        Ok(Err(DownloadError::Failed(err))) => {
+            warn!(room = %message.room_id, name, "attachment download failed: {err:#}");
+            note(message, describe(&format!("could not be downloaded: {err}")));
+        }
+        Err(_) => {
+            warn!(room = %message.room_id, name, "attachment download timed out after {DOWNLOAD_TIMEOUT:?}");
+            note(message, describe("could not be downloaded: timed out"));
+        }
+    }
+}
+
+fn note(message: &mut Event, line: String) {
+    if !message.text.is_empty() {
+        message.text.push('\n');
+    }
+    message.text.push_str(&line);
+}
+
+/// Reactions on the bot's own messages, from registered people, to the session that
+/// owns the room. Reactions on anything else are not the assistant's business.
+async fn on_reaction(event: OriginalSyncReactionEvent, room: Room, Ctx(daemon): Ctx<Shared>) {
+    if room.state() != RoomState::Joined {
+        return;
+    }
+    let sender = event.sender.as_str();
+    if daemon.routing.is_bot(sender) {
+        return;
+    }
+    let ts: u64 = event.origin_server_ts.get().into();
+    let room_id = room.room_id().as_str();
+    let event_id = event.event_id.as_str();
+    let target = event.content.relates_to.event_id.clone();
+    let key = event.content.relates_to.key.clone();
+
+    let Some((session, person)) = admit(&daemon, room_id, sender, event_id, ts, "reaction") else {
+        return;
+    };
+    match room.load_or_fetch_event(&target, None).await {
+        Ok(target_event) => match target_event.sender() {
+            Some(s) if daemon.routing.is_bot(s.as_str()) => {}
+            _ => {
+                debug!(room = room_id, sender, target = %target, "ignoring a reaction on a message that is not the bot's");
+                return;
+            }
+        },
+        Err(err) => {
+            warn!(room = room_id, sender, target = %target, "cannot fetch the target of a reaction: {err}");
+            return;
+        }
+    }
+
+    let message = Event {
+        kind: EventKind::Reaction,
+        person: person.name.clone(),
+        role: person.role,
+        sender: sender.to_owned(),
+        room_id: room_id.to_owned(),
+        event_id: event_id.to_owned(),
+        ts: rfc3339_utc(ts),
+        in_reply_to: None,
+        thread: None,
+        reacts_to: Some(target.to_string()),
+        text: key,
+        transcribed: false,
+        attachments: Vec::new(),
+    };
+    deliver(&daemon, session, &room, message, ts);
+}
+
+fn deliver(daemon: &Daemon, session: &str, room: &Room, event: Event, ts: u64) {
+    let what = event.kind.as_str();
+    let (room_id, person, bytes, files) = (event.room_id.clone(), event.person.clone(), event.text.len(), event.attachments.len());
+    match daemon.dispatch(session, room, event, ts) {
+        Dispatch::Delivered => info!(room = %room_id, %person, session, bytes, files, "delivered {what}"),
+        Dispatch::Queued(waiting) => {
+            warn!(room = %room_id, %person, session, waiting, "session is not connected, {what} queued")
+        }
+        Dispatch::Dropped(why) => warn!(room = %room_id, %person, session, "dropping a {what}: {why}"),
     }
 }
 

@@ -16,7 +16,7 @@ use matrix_sdk::{
 use silta::{
     backlog::Backlog,
     config::Routing,
-    protocol::{Cmd, CmdKind, CmdResult, DaemonMessage, Event},
+    protocol::{Cmd, CmdKind, CmdResult, DaemonMessage, Event, EventKind},
     replay::Watermark,
 };
 use thiserror::Error;
@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::outbound;
+use crate::{inbox::InboxConfig, outbound};
 
 /// Messages kept for a session that is not connected, per session.
 const BACKLOG_MAX: usize = 100;
@@ -45,6 +45,7 @@ pub struct Daemon {
     pub registry: Registry,
     pub started_at_ms: u64,
     pub replay_window_ms: u64,
+    pub inbox: InboxConfig,
     marks: Marks,
     typing: Arc<Mutex<HashMap<OwnedRoomId, TypingTask>>>,
     typing_generation: Mutex<u64>,
@@ -62,13 +63,14 @@ pub enum Dispatch {
 }
 
 impl Daemon {
-    pub fn new(client: Client, routing: Routing, state_dir: &Path, replay_window_secs: u64) -> Daemon {
+    pub fn new(client: Client, routing: Routing, state_dir: &Path, replay_window_secs: u64, inbox: InboxConfig) -> Daemon {
         Daemon {
             client,
             routing,
             registry: Registry::default(),
             started_at_ms: now_ms(),
             replay_window_ms: replay_window_secs.saturating_mul(1000),
+            inbox,
             marks: Marks::load(state_dir.join(MARKS_FILE)),
             typing: Arc::new(Mutex::new(HashMap::new())),
             typing_generation: Mutex::new(0),
@@ -79,6 +81,10 @@ impl Daemon {
     pub async fn execute(&self, session: &str, cmd: Cmd) -> CmdResult {
         match cmd.kind {
             CmdKind::Reply(reply) => outbound::reply(self, session, cmd.id, reply).await,
+            CmdKind::React(react) => outbound::react(self, session, cmd.id, react).await,
+            CmdKind::Edit(edit) => outbound::edit(self, session, cmd.id, edit).await,
+            CmdKind::SendFile(file) => outbound::send_file(self, session, cmd.id, file).await,
+            CmdKind::FetchMessages(fetch) => outbound::fetch_messages(self, session, cmd.id, fetch).await,
         }
     }
 
@@ -106,10 +112,14 @@ impl Daemon {
         }
     }
 
-    /// Bookkeeping once a message is on a session's socket: advance the room's
-    /// watermark and keep the typing indicator alive until the reply.
+    /// Bookkeeping once an event is on a session's socket: advance the room's
+    /// watermark and, for a message, keep the typing indicator alive until the
+    /// session's first visible action. A reaction expects no answer.
     pub fn after_delivery(&self, session: &str, event: &Event, ts_ms: u64) {
         self.marks.set(&event.room_id, Watermark { ts_ms, event_id: event.event_id.clone() });
+        if event.kind != EventKind::Message {
+            return;
+        }
         match RoomId::parse(&event.room_id).ok().and_then(|id| self.client.get_room(&id)) {
             Some(room) => self.typing_start(session, room),
             None => debug!(room = %event.room_id, "no room object for the typing notice"),
@@ -212,9 +222,14 @@ impl Marks {
         self.map.lock().unwrap().get(room_id).cloned()
     }
 
+    /// Watermarks only move forward: an attachment delivered after a newer text
+    /// message (its download took longer) must not pull the mark back.
     fn set(&self, room_id: &str, mark: Watermark) {
         let snapshot = {
             let mut map = self.map.lock().unwrap();
+            if map.get(room_id).is_some_and(|current| current.ts_ms > mark.ts_ms) {
+                return;
+            }
             map.insert(room_id.to_owned(), mark);
             serde_json::to_string_pretty(&*map).unwrap_or_default()
         };

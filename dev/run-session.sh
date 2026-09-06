@@ -31,6 +31,9 @@ if [ $# -ge 1 ]; then
 else
   args+=(--name silta-hub)
 fi
+# The daemon writes attachments under its state directory, outside the workspace; the
+# session may read them only because the directory is allowed here.
+args+=(--add-dir "$state/silta/inbox")
 args+=(--channels plugin:silta-claude@silta-local)
 
 initial='{"type":"user","message":{"role":"user","content":"You are connected to the family chat through the silta channel. Wait for messages and answer each one through the reply tool."}}'

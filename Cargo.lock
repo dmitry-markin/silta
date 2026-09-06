@@ -2233,6 +2233,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cbf6f36070878c42c5233846cd3de24cf9016828fd47bc22957a687298bb21fc"
 
 [[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3481,6 +3491,7 @@ dependencies = [
  "anyhow",
  "clap",
  "matrix-sdk",
+ "mime_guess",
  "serde",
  "serde_json",
  "silta",

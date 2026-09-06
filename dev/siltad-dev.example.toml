@@ -4,6 +4,8 @@
 socket    = "/ABSOLUTE/PATH/TO/silta/dev/state/siltad.sock"
 state_dir = "/ABSOLUTE/PATH/TO/silta/dev/state/silta"
 replay_window_secs = 300   # optional; messages from a downtime this old are still delivered
+inbox_max_age_days = 30    # optional; downloaded attachments older than this are deleted
+inbox_max_file_mb  = 100   # optional; larger attachments are not downloaded, the message says so
 
 [matrix]
 homeserver_url = "http://localhost"

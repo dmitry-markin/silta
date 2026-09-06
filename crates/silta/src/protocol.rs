@@ -100,7 +100,8 @@ impl ErrorCode {
     }
 }
 
-/// One inbound Matrix message the session owns.
+/// One inbound Matrix event the session owns: a message, or a reaction on one of the
+/// bot's own messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub kind: EventKind,
@@ -111,13 +112,20 @@ pub struct Event {
     pub event_id: String,
     /// RFC 3339 UTC, from `origin_server_ts`.
     pub ts: String,
-    /// The event id this message quotes (`m.in_reply_to`), when it is a reply.
+    /// The event id this message quotes (`m.in_reply_to`), when it is a reply. Inside
+    /// a thread only an explicit reply sets it, never the thread fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
-    /// The text; an emote arrives as `/me <text>`.
+    /// The thread root, when the message is in a thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    /// For a reaction: the bot's message the person reacted to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reacts_to: Option<String>,
+    /// The text; an emote arrives as `/me <text>`; a reaction carries its emoji.
     pub text: String,
     pub transcribed: bool,
-    /// Always present so that items can be added later without a protocol bump.
+    /// Files the daemon downloaded into its inbox; always present.
     pub attachments: Vec<Attachment>,
 }
 
@@ -125,9 +133,19 @@ pub struct Event {
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     Message,
+    Reaction,
 }
 
-/// A file the daemon downloaded into its inbox (not populated yet).
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventKind::Message => "message",
+            EventKind::Reaction => "reaction",
+        }
+    }
+}
+
+/// A file the daemon downloaded into its inbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub name: String,
@@ -146,18 +164,25 @@ pub struct Cmd {
 }
 
 /// The command payload, externally tagged so the command name is the key.
-/// Reserved and rejected with `bad_request` until implemented: `react`, `edit`,
-/// `send_file`, `fetch_messages`, `typing`, `permission_request`.
+/// Still reserved and rejected with `bad_request`: `typing`, `permission_request`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CmdKind {
     Reply(Reply),
+    React(React),
+    Edit(Edit),
+    SendFile(SendFile),
+    FetchMessages(FetchMessages),
 }
 
 impl CmdKind {
     pub fn name(&self) -> &'static str {
         match self {
             CmdKind::Reply(_) => "reply",
+            CmdKind::React(_) => "react",
+            CmdKind::Edit(_) => "edit",
+            CmdKind::SendFile(_) => "send_file",
+            CmdKind::FetchMessages(_) => "fetch_messages",
         }
     }
 }
@@ -169,6 +194,52 @@ pub struct Reply {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// Thread root to answer in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+}
+
+/// React to a message with an emoji.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct React {
+    pub room_id: String,
+    pub event_id: String,
+    pub emoji: String,
+}
+
+/// Replace the text of one of the bot's own messages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edit {
+    pub room_id: String,
+    pub event_id: String,
+    pub text: String,
+}
+
+/// Send a file from the daemon's host into a room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendFile {
+    pub room_id: String,
+    /// Absolute path of a regular file.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+}
+
+/// Fetch recent messages of a room, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchMessages {
+    pub room_id: String,
+    /// At least this many when the room has them (the last page is returned whole).
+    /// Default 20, at most 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// The `more` token of an earlier result, to page further back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 /// The daemon's answer to a command.
@@ -182,16 +253,72 @@ pub struct CmdResult {
     pub error: Option<ResultError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// `fetch_messages`: the messages, newest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<HistoryMessage>>,
+    /// `fetch_messages`: pass as `from` to page further back; absent at the start
+    /// of the room's history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub more: Option<String>,
 }
 
 impl CmdResult {
     pub fn ok(id: u64, event_id: impl Into<String>) -> Self {
-        Self { id, ok: true, event_id: Some(event_id.into()), error: None, message: None }
+        Self {
+            id,
+            ok: true,
+            event_id: Some(event_id.into()),
+            error: None,
+            message: None,
+            messages: None,
+            more: None,
+        }
+    }
+
+    pub fn history(id: u64, messages: Vec<HistoryMessage>, more: Option<String>) -> Self {
+        Self { id, ok: true, event_id: None, error: None, message: None, messages: Some(messages), more }
     }
 
     pub fn err(id: u64, error: ResultError, message: impl Into<String>) -> Self {
-        Self { id, ok: false, event_id: None, error: Some(error), message: Some(message.into()) }
+        Self {
+            id,
+            ok: false,
+            event_id: None,
+            error: Some(error),
+            message: Some(message.into()),
+            messages: None,
+            more: None,
+        }
     }
+}
+
+/// One message from a room's history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryMessage {
+    pub event_id: String,
+    pub sender: String,
+    /// The registered person, absent for the bot's own messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
+    /// Sent by the bot itself.
+    pub own: bool,
+    pub ts: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    pub text: String,
+    /// Listed, not downloaded.
+    pub attachments: Vec<HistoryAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryAttachment {
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
 }
 
 /// Error codes a command can fail with. `Unknown` catches codes from a newer daemon.
@@ -202,6 +329,10 @@ pub enum ResultError {
     RoomUnknown,
     SendFailed,
     BadRequest,
+    /// The event does not exist, or is not the bot's own message when it must be.
+    NotFound,
+    /// The path is not a readable regular file, or the file is too large.
+    FileError,
     #[serde(other)]
     Unknown,
 }
@@ -213,6 +344,8 @@ impl ResultError {
             ResultError::RoomUnknown => "room_unknown",
             ResultError::SendFailed => "send_failed",
             ResultError::BadRequest => "bad_request",
+            ResultError::NotFound => "not_found",
+            ResultError::FileError => "file_error",
             ResultError::Unknown => "unknown",
         }
     }
@@ -331,11 +464,27 @@ mod tests {
     }
 
     #[test]
-    fn event_with_attachment_is_forward_compatible() {
+    fn event_with_attachments() {
         let json = r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","event_id":"$xyz","ts":"2026-09-05T18:02:11Z","text":"","transcribed":true,"attachments":[{"name":"a.ogg","mime":"audio/ogg","size":12,"path":"/var/lib/silta/inbox/a.ogg"}]}}"#;
         let msg = roundtrip_daemon(json);
         let DaemonMessage::Event(e) = msg else { panic!("not event") };
         assert_eq!(e.attachments[0].size, 12);
+        assert_eq!(e.attachments[0].path, "/var/lib/silta/inbox/a.ogg");
+    }
+
+    #[test]
+    fn thread_and_reaction_events() {
+        let json = r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","event_id":"$t2","ts":"2026-09-06T10:00:00Z","thread":"$root","text":"in the thread","transcribed":false,"attachments":[]}}"#;
+        let DaemonMessage::Event(e) = roundtrip_daemon(json) else { panic!("not event") };
+        assert_eq!(e.thread.as_deref(), Some("$root"));
+        assert_eq!(e.in_reply_to, None);
+
+        let json = r#"{"event":{"kind":"reaction","person":"Bob","role":"owner","sender":"@bob:silta.test","room_id":"!abc:silta.test","event_id":"$r","ts":"2026-09-06T10:00:01Z","reacts_to":"$bot","text":"👍","transcribed":false,"attachments":[]}}"#;
+        let DaemonMessage::Event(e) = roundtrip_daemon(json) else { panic!("not event") };
+        assert_eq!(e.kind, EventKind::Reaction);
+        assert_eq!(e.kind.as_str(), "reaction");
+        assert_eq!(e.reacts_to.as_deref(), Some("$bot"));
+        assert_eq!(e.text, "👍");
     }
 
     #[test]
@@ -345,13 +494,47 @@ mod tests {
         );
         let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
         assert_eq!(cmd.id, 7);
-        let CmdKind::Reply(r) = cmd.kind;
+        let CmdKind::Reply(r) = cmd.kind else { panic!("not reply") };
         assert_eq!(r.reply_to.as_deref(), Some("$xyz"));
 
         let msg = roundtrip_client(r#"{"cmd":{"id":8,"reply":{"room_id":"!abc:silta.test","text":"plain"}}}"#);
         let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
-        let CmdKind::Reply(r) = cmd.kind;
+        let CmdKind::Reply(r) = cmd.kind else { panic!("not reply") };
         assert_eq!(r.reply_to, None);
+
+        let msg = roundtrip_client(r#"{"cmd":{"id":9,"reply":{"room_id":"!abc:silta.test","text":"t","thread":"$root"}}}"#);
+        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        let CmdKind::Reply(r) = cmd.kind else { panic!("not reply") };
+        assert_eq!(r.thread.as_deref(), Some("$root"));
+    }
+
+    #[test]
+    fn phase2_commands() {
+        let msg = roundtrip_client(r#"{"cmd":{"id":1,"react":{"room_id":"!r","event_id":"$e","emoji":"👀"}}}"#);
+        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        assert_eq!(cmd.kind.name(), "react");
+        let CmdKind::React(r) = cmd.kind else { panic!("not react") };
+        assert_eq!(r.emoji, "👀");
+
+        let msg = roundtrip_client(r#"{"cmd":{"id":2,"edit":{"room_id":"!r","event_id":"$own","text":"done"}}}"#);
+        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        assert_eq!(cmd.kind.name(), "edit");
+
+        let msg = roundtrip_client(
+            r#"{"cmd":{"id":3,"send_file":{"room_id":"!r","path":"/abs/report.md","caption":"the report","reply_to":"$e","thread":"$root"}}}"#,
+        );
+        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        let CmdKind::SendFile(f) = cmd.kind else { panic!("not send_file") };
+        assert_eq!(f.caption.as_deref(), Some("the report"));
+        let msg = roundtrip_client(r#"{"cmd":{"id":4,"send_file":{"room_id":"!r","path":"/abs/a.png"}}}"#);
+        assert!(matches!(msg, ClientMessage::Cmd(Cmd { kind: CmdKind::SendFile(_), .. })));
+
+        let msg = roundtrip_client(r#"{"cmd":{"id":5,"fetch_messages":{"room_id":"!r","limit":20,"from":"t1"}}}"#);
+        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        let CmdKind::FetchMessages(f) = cmd.kind else { panic!("not fetch_messages") };
+        assert_eq!(f.limit, Some(20));
+        let msg = roundtrip_client(r#"{"cmd":{"id":6,"fetch_messages":{"room_id":"!r"}}}"#);
+        assert!(matches!(msg, ClientMessage::Cmd(Cmd { kind: CmdKind::FetchMessages(_), .. })));
     }
 
     #[test]
@@ -370,6 +553,14 @@ mod tests {
                 "session hub may not send to !..."
             ))
         );
+        for code in ["not_found", "file_error"] {
+            let DaemonMessage::Result(r) =
+                roundtrip_daemon(&format!(r#"{{"result":{{"id":1,"ok":false,"error":"{code}","message":"m"}}}}"#))
+            else {
+                panic!("not result")
+            };
+            assert_eq!(r.error.unwrap().as_str(), code);
+        }
 
         // A newer daemon's error code is tolerated.
         let msg: DaemonMessage =
@@ -379,16 +570,33 @@ mod tests {
     }
 
     #[test]
+    fn history_result() {
+        let json = r#"{"result":{"id":5,"ok":true,"messages":[{"event_id":"$e","sender":"@alice:x","person":"Alice","role":"family","own":false,"ts":"2026-09-06T10:00:00Z","in_reply_to":"$q","thread":"$root","text":"hi","attachments":[{"name":"a.pdf","mime":"application/pdf","size":10}]},{"event_id":"$b","sender":"@silta:x","own":true,"ts":"2026-09-06T09:59:00Z","text":"hello","attachments":[]}],"more":"t123"}}"#;
+        let DaemonMessage::Result(r) = roundtrip_daemon(json) else { panic!("not result") };
+        let messages = r.messages.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].attachments[0].size, 10);
+        assert!(messages[1].own);
+        assert_eq!(r.more.as_deref(), Some("t123"));
+
+        // The end of history: no token.
+        let DaemonMessage::Result(r) = roundtrip_daemon(r#"{"result":{"id":6,"ok":true,"messages":[]}}"#) else {
+            panic!("not result")
+        };
+        assert_eq!(r, CmdResult::history(6, Vec::new(), None));
+    }
+
+    #[test]
     fn classify_client_lines() {
         let good = parse_client_line(r#"{"hello":{"protocol":1,"session":"hub","client":"x"}}"#).unwrap();
         assert!(matches!(good, Incoming::Message(ClientMessage::Hello(_))));
 
-        // Reserved command with an id: bad_request.
-        let reserved = parse_client_line(r#"{"cmd":{"id":3,"react":{"room_id":"!r","event_id":"$e","emoji":"x"}}}"#).unwrap();
+        // A reserved command with an id: bad_request.
+        let reserved = parse_client_line(r#"{"cmd":{"id":3,"typing":{"room_id":"!r","on":true}}}"#).unwrap();
         match reserved {
             Incoming::BadRequest { id, message } => {
                 assert_eq!(id, 3);
-                assert!(message.contains("react"), "{message}");
+                assert!(message.contains("typing"), "{message}");
             }
             other => panic!("unexpected {other:?}"),
         }

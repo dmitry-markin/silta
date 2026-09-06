@@ -1,6 +1,8 @@
 //! `siltad` as a library: the pieces the daemon binary and the test client share.
 
+pub mod content;
 pub mod daemon;
+pub mod inbox;
 pub mod matrix;
 pub mod outbound;
 pub mod server;

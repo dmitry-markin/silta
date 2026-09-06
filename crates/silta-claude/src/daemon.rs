@@ -11,8 +11,8 @@ use std::{
 use silta::{
     line::{write_line, LineReader},
     protocol::{
-        parse_daemon_line, Cmd, CmdKind, CmdResult, ClientMessage, DaemonMessage, Event, Hello, Reply,
-        ResultError, Welcome, PROTOCOL_VERSION,
+        parse_daemon_line, Cmd, CmdKind, CmdResult, ClientMessage, DaemonMessage, Event, Hello, ResultError,
+        Welcome, PROTOCOL_VERSION,
     },
 };
 use thiserror::Error;
@@ -72,12 +72,12 @@ impl DaemonClient {
         DaemonClient { tx }
     }
 
-    /// Send a reply and wait for the daemon's verdict. Returns the event id of the
-    /// last message sent.
-    pub async fn reply(&self, reply: Reply) -> Result<String, DaemonError> {
+    /// Send a command and wait for the daemon's verdict. A refusal is an error with
+    /// the daemon's code; a successful result is returned whole.
+    pub async fn command(&self, kind: CmdKind) -> Result<CmdResult, DaemonError> {
         let (done, wait) = oneshot::channel();
         self.tx
-            .send(Outgoing { kind: CmdKind::Reply(reply), done })
+            .send(Outgoing { kind, done })
             .await
             .map_err(|_| DaemonError::Unavailable("connection task stopped".into()))?;
         let result = time::timeout(RESULT_TIMEOUT, wait)
@@ -85,7 +85,7 @@ impl DaemonClient {
             .map_err(|_| DaemonError::Timeout(RESULT_TIMEOUT))?
             .map_err(|_| DaemonError::Unavailable("connection lost".into()))??;
         if result.ok {
-            Ok(result.event_id.unwrap_or_default())
+            Ok(result)
         } else {
             Err(DaemonError::Refused {
                 code: result.error.unwrap_or(ResultError::Unknown),

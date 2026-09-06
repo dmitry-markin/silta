@@ -1,82 +1,398 @@
-//! Outbound messages: policy check, Markdown rendering, chunking, sending.
+//! Outbound commands: policy checks, Markdown rendering, chunking, reactions, edits,
+//! files and history.
+
+use std::path::Path;
 
 use matrix_sdk::{
+    attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo},
+    room::{
+        reply::{EnforceThread, Reply as ReplyConfig, ReplyError},
+        MessagesOptions,
+    },
     ruma::{
         events::{
-            relation::{InReplyTo, Reply as ReplyRelation},
-            room::message::{Relation, RoomMessageEventContent},
+            reaction::ReactionEventContent,
+            relation::Annotation,
+            room::message::{
+                AddMentions, Relation, ReplacementMetadata, ReplyWithinThread, RoomMessageEventContent,
+                RoomMessageEventContentWithoutRelation, TextMessageEventContent,
+            },
+            AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
         },
-        EventId, RoomId,
+        EventId, OwnedEventId, RoomId, UInt,
     },
-    RoomMemberships, RoomState,
+    Room, RoomMemberships, RoomState,
 };
 use silta::{
-    protocol::{CmdResult, Reply, ResultError},
+    protocol::{CmdResult, Edit, FetchMessages, HistoryAttachment, HistoryMessage, React, Reply, ResultError, SendFile},
     text::chunk_text,
+    time::rfc3339_utc,
 };
 use tracing::{info, warn};
 
-use crate::daemon::Daemon;
+use crate::{
+    content::{self, Body},
+    daemon::Daemon,
+    inbox::human_size,
+};
 
 /// Matrix events are capped at 64 KiB, and a Markdown reply is sent twice in one event:
 /// once as `body` and once as the rendered `formatted_body`. Chunk well below a quarter
 /// of the cap so the rendered copy cannot push an event over it.
 const CHUNK_BYTES: usize = 8 * 1024;
+const HISTORY_DEFAULT: u32 = 20;
+const HISTORY_MAX: u32 = 100;
+
+type Fail = (ResultError, String);
+
+fn bad(message: impl Into<String>) -> Fail {
+    (ResultError::BadRequest, message.into())
+}
 
 pub async fn reply(daemon: &Daemon, session: &str, id: u64, reply: Reply) -> CmdResult {
-    let err = |code, message: String| CmdResult::err(id, code, message);
+    finish(id, do_reply(daemon, session, reply).await)
+}
 
-    if reply.text.trim().is_empty() {
-        return err(ResultError::BadRequest, "text is empty".into());
+pub async fn react(daemon: &Daemon, session: &str, id: u64, react: React) -> CmdResult {
+    finish(id, do_react(daemon, session, react).await)
+}
+
+pub async fn edit(daemon: &Daemon, session: &str, id: u64, edit: Edit) -> CmdResult {
+    finish(id, do_edit(daemon, session, edit).await)
+}
+
+pub async fn send_file(daemon: &Daemon, session: &str, id: u64, cmd: SendFile) -> CmdResult {
+    finish(id, do_send_file(daemon, session, cmd).await)
+}
+
+pub async fn fetch_messages(daemon: &Daemon, session: &str, id: u64, cmd: FetchMessages) -> CmdResult {
+    match do_fetch_messages(daemon, session, cmd).await {
+        Ok((messages, more)) => CmdResult::history(id, messages, more),
+        Err((code, message)) => CmdResult::err(id, code, message),
     }
-    let Ok(room_id) = RoomId::parse(&reply.room_id) else {
-        return err(ResultError::BadRequest, format!("{:?} is not a room id", reply.room_id));
-    };
-    let reply_to = match &reply.reply_to {
-        Some(s) => match EventId::parse(s) {
-            Ok(event_id) => Some(event_id),
-            Err(_) => return err(ResultError::BadRequest, format!("{s:?} is not an event id")),
-        },
-        None => None,
-    };
-    let Some(room) = daemon.client.get_room(&room_id) else {
-        return err(ResultError::RoomUnknown, format!("the bot is not in {room_id}"));
-    };
+}
+
+fn finish(id: u64, result: Result<OwnedEventId, Fail>) -> CmdResult {
+    match result {
+        Ok(event_id) => CmdResult::ok(id, event_id.to_string()),
+        Err((code, message)) => CmdResult::err(id, code, message),
+    }
+}
+
+/// The joined room behind a room id string.
+fn joined_room(daemon: &Daemon, room_id: &str) -> Result<Room, Fail> {
+    let room_id = RoomId::parse(room_id).map_err(|_| bad(format!("{room_id:?} is not a room id")))?;
+    let room = daemon
+        .client
+        .get_room(&room_id)
+        .ok_or_else(|| (ResultError::RoomUnknown, format!("the bot is not in {room_id}")))?;
     if room.state() != RoomState::Joined {
-        return err(ResultError::RoomUnknown, format!("the bot is not joined to {room_id}"));
+        return Err((ResultError::RoomUnknown, format!("the bot is not joined to {room_id}")));
     }
+    Ok(room)
+}
 
-    let members = match room.members(RoomMemberships::ACTIVE).await {
-        Ok(members) => members,
-        Err(e) => return err(ResultError::SendFailed, format!("cannot list the members of {room_id}: {e}")),
-    };
-    let member_ids = members.iter().map(|m| m.user_id().as_str());
-    if daemon.routing.may_send(session, room_id.as_str(), member_ids).is_err() {
-        warn!(session, room = %room_id, "send refused by policy");
-        return err(ResultError::RoomNotAllowed, format!("session {session} may not send to {room_id}"));
+async fn member_ids(room: &Room) -> Result<Vec<String>, Fail> {
+    let members = room
+        .members(RoomMemberships::ACTIVE)
+        .await
+        .map_err(|e| (ResultError::SendFailed, format!("cannot list the members of {}: {e}", room.room_id())))?;
+    Ok(members.iter().map(|m| m.user_id().to_string()).collect())
+}
+
+/// A room the session's send policy allows.
+async fn writable_room(daemon: &Daemon, session: &str, room_id: &str) -> Result<Room, Fail> {
+    let room = joined_room(daemon, room_id)?;
+    let members = member_ids(&room).await?;
+    if daemon.routing.may_send(session, room.room_id().as_str(), members.iter().map(String::as_str)).is_err() {
+        warn!(session, room = %room.room_id(), "send refused by policy");
+        return Err((ResultError::RoomNotAllowed, format!("session {session} may not send to {}", room.room_id())));
     }
+    Ok(room)
+}
+
+/// A room the session owns, for reading history.
+async fn readable_room(daemon: &Daemon, session: &str, room_id: &str) -> Result<Room, Fail> {
+    let room = joined_room(daemon, room_id)?;
+    let members = member_ids(&room).await?;
+    if daemon.routing.may_read(session, room.room_id().as_str(), members.iter().map(String::as_str)).is_err() {
+        warn!(session, room = %room.room_id(), "history refused by policy");
+        return Err((ResultError::RoomNotAllowed, format!("session {session} may not read {}", room.room_id())));
+    }
+    Ok(room)
+}
+
+fn parse_event_id(s: &str) -> Result<OwnedEventId, Fail> {
+    EventId::parse(s).map_err(|_| bad(format!("{s:?} is not an event id")))
+}
+
+fn parse_optional_event_id(s: Option<&str>) -> Result<Option<OwnedEventId>, Fail> {
+    s.map(parse_event_id).transpose()
+}
+
+/// What a quote and a thread mean for the relation of an outgoing message. A quote
+/// alone follows the quoted message into its thread if it is in one, as Element does.
+fn reply_config(reply_to: Option<OwnedEventId>, thread: Option<OwnedEventId>) -> Option<ReplyConfig> {
+    let (event_id, enforce_thread) = match (reply_to, thread) {
+        (Some(quoted), Some(_)) => (quoted, EnforceThread::Threaded(ReplyWithinThread::Yes)),
+        (Some(quoted), None) => (quoted, EnforceThread::MaybeThreaded),
+        (None, Some(root)) => (root, EnforceThread::Threaded(ReplyWithinThread::No)),
+        (None, None) => return None,
+    };
+    Some(ReplyConfig { event_id, enforce_thread, add_mentions: AddMentions::No })
+}
+
+async fn with_relation(
+    room: &Room,
+    content: RoomMessageEventContentWithoutRelation,
+    config: Option<ReplyConfig>,
+) -> Result<RoomMessageEventContent, Fail> {
+    match config {
+        None => Ok(content.with_relation(None)),
+        Some(config) => room.make_reply_event(content, config).await.map_err(|e| match e {
+            ReplyError::Fetch(_) => (ResultError::NotFound, format!("cannot fetch the event to relate to: {e}")),
+            other => bad(other.to_string()),
+        }),
+    }
+}
+
+/// The typing indicator runs from delivery until the session's first visible action
+/// in the room; every command that sends something ends it.
+async fn stop_typing(daemon: &Daemon, room: &Room) {
+    daemon.typing_stop(room.room_id());
+    let _ = room.typing_notice(false).await;
+}
+
+async fn do_reply(daemon: &Daemon, session: &str, reply: Reply) -> Result<OwnedEventId, Fail> {
+    if reply.text.trim().is_empty() {
+        return Err(bad("text is empty"));
+    }
+    let reply_to = parse_optional_event_id(reply.reply_to.as_deref())?;
+    let thread = parse_optional_event_id(reply.thread.as_deref())?;
+    let room = writable_room(daemon, session, &reply.room_id).await?;
 
     let chunks = chunk_text(&reply.text, CHUNK_BYTES);
-    let mut last_event_id = None;
+    let mut last: Option<OwnedEventId> = None;
+    let mut in_thread = false;
     for (i, chunk) in chunks.iter().enumerate() {
-        let mut content = RoomMessageEventContent::text_markdown(chunk);
+        let plain = RoomMessageEventContentWithoutRelation::text_markdown(chunk);
+        // Later chunks of a threaded reply must stay in the thread; each follows the
+        // previous chunk, which is by then the latest message of the thread.
+        let config = if i == 0 {
+            reply_config(reply_to.clone(), thread.clone())
+        } else if in_thread {
+            Some(ReplyConfig {
+                event_id: last.clone().expect("a chunk was sent"),
+                enforce_thread: EnforceThread::MaybeThreaded,
+                add_mentions: AddMentions::No,
+            })
+        } else {
+            None
+        };
+        let content = with_relation(&room, plain, config).await?;
         if i == 0 {
-            if let Some(event_id) = &reply_to {
-                content.relates_to = Some(Relation::Reply(ReplyRelation::new(InReplyTo::new(event_id.clone()))));
-            }
+            in_thread = matches!(content.relates_to, Some(Relation::Thread(_)));
         }
         match room.send(content).await {
-            Ok(sent) => last_event_id = Some(sent.response.event_id),
+            Ok(sent) => last = Some(sent.response.event_id),
             Err(e) => {
-                daemon.typing_stop(&room_id);
-                let _ = room.typing_notice(false).await;
-                return err(ResultError::SendFailed, format!("sending to {room_id} failed after {i} of {} chunks: {e}", chunks.len()));
+                stop_typing(daemon, &room).await;
+                return Err((
+                    ResultError::SendFailed,
+                    format!("sending to {} failed after {i} of {} chunks: {e}", room.room_id(), chunks.len()),
+                ));
             }
         }
     }
-    daemon.typing_stop(&room_id);
-    let _ = room.typing_notice(false).await;
-    let event_id = last_event_id.map(|e| e.to_string()).unwrap_or_default();
-    info!(session, room = %room_id, chunks = chunks.len(), bytes = reply.text.len(), "sent");
-    CmdResult::ok(id, event_id)
+    stop_typing(daemon, &room).await;
+    info!(session, room = %room.room_id(), chunks = chunks.len(), bytes = reply.text.len(), in_thread, "sent");
+    Ok(last.expect("at least one chunk"))
+}
+
+async fn do_react(daemon: &Daemon, session: &str, react: React) -> Result<OwnedEventId, Fail> {
+    if react.emoji.trim().is_empty() {
+        return Err(bad("emoji is empty"));
+    }
+    let target = parse_event_id(&react.event_id)?;
+    let room = writable_room(daemon, session, &react.room_id).await?;
+    let content = ReactionEventContent::new(Annotation::new(target.clone(), react.emoji.clone()));
+    let sent = room
+        .send(content)
+        .await
+        .map_err(|e| (ResultError::SendFailed, format!("reacting in {} failed: {e}", room.room_id())))?;
+    stop_typing(daemon, &room).await;
+    info!(session, room = %room.room_id(), %target, emoji = %react.emoji, "reacted");
+    Ok(sent.response.event_id)
+}
+
+async fn do_edit(daemon: &Daemon, session: &str, edit: Edit) -> Result<OwnedEventId, Fail> {
+    if edit.text.trim().is_empty() {
+        return Err(bad("text is empty"));
+    }
+    if edit.text.len() > CHUNK_BYTES {
+        return Err(bad(format!(
+            "the new text is {} bytes; an edit must fit one message of {CHUNK_BYTES} bytes, send a new message instead",
+            edit.text.len()
+        )));
+    }
+    let target = parse_event_id(&edit.event_id)?;
+    let room = writable_room(daemon, session, &edit.room_id).await?;
+
+    let original = room
+        .load_or_fetch_event(&target, None)
+        .await
+        .map_err(|e| (ResultError::NotFound, format!("cannot fetch {target}: {e}")))?;
+    match original.sender() {
+        Some(s) if daemon.routing.is_bot(s.as_str()) => {}
+        _ => return Err((ResultError::NotFound, format!("{target} is not one of the bot's own messages"))),
+    }
+    match original.raw().deserialize() {
+        Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)))) => {
+            if matches!(m.content.relates_to, Some(Relation::Replacement(_))) {
+                return Err(bad(format!("{target} is itself an edit; edit the original message")));
+            }
+        }
+        Ok(_) => return Err(bad(format!("{target} is not a message"))),
+        Err(e) => return Err((ResultError::NotFound, format!("cannot read {target}: {e}"))),
+    }
+
+    let content = RoomMessageEventContent::text_markdown(&edit.text).make_replacement(ReplacementMetadata::new(target.clone(), None));
+    let sent = room
+        .send(content)
+        .await
+        .map_err(|e| (ResultError::SendFailed, format!("editing {target} in {} failed: {e}", room.room_id())))?;
+    stop_typing(daemon, &room).await;
+    info!(session, room = %room.room_id(), %target, bytes = edit.text.len(), "edited");
+    Ok(sent.response.event_id)
+}
+
+async fn do_send_file(daemon: &Daemon, session: &str, cmd: SendFile) -> Result<OwnedEventId, Fail> {
+    let path = Path::new(&cmd.path);
+    let file_error = |message: String| (ResultError::FileError, message);
+    if !path.is_absolute() {
+        return Err(file_error(format!("{} is not an absolute path", path.display())));
+    }
+    let meta = tokio::fs::metadata(path).await.map_err(|e| file_error(format!("cannot read {}: {e}", path.display())))?;
+    if !meta.is_file() {
+        return Err(file_error(format!("{} is not a regular file", path.display())));
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_owned();
+    let reply_to = parse_optional_event_id(cmd.reply_to.as_deref())?;
+    let thread = parse_optional_event_id(cmd.thread.as_deref())?;
+    let room = writable_room(daemon, session, &cmd.room_id).await?;
+
+    match daemon.client.load_or_fetch_max_upload_size().await {
+        Ok(max) => {
+            let max = u64::from(max);
+            if meta.len() > max {
+                return Err(file_error(format!(
+                    "{} is {} and the server accepts at most {}",
+                    path.display(),
+                    human_size(meta.len()),
+                    human_size(max)
+                )));
+            }
+        }
+        Err(e) => warn!("cannot learn the server's upload limit, sending anyway: {e}"),
+    }
+    let data = tokio::fs::read(path).await.map_err(|e| file_error(format!("cannot read {}: {e}", path.display())))?;
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+
+    // The size in the event's `info`, so history and clients can show it; the SDK
+    // ignores an info whose kind does not match the content type.
+    let size = UInt::new(data.len() as u64);
+    let info = match mime.type_() {
+        mime_guess::mime::IMAGE => AttachmentInfo::Image(BaseImageInfo { size, ..Default::default() }),
+        mime_guess::mime::AUDIO => AttachmentInfo::Audio(BaseAudioInfo { size, ..Default::default() }),
+        mime_guess::mime::VIDEO => AttachmentInfo::Video(BaseVideoInfo { size, ..Default::default() }),
+        _ => AttachmentInfo::File(BaseFileInfo { size }),
+    };
+    let mut config = AttachmentConfig::new().info(info);
+    if let Some(caption) = cmd.caption.filter(|c| !c.trim().is_empty()) {
+        config = config.caption(Some(TextMessageEventContent::markdown(caption)));
+    }
+    config = config.reply(reply_config(reply_to, thread));
+    let bytes = data.len();
+    let response = room
+        .send_attachment(&name, &mime, data, config)
+        .await
+        .map_err(|e| (ResultError::SendFailed, format!("sending {} to {} failed: {e}", path.display(), room.room_id())))?;
+    stop_typing(daemon, &room).await;
+    info!(session, room = %room.room_id(), name, bytes, mime = %mime, "file sent");
+    Ok(response.event_id)
+}
+
+/// Raw pages read for one history command at most, so a room full of reactions
+/// cannot keep the daemon paging.
+const HISTORY_MAX_PAGES: usize = 5;
+
+/// Page backwards until at least `limit` messages are collected or the history ends.
+/// A server-side type filter would not do: in an encrypted room every event is
+/// `m.room.encrypted` on the server, and conduit ignores the filter anyway. The last
+/// page is returned whole, so a call may bring a few more than `limit`.
+async fn do_fetch_messages(daemon: &Daemon, session: &str, cmd: FetchMessages) -> Result<(Vec<HistoryMessage>, Option<String>), Fail> {
+    let room = readable_room(daemon, session, &cmd.room_id).await?;
+    let limit = cmd.limit.unwrap_or(HISTORY_DEFAULT).clamp(1, HISTORY_MAX);
+    let mut from = cmd.from;
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let mut pages = 0usize;
+    let more = loop {
+        let mut options = MessagesOptions::backward();
+        options.limit = UInt::from(limit);
+        options.from = from.take();
+        let page = room
+            .messages(options)
+            .await
+            .map_err(|e| (ResultError::SendFailed, format!("history request for {} failed: {e}", room.room_id())))?;
+        pages += 1;
+        for event in &page.chunk {
+            match history_message(daemon, event) {
+                Some(message) => out.push(message),
+                None => skipped += 1,
+            }
+        }
+        match page.end {
+            None => break None,
+            Some(_) if page.chunk.is_empty() => break None,
+            Some(end) if out.len() >= limit as usize || pages >= HISTORY_MAX_PAGES => break Some(end),
+            Some(end) => from = Some(end),
+        }
+    };
+    info!(session, room = %room.room_id(), count = out.len(), skipped, pages, more = more.is_some(), "history fetched");
+    Ok((out, more))
+}
+
+/// One raw timeline event as a history message: registered senders and the bot only,
+/// messages only (not reactions, edits or state), decrypted.
+fn history_message(daemon: &Daemon, event: &matrix_sdk::deserialized_responses::TimelineEvent) -> Option<HistoryMessage> {
+    let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(m)))) =
+        event.raw().deserialize()
+    else {
+        return None;
+    };
+    let sender = m.sender.as_str();
+    let own = daemon.routing.is_bot(sender);
+    let person = if own { None } else { Some(daemon.routing.person_for(sender)?) };
+    let parsed = content::parse(&m.content);
+    let (text, attachments) = match parsed.body {
+        Body::Text(text) => (text, Vec::new()),
+        Body::Media(media) => (
+            media.caption,
+            vec![HistoryAttachment { name: media.name, mime: media.mime, size: media.size.unwrap_or(0) }],
+        ),
+        Body::Edit | Body::Other(_) => return None,
+    };
+    Some(HistoryMessage {
+        event_id: m.event_id.to_string(),
+        sender: sender.to_owned(),
+        person: person.map(|p| p.name.clone()),
+        role: person.map(|p| p.role),
+        own,
+        ts: rfc3339_utc(m.origin_server_ts.get().into()),
+        in_reply_to: parsed.in_reply_to,
+        thread: parsed.thread,
+        text,
+        attachments,
+    })
 }

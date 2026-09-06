@@ -6,9 +6,12 @@ target/
 **/.claude/settings.local.json
 CLAUDE.local.md
 
-# Assistant workspace runtime files (spike and later): notes and inbox, not the persona
-dev/workspace/notes.md
-dev/workspace/inbox/
+# Dev session workspace: runtime files (inbox, out, notes, memory); only the plugin
+# enablement is tracked
+dev/workspace/*
+!dev/workspace/.claude/
+dev/workspace/.claude/*
+!dev/workspace/.claude/settings.json
 
 # Secrets and host-specific config: only *.example files are tracked
 *.env

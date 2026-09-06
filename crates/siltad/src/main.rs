@@ -1,11 +1,11 @@
 //! `siltad`: owns the bot's Matrix device and routes rooms to assistant sessions.
 
-use std::{path::PathBuf, process::ExitCode, sync::Arc};
+use std::{path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::Parser;
 use silta::config::{Config, Routing};
-use siltad::{daemon::Daemon, matrix, server, session};
+use siltad::{daemon::Daemon, inbox, matrix, server, session};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -48,13 +48,20 @@ async fn run(args: Args) -> anyhow::Result<()> {
         warn!("{warning}");
     }
     info!(
-        "siltad {} starting: {} people, {} sessions, replay window {} s, socket {}",
+        "siltad {} starting: {} people, {} sessions, replay window {} s, inbox files up to {} MB kept {} days, socket {}",
         env!("CARGO_PKG_VERSION"),
         config.people.len(),
         config.sessions.len(),
         config.replay_window_secs,
+        config.inbox_max_file_mb,
+        config.inbox_max_age_days,
         config.socket.display()
     );
+    let inbox_config = inbox::InboxConfig {
+        dir: config.state_dir.join("inbox"),
+        max_age: Duration::from_secs(config.inbox_max_age_days.saturating_mul(86_400)),
+        max_bytes: config.inbox_max_file_mb.saturating_mul(1024 * 1024),
+    };
 
     let client = session::build_client(&config.matrix.homeserver_url, &config.state_dir).await?;
     session::login_or_restore(
@@ -70,10 +77,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
     )
     .await?;
 
-    let daemon = Arc::new(Daemon::new(client, Routing::new(&config), &config.state_dir, config.replay_window_secs));
+    inbox::prepare(&inbox_config.dir)?;
+    let daemon = Arc::new(Daemon::new(client, Routing::new(&config), &config.state_dir, config.replay_window_secs, inbox_config));
     matrix::register_handlers(&daemon);
 
     let cancel = CancellationToken::new();
+    inbox::spawn_sweeper(daemon.inbox.dir.clone(), daemon.inbox.max_age, cancel.clone());
     tokio::spawn({
         let cancel = cancel.clone();
         async move {
