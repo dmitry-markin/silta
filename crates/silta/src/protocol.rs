@@ -1,4 +1,4 @@
-//! Socket protocol v2 between `siltad` (server) and a session plugin (client).
+//! Socket protocol v3 between `siltad` (server) and a session plugin (client).
 //!
 //! JSON lines over a Unix stream socket, one object per line, UTF-8, `\n` terminated,
 //! at most [`MAX_LINE_BYTES`] per line. The wire format is pinned by the tests at the
@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
 /// Protocol revision carried in `hello` and `welcome`.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Hard cap on one line, a guard against a runaway peer rather than a buffer size.
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -23,6 +23,8 @@ pub enum ClientMessage {
     File(FileHeader),
     Chunk(FileChunk),
     FileEnd(FileEnd),
+    /// An event's channel notification reached Claude Code, see [`Ack`].
+    Ack(Ack),
 }
 
 /// Messages from the daemon to a plugin.
@@ -60,6 +62,15 @@ pub struct FileChunk {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEnd {
     pub transfer: String,
+}
+
+/// The plugin handed an event's channel notification to Claude Code. Only then does
+/// the daemon count the event as delivered: it advances the room's watermark and drops
+/// the event's spooled attachments. An event never acknowledged is delivered again on
+/// the session's next connection, so delivery is at least once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ack {
+    pub event_id: String,
 }
 
 /// First line on a connection: which session this client is.
@@ -536,11 +547,11 @@ mod tests {
 
     #[test]
     fn hello() {
-        let msg = roundtrip_client(r#"{"hello":{"protocol":2,"session":"hub","client":"silta-claude/0.1.0"}}"#);
+        let msg = roundtrip_client(r#"{"hello":{"protocol":3,"session":"hub","client":"silta-claude/0.1.0"}}"#);
         assert_eq!(
             msg,
             ClientMessage::Hello(Hello {
-                protocol: 2,
+                protocol: 3,
                 session: "hub".into(),
                 client: "silta-claude/0.1.0".into()
             })
@@ -550,7 +561,7 @@ mod tests {
     #[test]
     fn welcome() {
         let msg = roundtrip_daemon(
-            r#"{"welcome":{"protocol":2,"session":"hub","user_id":"@silta:silta.test","people":[{"name":"Bob","role":"owner"},{"name":"Alice","role":"family"}],"inbox_max_age_days":30}}"#,
+            r#"{"welcome":{"protocol":3,"session":"hub","user_id":"@silta:silta.test","people":[{"name":"Bob","role":"owner"},{"name":"Alice","role":"family"}],"inbox_max_age_days":30}}"#,
         );
         let DaemonMessage::Welcome(w) = msg else { panic!("not welcome") };
         assert_eq!(w.people[0].role, Role::Owner);
@@ -754,7 +765,7 @@ mod tests {
 
     #[test]
     fn classify_client_lines() {
-        let good = parse_client_line(r#"{"hello":{"protocol":2,"session":"hub","client":"x"}}"#).unwrap();
+        let good = parse_client_line(r#"{"hello":{"protocol":3,"session":"hub","client":"x"}}"#).unwrap();
         assert!(matches!(good, Incoming::Message(ClientMessage::Hello(_))));
 
         // A reserved command with an id: bad_request.
@@ -798,10 +809,15 @@ mod tests {
     }
 
     #[test]
+    fn ack_line() {
+        assert_eq!(roundtrip_client(r#"{"ack":{"event_id":"$e"}}"#), ClientMessage::Ack(Ack { event_id: "$e".into() }));
+    }
+
+    #[test]
     fn extra_fields_are_tolerated() {
         // A newer plugin may add fields; the daemon must not disconnect over them.
         let msg: ClientMessage =
-            serde_json::from_str(r#"{"hello":{"protocol":2,"session":"hub","client":"x","features":["a"]}}"#).unwrap();
+            serde_json::from_str(r#"{"hello":{"protocol":3,"session":"hub","client":"x","features":["a"]}}"#).unwrap();
         assert!(matches!(msg, ClientMessage::Hello(_)));
         let msg: DaemonMessage = serde_json::from_str(
             r#"{"event":{"kind":"message","person":"A","role":"owner","sender":"@a:x","room_id":"!r","event_id":"$e","ts":"t","text":"x","transcribed":false,"attachments":[],"thread":"$t"}}"#,

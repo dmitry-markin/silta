@@ -132,12 +132,12 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
         warn!(session, evicted, "dropped queued messages older than the replay window");
     }
     let count = queued.len();
-    for (ts_ms, event) in queued {
+    for (_, event) in queued {
         if let Err(err) = write_event(&daemon, &mut writer, &session, &event).await {
             warn!(session, "write failed while delivering the backlog: {err}");
             return;
         }
-        daemon.after_delivery(&session, &event, ts_ms);
+        daemon.handed_over(&session, &event);
     }
     if count > 0 {
         info!(session, count, "delivered the messages queued while the session was away");
@@ -214,6 +214,13 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
                 }
                 None
             }
+            Ok(Incoming::Message(ClientMessage::Ack(ack))) => {
+                match daemon.registry.ack(&session, &ack.event_id) {
+                    Some((ts_ms, event)) => daemon.acked(&session, &event, ts_ms),
+                    None => warn!(session, event_id = %ack.event_id, "acknowledgement for an event that is not in flight"),
+                }
+                None
+            }
             Ok(Incoming::Message(ClientMessage::Hello(_))) => {
                 warn!(session, "ignoring a second hello");
                 None
@@ -270,10 +277,11 @@ fn wrap(piece: Piece) -> DaemonMessage {
     }
 }
 
-/// Write an event to a session: each attachment streams from the spool first (and
-/// leaves it), then the event line. An attachment missing from the spool (swept, or
-/// the daemon restarted meanwhile) is logged and the event goes without it; the
-/// plugin tells the model.
+/// Write an event to a session: each attachment streams from the spool first, then
+/// the event line. The spool copy stays until the event is acknowledged, so a second
+/// delivery still has the file. An attachment missing from the spool (swept, or the
+/// daemon restarted meanwhile) is logged and the event goes without it; the plugin
+/// tells the model.
 async fn write_event(daemon: &Daemon, writer: &mut OwnedWriteHalf, session: &str, event: &Event) -> io::Result<()> {
     for attachment in &event.attachments {
         let path = daemon.spool.inbox_path(&attachment.transfer);
@@ -284,10 +292,7 @@ async fn write_event(daemon: &Daemon, writer: &mut OwnedWriteHalf, session: &str
             size: attachment.size,
         };
         match transfer::send(writer, header, &path, wrap).await {
-            Ok(()) => {
-                debug!(session, transfer = %attachment.transfer, bytes = attachment.size, "attachment transferred");
-                let _ = tokio::fs::remove_file(&path).await;
-            }
+            Ok(()) => debug!(session, transfer = %attachment.transfer, bytes = attachment.size, "attachment transferred"),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 warn!(session, transfer = %attachment.transfer, "attachment is gone from the spool; the event goes without it");
             }
@@ -328,10 +333,11 @@ mod tests {
     use crate::{daemon::Daemon, spool::Spool};
     use silta::{
         config::{Config, Routing},
-        protocol::{Attachment, EventKind, Role, SendFile},
+        protocol::{Ack, Attachment, EventKind, Role, SendFile, Typing},
         transfer::CHUNK_BYTES,
     };
     use std::sync::Arc;
+    use tokio::{net::unix::OwnedReadHalf, task::JoinHandle};
 
     fn wrap_client(piece: Piece) -> ClientMessage {
         match piece {
@@ -341,13 +347,10 @@ mod tests {
         }
     }
 
-    /// A file crossing each way at the same moment must not hang the connection. The
-    /// fake plugin streams its file without reading meanwhile, as the real one does,
-    /// while the daemon streams an attachment to it; with one task doing both the
-    /// daemon's writing and reading, both socket buffers filled and nothing moved.
-    #[tokio::test]
-    async fn files_crossing_both_ways_do_not_deadlock() {
-        let dir = std::env::temp_dir().join(format!("siltad-server-{}", std::process::id()));
+    /// A daemon with one session, `alice`, run by this process's user, and a client
+    /// that has no homeserver to talk to.
+    async fn test_daemon(tag: &str) -> (Shared, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("siltad-server-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let config = Config::parse(&format!(
@@ -375,24 +378,12 @@ user = "whoever"
         let spool = Spool::new(&dir, u64::MAX);
         spool.prepare().unwrap();
         let users = HashMap::from([("alice".to_owned(), nix::unistd::getuid().as_raw())]);
-        let daemon = Arc::new(Daemon::new(client, Routing::new(&config), &dir, 300, spool, 30, users));
+        (Arc::new(Daemon::new(client, Routing::new(&config), &dir, 300, spool, 30, users)), dir)
+    }
 
-        // Three chunks each way: an attachment waiting in the spool, a file to send.
-        let content: Vec<u8> = (0..3 * CHUNK_BYTES).map(|i| (i % 253) as u8).collect();
-        std::fs::write(daemon.spool.inbox_path("ev-1"), &content).unwrap();
-        let upload = dir.join("upload.bin");
-        std::fs::write(&upload, &content).unwrap();
-
-        let (plugin, server) = UnixStream::pair().unwrap();
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn(handle(daemon.clone(), server, cancel.clone()));
-        let (read_half, mut writer) = plugin.into_split();
-        let mut reader = LineReader::new(read_half);
-        let hello = Hello { protocol: PROTOCOL_VERSION, session: "alice".into(), client: "test".into() };
-        write_line(&mut writer, &ClientMessage::Hello(hello)).await.unwrap();
-        assert!(matches!(reader.next_json::<DaemonMessage>().await.unwrap(), Some(DaemonMessage::Welcome(_))));
-
-        let event = Event {
+    /// Alice's message `$ev` with one attachment, transfer `ev-1`, of `size` bytes.
+    fn event(size: u64) -> Event {
+        Event {
             kind: EventKind::Message,
             person: "Alice".into(),
             role: Role::Family,
@@ -405,9 +396,66 @@ user = "whoever"
             reacts_to: None,
             text: String::new(),
             transcribed: false,
-            attachments: vec![Attachment { transfer: "ev-1".into(), name: "a.bin".into(), mime: "application/octet-stream".into(), size: content.len() as u64 }],
-        };
-        daemon.registry.deliver("alice", DaemonMessage::Event(event)).unwrap();
+            attachments: vec![Attachment { transfer: "ev-1".into(), name: "a.bin".into(), mime: "application/octet-stream".into(), size }],
+        }
+    }
+
+    type Plugin = (JoinHandle<()>, LineReader<OwnedReadHalf>, OwnedWriteHalf);
+
+    /// A fake plugin connected as `alice`, past the welcome.
+    async fn connect(daemon: &Shared, cancel: &CancellationToken) -> Plugin {
+        let (plugin, server) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle(daemon.clone(), server, cancel.clone()));
+        let (read_half, mut writer) = plugin.into_split();
+        let mut reader = LineReader::new(read_half);
+        let hello = Hello { protocol: PROTOCOL_VERSION, session: "alice".into(), client: "test".into() };
+        write_line(&mut writer, &ClientMessage::Hello(hello)).await.unwrap();
+        assert!(matches!(reader.next_json::<DaemonMessage>().await.unwrap(), Some(DaemonMessage::Welcome(_))));
+        (task, reader, writer)
+    }
+
+    async fn next(reader: &mut LineReader<OwnedReadHalf>) -> DaemonMessage {
+        let next = timeout(Duration::from_secs(10), reader.next_json::<DaemonMessage>()).await.expect("the daemon stopped writing");
+        next.unwrap().expect("the daemon closed the connection")
+    }
+
+    /// An event preceded by its attachment's transfer; returns the chunk count too.
+    async fn read_event(reader: &mut LineReader<OwnedReadHalf>) -> (usize, Event) {
+        let mut chunks = 0;
+        loop {
+            match next(reader).await {
+                DaemonMessage::File(h) => assert_eq!(h.transfer, "ev-1"),
+                DaemonMessage::Chunk(_) => chunks += 1,
+                DaemonMessage::FileEnd(_) => {}
+                DaemonMessage::Event(e) => return (chunks, e),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    async fn read_result(reader: &mut LineReader<OwnedReadHalf>) -> CmdResult {
+        match next(reader).await {
+            DaemonMessage::Result(r) => r,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A file crossing each way at the same moment must not hang the connection. The
+    /// fake plugin streams its file without reading meanwhile, as the real one does,
+    /// while the daemon streams an attachment to it; with one task doing both the
+    /// daemon's writing and reading, both socket buffers filled and nothing moved.
+    #[tokio::test]
+    async fn files_crossing_both_ways_do_not_deadlock() {
+        let (daemon, dir) = test_daemon("crossing").await;
+        // Three chunks each way: an attachment waiting in the spool, a file to send.
+        let content: Vec<u8> = (0..3 * CHUNK_BYTES).map(|i| (i % 253) as u8).collect();
+        std::fs::write(daemon.spool.inbox_path("ev-1"), &content).unwrap();
+        let upload = dir.join("upload.bin");
+        std::fs::write(&upload, &content).unwrap();
+        let cancel = CancellationToken::new();
+        let (task, mut reader, mut writer) = connect(&daemon, &cancel).await;
+
+        daemon.registry.deliver("alice", event(content.len() as u64), 1).unwrap();
         let header = FileHeader { transfer: "t1".into(), name: "up.bin".into(), mime: "application/octet-stream".into(), size: content.len() as u64 };
         let streamed = timeout(Duration::from_secs(10), transfer::send(&mut writer, header, &upload, wrap_client)).await;
         assert!(streamed.is_ok(), "the plugin's transfer hung: the daemon stopped reading while it was writing");
@@ -415,31 +463,62 @@ user = "whoever"
         let send_file = SendFile { room_id: "!r:silta.test".into(), transfer: "t1".into(), caption: None, reply_to: None, thread: None, more: false };
         write_line(&mut writer, &ClientMessage::Cmd(Cmd { id: 1, kind: CmdKind::SendFile(send_file) })).await.unwrap();
 
-        // The attachment, its event, then the answer to the command (there is no such
-        // room, so a refusal, but an answer).
-        let (mut chunks, mut got_event) = (0, false);
-        loop {
-            let next = timeout(Duration::from_secs(10), reader.next_json::<DaemonMessage>()).await.expect("the daemon stopped writing");
-            match next.unwrap().expect("the daemon closed the connection") {
-                DaemonMessage::File(h) => assert_eq!(h.transfer, "ev-1"),
-                DaemonMessage::Chunk(_) => chunks += 1,
-                DaemonMessage::FileEnd(_) => {}
-                DaemonMessage::Event(e) => {
-                    assert_eq!(e.attachments[0].transfer, "ev-1");
-                    got_event = true;
-                }
-                DaemonMessage::Result(r) => {
-                    assert_eq!((r.id, r.error), (1, Some(ResultError::RoomUnknown)));
-                    break;
-                }
-                other => panic!("unexpected {other:?}"),
-            }
-        }
-        assert_eq!(chunks, 3);
-        assert!(got_event);
-        // Both spool files are gone: the attachment went out, the upload was consumed.
-        assert!(!daemon.spool.inbox_path("ev-1").exists());
+        // The attachment and its event, then the answer to the command (there is no
+        // such room, so a refusal, but an answer).
+        let (chunks, e) = read_event(&mut reader).await;
+        assert_eq!((chunks, e.attachments[0].transfer.as_str()), (3, "ev-1"));
+        let result = read_result(&mut reader).await;
+        assert_eq!((result.id, result.error), (1, Some(ResultError::RoomUnknown)));
+        // The upload was consumed; the attachment waits for the acknowledgement.
         assert!(std::fs::read_dir(&daemon.spool.outbox).unwrap().next().is_none());
+        assert!(daemon.spool.inbox_path("ev-1").exists());
+        cancel.cancel();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An event is delivered on the plugin's acknowledgement, not on the write: one a
+    /// connection never acknowledged comes again, attachment included, on the next
+    /// connection, and the watermark moves only on the ack.
+    #[tokio::test]
+    async fn unacknowledged_events_come_back_on_the_next_connection() {
+        let (daemon, dir) = test_daemon("ack").await;
+        let content = vec![7u8; 10];
+        std::fs::write(daemon.spool.inbox_path("ev-1"), &content).unwrap();
+        let cancel = CancellationToken::new();
+
+        // The first connection takes the event and goes away without acknowledging it.
+        // (A current timestamp: the backlog keeps nothing older than the replay window.)
+        let ts = now_ms();
+        let (task, mut reader, writer) = connect(&daemon, &cancel).await;
+        daemon.registry.deliver("alice", event(content.len() as u64), ts).unwrap();
+        let (_, e) = read_event(&mut reader).await;
+        assert_eq!(e.event_id, "$ev");
+        assert!(daemon.watermark("!r:silta.test").is_none());
+        drop(writer);
+        drop(reader);
+        task.await.unwrap();
+        assert!(daemon.spool.inbox_path("ev-1").exists(), "the spool keeps the attachment until the ack");
+
+        // The next connection gets it right after the welcome, then acknowledges it;
+        // a command after the ack proves the ack was processed before its answer.
+        let (task, mut reader, mut writer) = connect(&daemon, &cancel).await;
+        let (chunks, e) = read_event(&mut reader).await;
+        assert_eq!((chunks, e.event_id.as_str()), (1, "$ev"));
+        write_line(&mut writer, &ClientMessage::Ack(Ack { event_id: "$ev".into() })).await.unwrap();
+        let typing = ClientMessage::Cmd(Cmd { id: 1, kind: CmdKind::Typing(Typing { room_id: "!r:silta.test".into() }) });
+        write_line(&mut writer, &typing).await.unwrap();
+        assert_eq!(read_result(&mut reader).await.id, 1);
+        let mark = daemon.watermark("!r:silta.test").expect("acknowledged");
+        assert_eq!((mark.ts_ms, mark.event_id.as_str()), (ts, "$ev"));
+        assert!(!daemon.spool.inbox_path("ev-1").exists());
+        drop(writer);
+        drop(reader);
+        task.await.unwrap();
+
+        // Acknowledged: a third connection gets nothing.
+        let (task, mut reader, _writer) = connect(&daemon, &cancel).await;
+        assert!(timeout(Duration::from_millis(300), reader.next_line()).await.is_err(), "nothing should be queued");
         cancel.cancel();
         let _ = task.await;
         let _ = std::fs::remove_dir_all(&dir);

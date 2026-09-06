@@ -20,7 +20,7 @@ use silta::{
     replay::Watermark,
 };
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -76,12 +76,13 @@ impl Daemon {
         inbox_max_age_days: u64,
         users: HashMap<String, u32>,
     ) -> Daemon {
+        let replay_window_ms = replay_window_secs.saturating_mul(1000);
         Daemon {
             client,
             routing,
-            registry: Registry::default(),
+            registry: Registry::new(replay_window_ms),
             started_at_ms: now_ms(),
-            replay_window_ms: replay_window_secs.saturating_mul(1000),
+            replay_window_ms,
             spool,
             inbox_max_age_days,
             users,
@@ -112,14 +113,13 @@ impl Daemon {
 
     /// Hand a message to its session, or queue it while the session is away.
     pub fn dispatch(&self, session: &str, room: &Room, event: Event, ts_ms: u64) -> Dispatch {
-        match self.registry.deliver(session, DaemonMessage::Event(event.clone())) {
+        match self.registry.deliver(session, event.clone(), ts_ms) {
             Ok(()) => {
-                self.after_delivery(session, &event, ts_ms);
+                self.handed_over(session, &event);
                 Dispatch::Delivered
             }
             Err(DeliverError::NotConnected) => {
-                let (waiting, evicted) =
-                    self.registry.enqueue(session, ts_ms, event, now_ms(), self.replay_window_ms);
+                let (waiting, evicted) = self.registry.enqueue(session, ts_ms, event, now_ms());
                 if evicted > 0 {
                     warn!(session, evicted, "dropped queued messages beyond the backlog limits");
                 }
@@ -130,11 +130,20 @@ impl Daemon {
         }
     }
 
-    /// Bookkeeping once an event is on a session's socket: advance the room's
-    /// watermark and, for a message, keep the typing indicator alive until the
-    /// session's first visible action. A reaction expects no answer.
-    pub fn after_delivery(&self, session: &str, event: &Event, ts_ms: u64) {
+    /// The session acknowledged an event, so it is delivered: the room's watermark
+    /// moves past it and its attachments leave the spool.
+    pub fn acked(&self, session: &str, event: &Event, ts_ms: u64) {
         self.marks.set(&event.room_id, Watermark { ts_ms, event_id: event.event_id.clone() });
+        for attachment in &event.attachments {
+            let _ = fs::remove_file(self.spool.inbox_path(&attachment.transfer));
+        }
+        debug!(session, event_id = %event.event_id, "acknowledged");
+    }
+
+    /// Once an event is on its way to a session: for a message, keep the typing
+    /// indicator alive until the session's first visible action. A reaction expects no
+    /// answer. The watermark waits for the acknowledgement.
+    pub fn handed_over(&self, session: &str, event: &Event) {
         if event.kind != EventKind::Message {
             return;
         }
@@ -261,6 +270,10 @@ impl Marks {
 /// Outbound queue size per connected session.
 const SESSION_QUEUE: usize = 256;
 
+/// Per session, the events handed to its connection and not acknowledged yet, in the
+/// order handed over, with their timestamps.
+type InFlight = HashMap<String, Vec<(u64, Event)>>;
+
 #[derive(Debug, Error)]
 pub enum DeliverError {
     #[error("session is not connected")]
@@ -269,16 +282,24 @@ pub enum DeliverError {
     QueueFull,
 }
 
-/// Which sessions are connected, the queue to each, and the backlog of a session that
-/// is away. A session name is claimed by at most one connection; the claim is
-/// released when the connection's [`Claim`] drops.
-#[derive(Clone, Default)]
+/// Which sessions are connected, the queue to each, the events each connection has
+/// been handed and not acknowledged yet, and the backlog of a session that is away. A
+/// session name is claimed by at most one connection; the claim is released when the
+/// connection's [`Claim`] drops, and what it had in flight goes back to the backlog.
+#[derive(Clone)]
 pub struct Registry {
     inner: Arc<Mutex<HashMap<String, mpsc::Sender<DaemonMessage>>>>,
     backlogs: Arc<Mutex<HashMap<String, Backlog<Event>>>>,
+    inflight: Arc<Mutex<InFlight>>,
+    /// The age cap of a queued event: the replay window.
+    max_age_ms: u64,
 }
 
 impl Registry {
+    pub fn new(max_age_ms: u64) -> Registry {
+        Registry { inner: Default::default(), backlogs: Default::default(), inflight: Default::default(), max_age_ms }
+    }
+
     /// Claim a session for a connection: the sender the connection answers its own
     /// commands through, the queue its writer drains, and the claim. `None` if another
     /// connection holds the session.
@@ -296,32 +317,68 @@ impl Registry {
         self.inner.lock().unwrap().contains_key(session)
     }
 
-    /// Queue a message for a connected session without waiting.
-    pub fn deliver(&self, session: &str, message: DaemonMessage) -> Result<(), DeliverError> {
+    /// Hand an event to a connected session without waiting; it is in flight until the
+    /// session acknowledges it.
+    pub fn deliver(&self, session: &str, event: Event, ts_ms: u64) -> Result<(), DeliverError> {
         let map = self.inner.lock().unwrap();
         let Some(tx) = map.get(session) else {
             return Err(DeliverError::NotConnected);
         };
-        tx.try_send(message).map_err(|_| DeliverError::QueueFull)
+        let mut inflight = self.inflight.lock().unwrap();
+        let list = inflight.entry(session.to_owned()).or_default();
+        list.push((ts_ms, event.clone()));
+        tx.try_send(DaemonMessage::Event(event)).map_err(|err| {
+            list.pop();
+            match err {
+                TrySendError::Full(_) => DeliverError::QueueFull,
+                // The connection is on its way out: the backlog takes it.
+                TrySendError::Closed(_) => DeliverError::NotConnected,
+            }
+        })
     }
 
     /// Keep a message for a session that is away. Returns how many are waiting and how
     /// many were evicted to make room.
-    pub fn enqueue(&self, session: &str, ts_ms: u64, event: Event, now_ms: u64, max_age_ms: u64) -> (usize, usize) {
+    pub fn enqueue(&self, session: &str, ts_ms: u64, event: Event, now_ms: u64) -> (usize, usize) {
         let mut backlogs = self.backlogs.lock().unwrap();
-        let backlog = backlogs.entry(session.to_owned()).or_insert_with(|| Backlog::new(BACKLOG_MAX, max_age_ms));
+        let backlog = backlogs.entry(session.to_owned()).or_insert_with(|| Backlog::new(BACKLOG_MAX, self.max_age_ms));
         let evicted = backlog.push(ts_ms, event, now_ms);
         (backlog.len(), evicted)
     }
 
-    /// Take the messages waiting for a session, oldest first, plus the number that
-    /// expired meanwhile.
+    /// Take the messages waiting for a session, oldest first, to hand them to its
+    /// connection: they are in flight from here. Also the number that expired meanwhile.
     pub fn take_backlog(&self, session: &str, now_ms: u64) -> (Vec<(u64, Event)>, usize) {
-        let mut backlogs = self.backlogs.lock().unwrap();
-        match backlogs.get_mut(session) {
+        let (items, evicted) = match self.backlogs.lock().unwrap().get_mut(session) {
             Some(backlog) => backlog.drain(now_ms),
             None => (Vec::new(), 0),
+        };
+        if !items.is_empty() {
+            self.inflight.lock().unwrap().entry(session.to_owned()).or_default().extend(items.iter().cloned());
         }
+        (items, evicted)
+    }
+
+    /// The session acknowledged an event: no longer in flight.
+    pub fn ack(&self, session: &str, event_id: &str) -> Option<(u64, Event)> {
+        let mut inflight = self.inflight.lock().unwrap();
+        let list = inflight.get_mut(session)?;
+        let at = list.iter().position(|(_, event)| event.event_id == event_id)?;
+        Some(list.remove(at))
+    }
+
+    /// A connection went away: what it had not acknowledged goes back in front of the
+    /// backlog for the next one. Returns how many went back and how many of those were
+    /// evicted.
+    fn restore(&self, session: &str, now_ms: u64) -> (usize, usize) {
+        let items = self.inflight.lock().unwrap().remove(session).unwrap_or_default();
+        if items.is_empty() {
+            return (0, 0);
+        }
+        let count = items.len();
+        let mut backlogs = self.backlogs.lock().unwrap();
+        let backlog = backlogs.entry(session.to_owned()).or_insert_with(|| Backlog::new(BACKLOG_MAX, self.max_age_ms));
+        (count, backlog.restore(items, now_ms))
     }
 }
 
@@ -334,6 +391,10 @@ pub struct Claim {
 impl Drop for Claim {
     fn drop(&mut self) {
         self.registry.inner.lock().unwrap().remove(&self.session);
+        let (returned, evicted) = self.registry.restore(&self.session, now_ms());
+        if returned > 0 {
+            warn!(session = %self.session, returned, evicted, "events the session never acknowledged wait for its next connection");
+        }
         info!(session = %self.session, "session released");
     }
 }

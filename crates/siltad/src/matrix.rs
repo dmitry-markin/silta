@@ -285,7 +285,7 @@ fn deliver(daemon: &Daemon, session: &str, room: &Room, event: Event, ts: u64) {
     let what = event.kind.as_str();
     let (room_id, person, bytes, files) = (event.room_id.clone(), event.person.clone(), event.text.len(), event.attachments.len());
     match daemon.dispatch(session, room, event, ts) {
-        Dispatch::Delivered => info!(room = %room_id, %person, session, bytes, files, "delivered {what}"),
+        Dispatch::Delivered => info!(room = %room_id, %person, session, bytes, files, "sent {what} to the session"),
         Dispatch::Queued(waiting) => {
             warn!(room = %room_id, %person, session, waiting, "session is not connected, {what} queued")
         }

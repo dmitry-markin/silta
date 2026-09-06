@@ -3,7 +3,10 @@
 
 socket    = "/ABSOLUTE/PATH/TO/silta/dev/state/siltad.sock"
 state_dir = "/ABSOLUTE/PATH/TO/silta/dev/state/silta"
-replay_window_secs = 300   # optional; messages from a downtime this old are still delivered
+replay_window_secs = 7200  # optional (default 300); how long a message waits for its session, or is
+                           # replayed after a daemon restart, before it is dropped. Two hours for
+                           # production (2026-09-06): gaps there are unattended, and a late answer
+                           # beats a dropped message
 inbox_max_age_days = 30    # optional; a session's plugin deletes received files older than this
 attachment_max_mb  = 100   # optional; larger attachments are not downloaded or accepted
 

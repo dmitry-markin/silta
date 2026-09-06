@@ -435,11 +435,17 @@ impl ServerHandler for SiltaChannel {
         info!("client initialized, connecting to the daemon and starting the notification pump");
         let _ = ready.send(());
         let peer = context.peer.clone();
+        let daemon = self.daemon.clone();
         tokio::spawn(async move {
             while let Some(inbound) = events.recv().await {
                 let notification = CustomNotification::new(CHANNEL_NOTIFICATION, Some(channel_params(&inbound)));
                 match peer.send_notification(ServerNotification::CustomNotification(notification)).await {
-                    Ok(()) => debug!(kind = inbound.event.kind.as_str(), "channel notification delivered"),
+                    Ok(()) => {
+                        debug!(kind = inbound.event.kind.as_str(), "channel notification delivered");
+                        // Only now does the daemon count the event as delivered; until
+                        // the acknowledgement it would come again.
+                        daemon.ack(inbound.event.event_id).await;
+                    }
                     Err(err) => {
                         warn!("cannot deliver channel notification, stopping the pump: {err}");
                         return;

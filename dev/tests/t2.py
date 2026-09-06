@@ -53,16 +53,19 @@ time.sleep(4)
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(SOCK); f = s.makefile("rw", encoding="utf-8")
 events, results = queue.Queue(), queue.Queue()
 received, partial = {}, {}
+lock = threading.Lock()
+def send(o):
+    with lock: f.write(json.dumps(o, ensure_ascii=False) + "\n"); f.flush()
 def reader():
     for line in f:
         o = json.loads(line)
         if "file" in o: partial[o["file"]["transfer"]] = [o["file"], bytearray()]
         elif "chunk" in o: partial[o["chunk"]["transfer"]][1] += base64.b64decode(o["chunk"]["data"])
         elif "file_end" in o: received[o["file_end"]["transfer"]] = partial.pop(o["file_end"]["transfer"])
-        else: (events if "event" in o else results).put(o)
+        elif "event" in o: events.put(o); send({"ack": {"event_id": o["event"]["event_id"]}})  # as the plugin does once the notification is out
+        else: results.put(o)
 threading.Thread(target=reader, daemon=True).start()
-def send(o): f.write(json.dumps(o, ensure_ascii=False) + "\n"); f.flush()
-send({"hello": {"protocol": 2, "session": "test", "client": "t2/0"}})
+send({"hello": {"protocol": 3, "session": "test", "client": "t2/0"}})
 print("welcome:", json.dumps(results.get(timeout=5))[:120])
 n = 0
 def cmd(kind, **args):

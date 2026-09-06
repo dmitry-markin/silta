@@ -35,6 +35,21 @@ impl<T> Backlog<T> {
         (self.items.drain(..).collect(), evicted)
     }
 
+    /// Put items back in front of the queue, in the order given: they were handed to a
+    /// connection that went away, so they are older than anything queued since. Returns
+    /// how many were evicted for age or count.
+    pub fn restore(&mut self, items: Vec<(u64, T)>, now_ms: u64) -> usize {
+        for item in items.into_iter().rev() {
+            self.items.push_front(item);
+        }
+        let mut evicted = self.evict_expired(now_ms);
+        while self.items.len() > self.max_len.max(1) {
+            self.items.pop_front();
+            evicted += 1;
+        }
+        evicted
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -80,6 +95,18 @@ mod tests {
         assert_eq!(b.push(3, "c", 3), 1);
         assert_eq!(b.len(), 2);
         assert_eq!(b.drain(3).0, vec![(2, "b"), (3, "c")]);
+    }
+
+    #[test]
+    fn restored_items_go_first() {
+        let mut b = Backlog::new(3, 1_000);
+        b.push(300, "new", 300);
+        assert_eq!(b.restore(vec![(100, "a"), (200, "b")], 300), 0);
+        assert_eq!(b.drain(300).0, vec![(100, "a"), (200, "b"), (300, "new")]);
+        // The age cap and then the count cap take the oldest restored ones.
+        b.push(500, "x", 500);
+        assert_eq!(b.restore(vec![(1, "expired"), (350, "w"), (400, "y"), (450, "z")], 1_200), 2);
+        assert_eq!(b.drain(1_200).0, vec![(400, "y"), (450, "z"), (500, "x")]);
     }
 
     #[test]

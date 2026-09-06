@@ -26,10 +26,14 @@ except socket.timeout:
 srv.settimeout(None)
 msend({"jsonrpc": "2.0", "method": "notifications/initialized"})
 conn, _ = srv.accept(); f = conn.makefile("rw", encoding="utf-8")
-print("daemon<-", f.readline().strip())
+hello = json.loads(f.readline()); print("daemon<-", json.dumps(hello))
+print("  PASS hello says protocol 3" if hello["hello"]["protocol"] == 3 else f"  FAIL protocol {hello['hello']['protocol']}")
 def dsend(o): f.write(json.dumps(o, ensure_ascii=False) + "\n"); f.flush()
 def dread(): return json.loads(f.readline())
-dsend({"welcome": {"protocol": 2, "session": "hub", "user_id": "@silta:localhost", "people": [{"name": "Bob", "role": "owner"}, {"name": "Alice", "role": "family"}], "inbox_max_age_days": 30}})
+def expect_ack(event_id):
+    """After each notification the plugin acknowledges the event to the daemon."""
+    a = dread(); print("  PASS acked" if a == {"ack": {"event_id": event_id}} else f"  FAIL expected the ack for {event_id}, got {a}")
+dsend({"welcome": {"protocol": 3, "session": "hub", "user_id": "@silta:localhost", "people": [{"name": "Bob", "role": "owner"}, {"name": "Alice", "role": "family"}], "inbox_max_age_days": 30}})
 msend({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
 tools = mread()["result"]["tools"]
 for t in tools:
@@ -49,17 +53,21 @@ p1 = meta.get("attachment_1_path", ""); p2 = meta.get("attachment_2_path", "")
 print("  PASS attachments written to the inbox under safe names" if p1 == f"{INBOX}/a1-1-photo.jpg" and open(p1, "rb").read() == photo and open(p2, "rb").read() == notes else f"  FAIL inbox paths {p1} {p2}")
 print("  PASS inbox file is 0600" if oct(os.stat(p1).st_mode & 0o777) == "0o600" else "  FAIL inbox file mode")
 print("  PASS no Matrix id on the tag" if "sender" not in meta and meta["person"] == "Alice" else f"  FAIL sender on the tag: {meta}")
+expect_ack("$a1")
 # 1b: an attachment whose transfer never came (swept from the daemon's spool)
 dsend({"event": dict(base, event_id="$a1b", text="see this", attachments=[{"transfer": "gone-1", "name": "old.pdf", "mime": "application/pdf", "size": 5}])})
 n = mread(); print("notification", "content", repr(n["params"]["content"]))
 print("  PASS missing transfer named in the text, no path" if "was not received" in n["params"]["content"] and "attachment_1_path" not in n["params"]["meta"] else "  FAIL missing transfer")
+expect_ack("$a1b")
 # 2: an unknown event kind from a newer daemon must be skipped, not kill the connection
 dsend({"event": dict(base, event_id="$a2", kind="poll", text="x")})
 # 3: a thread message with an explicit reply, then a reaction
 dsend({"event": dict(base, event_id="$a3", thread="$root", in_reply_to="$q", text="in the thread")})
 n = mread(); print("notification", "content", repr(n["params"]["content"]), "meta", json.dumps(n["params"]["meta"]))
+expect_ack("$a3")
 dsend({"event": dict(base, event_id="$a4", kind="reaction", person="Bob", role="owner", sender="@bob:localhost", reacts_to="$bot", text="👍")})
 n = mread(); print("notification", "content", repr(n["params"]["content"]), "meta", json.dumps(n["params"]["meta"], ensure_ascii=False))
+expect_ack("$a4")
 rid = 10
 def call(name, args, result):
     global rid; rid += 1

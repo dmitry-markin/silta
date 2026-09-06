@@ -14,7 +14,7 @@ use std::{
 use silta::{
     line::{write_line, LineReader},
     protocol::{
-        parse_daemon_line, Cmd, CmdKind, CmdResult, ClientMessage, DaemonMessage, Event, FileHeader, Hello,
+        parse_daemon_line, Ack, Cmd, CmdKind, CmdResult, ClientMessage, DaemonMessage, Event, FileHeader, Hello,
         ResultError, SendFile, Welcome, PROTOCOL_VERSION,
     },
     transfer::{self, sweep, Piece, Receiver},
@@ -64,12 +64,18 @@ pub struct Inbound {
     pub paths: Vec<Option<PathBuf>>,
 }
 
-struct Outgoing {
+struct Command {
     kind: CmdKind,
     /// For `send_file`: the file to stream before the command, with its header (the
     /// transfer id is filled in on the connection).
     file: Option<(PathBuf, FileHeader)>,
     done: oneshot::Sender<Result<CmdResult, DaemonError>>,
+}
+
+enum Outgoing {
+    Command(Box<Command>),
+    /// The channel notification for this event reached Claude Code.
+    Ack(String),
 }
 
 /// Handle to the connection task. Cheap to clone.
@@ -98,7 +104,7 @@ impl DaemonClient {
     /// Send a command and wait for the daemon's verdict. A refusal is an error with
     /// the daemon's code; a successful result is returned whole.
     pub async fn command(&self, kind: CmdKind) -> Result<CmdResult, DaemonError> {
-        self.submit(Outgoing { kind, file: None, done: oneshot::channel().0 }, RESULT_TIMEOUT).await
+        self.submit(kind, None, RESULT_TIMEOUT).await
     }
 
     /// Stream a file from this host to the daemon, then the `send_file` command for it.
@@ -117,13 +123,20 @@ impl DaemonClient {
         let mime = mime_guess::from_path(&path).first_or_octet_stream().to_string();
         let header = FileHeader { transfer: String::new(), name, mime, size: meta.len() };
         cmd.transfer = String::new();
-        let out = Outgoing { kind: CmdKind::SendFile(cmd), file: Some((path, header)), done: oneshot::channel().0 };
-        self.submit(out, SEND_FILE_TIMEOUT).await
+        self.submit(CmdKind::SendFile(cmd), Some((path, header)), SEND_FILE_TIMEOUT).await
     }
 
-    async fn submit(&self, out: Outgoing, timeout: Duration) -> Result<CmdResult, DaemonError> {
+    /// Tell the daemon that an event's channel notification reached Claude Code. Best
+    /// effort: without a connection the daemon delivers the event again anyway.
+    pub async fn ack(&self, event_id: String) {
+        if self.tx.send(Outgoing::Ack(event_id)).await.is_err() {
+            debug!("acknowledgement dropped: connection task stopped");
+        }
+    }
+
+    async fn submit(&self, kind: CmdKind, file: Option<(PathBuf, FileHeader)>, timeout: Duration) -> Result<CmdResult, DaemonError> {
         let (done, wait) = oneshot::channel();
-        let out = Outgoing { done, ..out };
+        let out = Outgoing::Command(Box::new(Command { kind, file, done }));
         self.tx.send(out).await.map_err(|_| DaemonError::Unavailable("connection task stopped".into()))?;
         let result = time::timeout(timeout, wait)
             .await
@@ -197,9 +210,11 @@ async fn run(
                 _ = cancel.cancelled() => break,
                 _ = &mut sleep => break,
                 out = rx.recv() => match out {
-                    Some(out) => {
-                        let _ = out.done.send(Err(DaemonError::Unavailable("not connected".into())));
+                    Some(Outgoing::Command(command)) => {
+                        let _ = command.done.send(Err(DaemonError::Unavailable("not connected".into())));
                     }
+                    // Nobody to acknowledge to: the daemon delivers the event again.
+                    Some(Outgoing::Ack(_)) => {}
                     None => break,
                 },
             }
@@ -334,10 +349,16 @@ async fn serve(
                 Err(err) => break format!("read error: {err}"),
             },
             out = rx.recv() => match out {
-                Some(out) => {
+                Some(Outgoing::Ack(event_id)) => {
+                    if let Err(err) = write_line(&mut write_half, &ClientMessage::Ack(Ack { event_id })).await {
+                        break format!("write error: {err}");
+                    }
+                }
+                Some(Outgoing::Command(command)) => {
+                    let Command { kind, file, done } = *command;
                     let id = next_id;
                     next_id += 1;
-                    let kind = match (out.kind, out.file) {
+                    let kind = match (kind, file) {
                         (CmdKind::SendFile(mut cmd), Some((path, mut header))) => {
                             let transfer = format!("t{id}");
                             header.transfer = transfer.clone();
@@ -348,11 +369,11 @@ async fn serve(
                                 // error leaves the connection clean.
                                 Err(err) if is_local(&err) => {
                                     let message = format!("cannot read {}: {err}", path.display());
-                                    let _ = out.done.send(Err(DaemonError::Refused { code: ResultError::FileError, message }));
+                                    let _ = done.send(Err(DaemonError::Refused { code: ResultError::FileError, message }));
                                     continue;
                                 }
                                 Err(err) => {
-                                    let _ = out.done.send(Err(DaemonError::Unavailable(format!("write failed: {err}"))));
+                                    let _ = done.send(Err(DaemonError::Unavailable(format!("write failed: {err}"))));
                                     break format!("write error: {err}");
                                 }
                             }
@@ -361,10 +382,10 @@ async fn serve(
                         (kind, _) => kind,
                     };
                     if let Err(err) = send_cmd(&mut write_half, id, kind).await {
-                        let _ = out.done.send(Err(DaemonError::Unavailable(format!("write failed: {err}"))));
+                        let _ = done.send(Err(DaemonError::Unavailable(format!("write failed: {err}"))));
                         break format!("write error: {err}");
                     }
-                    pending.insert(id, out.done);
+                    pending.insert(id, done);
                 }
                 None => break "client handle dropped".to_owned(),
             },
