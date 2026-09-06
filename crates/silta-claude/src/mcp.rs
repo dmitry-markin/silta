@@ -61,7 +61,7 @@ pub struct ReplyParams {
     /// Thread root to answer in (the thread attribute of the channel tag). Optional.
     #[serde(default)]
     pub thread: Option<String>,
-    /// Required: true when another message of yours will follow in this room in this turn (the typing indicator stays on), false when this is the last one.
+    /// Required: true when another message of yours will follow in this room in this turn (the typing indicator stays on), false when this is the last one; if you decide only after this send that another message is coming, call typing first.
     pub more: bool,
 }
 
@@ -73,7 +73,7 @@ pub struct ReactParams {
     pub event_id: String,
     /// One emoji.
     pub emoji: String,
-    /// Required: true when a message of yours will follow in this room in this turn (a 👀 before a long task), false when the reaction is the whole answer.
+    /// Required: true when a message of yours will follow in this room in this turn (a 👀 before a long task), false when the reaction is the whole answer; if you decide only after this send that another message is coming, call typing first.
     pub more: bool,
 }
 
@@ -85,7 +85,7 @@ pub struct EditParams {
     pub event_id: String,
     /// The new text, in Markdown; must fit one message (8 KiB).
     pub text: String,
-    /// Required: true when another message of yours will follow in this room in this turn, false otherwise.
+    /// Required: true when another message of yours will follow in this room in this turn, false otherwise; if you decide only after this send that another message is coming, call typing first.
     pub more: bool,
 }
 
@@ -104,7 +104,7 @@ pub struct SendFileParams {
     /// Thread root to send in. Optional.
     #[serde(default)]
     pub thread: Option<String>,
-    /// Required: true when another message of yours will follow in this room in this turn, false when this is the last one.
+    /// Required: true when another message of yours will follow in this room in this turn, false when this is the last one; if you decide only after this send that another message is coming, call typing first.
     pub more: bool,
 }
 
