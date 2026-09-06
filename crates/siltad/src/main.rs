@@ -16,6 +16,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+const DEFAULT_LOG_FILTER: &str =
+    "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn,matrix_sdk_crypto::backups=error,matrix_sdk::http_client=off";
+
 /// silta daemon: one Matrix device for the family assistant, one Unix socket for its
 /// sessions.
 #[derive(Parser, Debug)]
@@ -43,11 +46,12 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The default filter, unless RUST_LOG says otherwise. matrix_sdk_crypto::backups is
+    // at error because the SDK's backup upload task warns "no backup key was found"
+    // at every new room key while server-side key backups are off, which they are on
+    // purpose (the store is backed up as files instead).
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn,matrix_sdk::http_client=off")),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER)))
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .with_target(false)
