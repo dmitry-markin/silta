@@ -18,8 +18,10 @@ use tracing::{info, warn};
 
 use crate::daemon::Daemon;
 
-/// Matrix events are capped at 64 KiB; chunk well below that.
-const CHUNK_BYTES: usize = 32 * 1024;
+/// Matrix events are capped at 64 KiB, and a Markdown reply is sent twice in one event:
+/// once as `body` and once as the rendered `formatted_body`. Chunk well below a quarter
+/// of the cap so the rendered copy cannot push an event over it.
+const CHUNK_BYTES: usize = 8 * 1024;
 
 pub async fn reply(daemon: &Daemon, session: &str, id: u64, reply: Reply) -> CmdResult {
     let err = |code, message: String| CmdResult::err(id, code, message);

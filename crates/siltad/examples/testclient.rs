@@ -2,8 +2,10 @@
 //!
 //! Environment: `TESTCLIENT_USER` and `TESTCLIENT_PASSWORD` (default: `ALICE_USER` and
 //! `ALICE_PASSWORD` from `dev/state/accounts.env`), `TESTCLIENT_HOMESERVER` (default
-//! `http://localhost`), `TESTCLIENT_STATE` (default `dev/state/testclient`). The
-//! store and session live under `<state>/<localpart>`.
+//! `http://localhost`), `TESTCLIENT_STATE` (default `dev/state/testclient`),
+//! `TESTCLIENT_DEVICE` (default `testclient`; give a concurrent second process its own
+//! device and `TESTCLIENT_STATE`, two processes must not share one store). The store
+//! and session live under `<state>/<localpart>`.
 //!
 //! Commands: `dm <user>` creates or finds the encrypted DM with a user; `room <name>
 //! <user>...` creates an encrypted private room and invites users; `send <room> <text>`
@@ -47,6 +49,7 @@ async fn run() -> Result<()> {
     let state_root = env::var("TESTCLIENT_STATE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dev/state/testclient"));
+    let device = env::var("TESTCLIENT_DEVICE").unwrap_or_else(|_| "testclient".into());
     let user_id = UserId::parse(&user).context("TESTCLIENT_USER is not a Matrix user id")?;
     let state_dir = state_root.join(user_id.localpart());
 
@@ -58,8 +61,8 @@ async fn run() -> Result<()> {
             homeserver_url: &homeserver,
             user_id: &user,
             password: &password,
-            device_id: "testclient",
-            device_name: "silta testclient",
+            device_id: &device,
+            device_name: &format!("silta {device}"),
         },
     )
     .await?;

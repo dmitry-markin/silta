@@ -142,6 +142,10 @@ async fn on_undecryptable(event: OriginalSyncRoomEncryptedEvent, room: Room) {
     );
 }
 
+/// The sync backoff cap. It is also the worst case for how long the bot stays deaf after
+/// the homeserver comes back, so it is kept short.
+const MAX_SYNC_RETRY_DELAY: Duration = Duration::from_secs(15);
+
 /// Sync until cancelled. Transient errors are retried with backoff; an invalid token is
 /// fatal because only a new login can fix it.
 pub async fn sync_loop(daemon: Shared, cancel: CancellationToken) -> Result<()> {
@@ -168,7 +172,7 @@ pub async fn sync_loop(daemon: Shared, cancel: CancellationToken) -> Result<()> 
                         _ = cancel.cancelled() => return Ok(()),
                         _ = sleep(delay) => {}
                     }
-                    delay = (delay * 2).min(Duration::from_secs(60));
+                    delay = (delay * 2).min(MAX_SYNC_RETRY_DELAY);
                 }
             }
         }
