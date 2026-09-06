@@ -91,11 +91,14 @@ async fn on_invite(event: StrippedRoomMemberEvent, room: Room, client: Client, C
 /// already. `None` means drop, already logged.
 async fn admit<'a>(daemon: &'a Daemon, room: &Room, sender: &str, event_id: &str, ts: u64, what: &str) -> Option<(&'a str, &'a PersonConfig)> {
     let room_id = room.room_id().as_str();
+    // Without the members a group room cannot be told from a DM, and a group room must
+    // never reach a personal mind. Nothing is marked delivered, so a restart within the
+    // replay window brings the message back.
     let members = match member_ids(room).await {
         Ok(members) => members,
         Err((_, message)) => {
-            warn!(room = room_id, "{message}; routing the {what} as a DM");
-            Vec::new()
+            warn!(room = room_id, sender, "dropping a {what}: {message}");
+            return None;
         }
     };
     let (session, person) = match daemon.routing.inbound(sender, room_id, members.iter().map(String::as_str)) {

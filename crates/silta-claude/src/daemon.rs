@@ -79,17 +79,19 @@ pub struct DaemonClient {
 }
 
 impl DaemonClient {
-    /// Spawn the connection task. Events from the daemon go to `events`; attachments
+    /// Spawn the connection task. It connects once `ready` fires (the MCP client has
+    /// sent `initialized`); events from the daemon then go to `events`, attachments
     /// are written under `inbox`.
     pub fn start(
         socket: PathBuf,
         session: String,
         inbox: PathBuf,
         events: mpsc::Sender<Inbound>,
+        ready: oneshot::Receiver<()>,
         cancel: CancellationToken,
     ) -> DaemonClient {
         let (tx, rx) = mpsc::channel(32);
-        tokio::spawn(run(socket, session, inbox, events, rx, cancel));
+        tokio::spawn(run(socket, session, inbox, events, rx, ready, cancel));
         DaemonClient { tx }
     }
 
@@ -144,8 +146,19 @@ async fn run(
     inbox: PathBuf,
     events: mpsc::Sender<Inbound>,
     mut rx: mpsc::Receiver<Outgoing>,
+    ready: oneshot::Receiver<()>,
     cancel: CancellationToken,
 ) {
+    // The daemon counts an event as delivered once this process has taken it, and Claude
+    // Code registers the channel only after the MCP handshake. A session whose handshake
+    // never completes (one started while its predecessor was still shutting down) would
+    // swallow the queued messages; so the daemon keeps them until `initialized`.
+    tokio::select! {
+        _ = cancel.cancelled() => return,
+        ready = ready => if ready.is_err() {
+            return;
+        },
+    }
     let mut backoff = Backoff::new();
     let mut sweeper: Option<JoinHandle<()>> = None;
     loop {

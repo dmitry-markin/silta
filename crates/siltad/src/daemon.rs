@@ -279,15 +279,17 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Claim a session for a connection. `None` if another connection holds it.
-    pub fn claim(&self, session: &str) -> Option<(mpsc::Receiver<DaemonMessage>, Claim)> {
+    /// Claim a session for a connection: the sender the connection answers its own
+    /// commands through, the queue its writer drains, and the claim. `None` if another
+    /// connection holds the session.
+    pub fn claim(&self, session: &str) -> Option<(mpsc::Sender<DaemonMessage>, mpsc::Receiver<DaemonMessage>, Claim)> {
         let mut map = self.inner.lock().unwrap();
         if map.contains_key(session) {
             return None;
         }
         let (tx, rx) = mpsc::channel(SESSION_QUEUE);
-        map.insert(session.to_owned(), tx);
-        Some((rx, Claim { registry: self.clone(), session: session.to_owned() }))
+        map.insert(session.to_owned(), tx.clone());
+        Some((tx, rx, Claim { registry: self.clone(), session: session.to_owned() }))
     }
 
     pub fn is_connected(&self, session: &str) -> bool {

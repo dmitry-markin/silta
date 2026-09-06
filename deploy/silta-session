@@ -4,7 +4,8 @@
 # From the unit: SILTA_SESSION (the instance name), HOME (the state directory), and the
 # credential oauth-token. Overridable: SILTA_SOCKET, SILTA_PERSONA, SILTA_CLAUDE_BIN,
 # CLAUDE_BIN. The workspace is $HOME/workspace with inbox/ and out/; the session id of
-# the first start is saved in $HOME/session-id and resumed afterwards.
+# the first start is saved in $HOME/session-id and resumed afterwards. Claude Code's
+# stdout (stream-json) goes to $HOME/session.log, its stderr to $HOME/session.err.
 #
 # stdin is a FIFO this script holds open, one initial user message
 # starts the first turn, channel events arrive as turns; closing the FIFO ends the
@@ -43,9 +44,8 @@ fi
 args+=(--channels plugin:silta-claude@silta-local)
 initial='{"type":"user","message":{"role":"user","content":"You are connected to the family chat through the silta channel. Wait for messages and answer each one through the reply tool."}}'
 
-started=$(date +%s)
 : > "$state/session.log"
-"$claude_bin" "${args[@]}" < "$fifo" > "$state/session.log" &
+"$claude_bin" "${args[@]}" < "$fifo" > "$state/session.log" 2> "$state/session.err" &
 pid=$!
 exec 3> "$fifo"
 printf '%s\n' "$initial" >&3
@@ -68,9 +68,14 @@ stop() {
 trap stop INT TERM
 code=0
 wait "$pid" || code=$?
-# A resume that dies at once (the saved id no longer resumes): start fresh next time.
-if [ "$resumed" = 1 ] && [ "$code" != 0 ] && [ $(( $(date +%s) - started )) -lt 20 ]; then
-  echo "resume of $(cat "$idfile") failed at once; a new session starts on the next run" >&2
+if [ "$code" != 0 ]; then
+  echo "claude exited with $code; the end of $state/session.err:" >&2
+  tail -n 5 "$state/session.err" >&2
+fi
+# Only a saved id that no longer resumes is dropped, so that a start that fails for
+# any other reason (an expired token, the network) keeps the conversation.
+if [ "$resumed" = 1 ] && grep -q "No conversation found with session ID" "$state/session.err"; then
+  echo "session $(cat "$idfile") cannot be resumed; a new session starts on the next run" >&2
   rm -f "$idfile"
 fi
 exit "$code"

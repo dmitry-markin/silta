@@ -17,7 +17,7 @@ use serde_json::json;
 use silta::protocol::{
     CmdKind, Edit, EventKind, FetchMessage, FetchMessages, HistoryMessage, React, Reply, SearchMessages, SendFile, Typing,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::daemon::{DaemonClient, Inbound};
@@ -150,14 +150,21 @@ pub struct SearchMessagesParams {
 #[derive(Clone)]
 pub struct SiltaChannel {
     daemon: DaemonClient,
-    events: Arc<Mutex<Option<mpsc::Receiver<Inbound>>>>,
+    startup: Arc<Mutex<Option<Startup>>>,
     tool_router: ToolRouter<Self>,
+}
+
+/// What the client's `initialized` starts: the connection to the daemon (`ready`) and
+/// the pump that turns its events into channel notifications.
+struct Startup {
+    events: mpsc::Receiver<Inbound>,
+    ready: oneshot::Sender<()>,
 }
 
 #[tool_router]
 impl SiltaChannel {
-    pub fn new(daemon: DaemonClient, events: mpsc::Receiver<Inbound>) -> Self {
-        SiltaChannel { daemon, events: Arc::new(Mutex::new(Some(events))), tool_router: Self::tool_router() }
+    pub fn new(daemon: DaemonClient, events: mpsc::Receiver<Inbound>, ready: oneshot::Sender<()>) -> Self {
+        SiltaChannel { daemon, startup: Arc::new(Mutex::new(Some(Startup { events, ready }))), tool_router: Self::tool_router() }
     }
 
     #[tool(
@@ -419,11 +426,12 @@ impl ServerHandler for SiltaChannel {
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
-        let Some(mut events) = self.events.lock().await.take() else {
+        let Some(Startup { mut events, ready }) = self.startup.lock().await.take() else {
             warn!("initialized twice; the notification pump is already running");
             return;
         };
-        info!("client initialized, starting the notification pump");
+        info!("client initialized, connecting to the daemon and starting the notification pump");
+        let _ = ready.send(());
         let peer = context.peer.clone();
         tokio::spawn(async move {
             while let Some(inbound) = events.recv().await {

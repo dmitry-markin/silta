@@ -11,17 +11,25 @@ if os.path.exists(SOCK): os.unlink(SOCK)
 srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); srv.bind(SOCK); srv.listen(1)
 env = dict(os.environ, SILTA_SESSION="hub", SILTA_SOCKET=SOCK, SILTA_INBOX=INBOX, RUST_LOG="info")
 p = subprocess.Popen([BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(LOG, "w"), env=env)
+def msend(o): p.stdin.write((json.dumps(o, ensure_ascii=False) + "\n").encode()); p.stdin.flush()
+def mread(): return json.loads(p.stdout.readline())
+msend({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t1", "version": "0"}}})
+init = mread()["result"]
+print("initialize:", init["protocolVersion"], "experimental", init["capabilities"].get("experimental"), "instructions", len(init.get("instructions", "")), "chars")
+# The plugin connects to the daemon only after `initialized`: a socket
+# connection before this point would be a failure.
+srv.settimeout(2)
+try:
+    srv.accept(); print("FAIL the plugin connected before the MCP handshake")
+except socket.timeout:
+    print("PASS no daemon connection before initialized")
+srv.settimeout(None)
+msend({"jsonrpc": "2.0", "method": "notifications/initialized"})
 conn, _ = srv.accept(); f = conn.makefile("rw", encoding="utf-8")
 print("daemon<-", f.readline().strip())
 def dsend(o): f.write(json.dumps(o, ensure_ascii=False) + "\n"); f.flush()
 def dread(): return json.loads(f.readline())
-def msend(o): p.stdin.write((json.dumps(o, ensure_ascii=False) + "\n").encode()); p.stdin.flush()
-def mread(): return json.loads(p.stdout.readline())
 dsend({"welcome": {"protocol": 2, "session": "hub", "user_id": "@silta:localhost", "people": [{"name": "Bob", "role": "owner"}, {"name": "Alice", "role": "family"}], "inbox_max_age_days": 30}})
-msend({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t1", "version": "0"}}})
-init = mread()["result"]
-print("initialize:", init["protocolVersion"], "experimental", init["capabilities"].get("experimental"), "instructions", len(init.get("instructions", "")), "chars")
-msend({"jsonrpc": "2.0", "method": "notifications/initialized"})
 msend({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
 tools = mread()["result"]["tools"]
 for t in tools:

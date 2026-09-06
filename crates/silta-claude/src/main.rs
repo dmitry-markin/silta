@@ -12,7 +12,10 @@ use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::Parser;
 use rmcp::{transport::stdio, ServiceExt};
-use tokio::{signal::unix::{signal, SignalKind}, sync::mpsc};
+use tokio::{
+    signal::unix::{signal, SignalKind},
+    sync::{mpsc, oneshot},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -117,8 +120,9 @@ async fn run(args: Args, parent: libc::pid_t) -> i32 {
     }
     info!(session = %args.session, socket = %args.socket.display(), inbox = %inbox.display(), "silta-claude {} starting", env!("CARGO_PKG_VERSION"));
     let (events_tx, events_rx) = mpsc::channel(256);
-    let daemon = daemon::DaemonClient::start(args.socket, args.session, inbox, events_tx, cancel.clone());
-    let handler = mcp::SiltaChannel::new(daemon, events_rx);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let daemon = daemon::DaemonClient::start(args.socket, args.session, inbox, events_tx, ready_rx, cancel.clone());
+    let handler = mcp::SiltaChannel::new(daemon, events_rx, ready_tx);
 
     // The handshake waits for the client's initialize request; a shutdown signal must
     // end that wait too, not only the serving phase.
