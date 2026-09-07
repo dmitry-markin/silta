@@ -8,4 +8,4 @@ set -eu
 in="$1"
 out="${2:-${in%.md}.pdf}"
 here="$(cd "$(dirname "$0")" && pwd)"
-exec pandoc "$in" --pdf-engine=typst --metadata-file="$here/md2pdf.yaml" --include-in-header="$here/md2pdf.typ" -o "$out"
+exec pandoc "$in" -f markdown-citations --pdf-engine=typst --metadata-file="$here/md2pdf.yaml" --include-in-header="$here/md2pdf.typ" -o "$out"
