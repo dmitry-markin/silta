@@ -41,7 +41,7 @@ session runs. One systemd unit for the daemon, one template unit per mind, a hel
 adds a mind, a daily backup of the store."""
 section = "net"
 priority = "optional"
-depends = "$auto, systemd, passwd"
+depends = "$auto, systemd, passwd, bubblewrap, socat"
 recommends = "curl"
 maintainer-scripts = "debian"
 assets = [

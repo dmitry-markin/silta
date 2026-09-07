@@ -44,13 +44,18 @@ TasksMax=512
 # Hardening. What a mind needs: its state directory (HOME and the workspace, writable
 # through StateDirectory), a private /tmp, the daemon's socket (connecting works on a
 # read-only /run), the persona and the allowlist under /etc, the Claude Code install
-# under /opt/claude, the network for the model and for research, and the credential.
-# No MemoryDenyWriteExecute: the Claude Code binary is a JavaScript runtime with a JIT.
-# A denylist of privileged syscall groups rather than an allowlist, because a mind runs
-# arbitrary developer tools. RestrictNamespaces means Claude Code's optional bubblewrap
-# sandbox cannot be enabled in a mind, and PrivateTmp keeps Claude Code's messaging
-# socket (/tmp/cc-socks-<uid>) private to the mind. ProtectProc=invisible keeps minds
-# from seeing each other's processes.
+# under /opt/claude, the network for the model and for research, the credential, and
+# what Claude Code's Bash sandbox needs (bubblewrap, switched on for every mind in
+# /etc/claude-code/managed-settings.json): the user, mnt, pid and net namespaces it asks
+# for, and the mount syscalls inside its user namespace, hence no @mount in the
+# denylist. Not ProtectKernelTunables or ProtectKernelLogs: both put locked mounts over
+# parts of /proc, and the kernel then refuses the sandbox's fresh /proc ("Can't mount
+# proc", reproduced 2026-09-07); a process without capabilities cannot write there
+# anyway. No MemoryDenyWriteExecute: the Claude Code binary is a JavaScript runtime with
+# a JIT. A denylist of privileged syscall groups rather than an allowlist, because a
+# mind runs arbitrary developer tools. PrivateTmp keeps Claude Code's messaging socket
+# (/tmp/cc-socks-<uid>) private to the mind. ProtectProc=invisible keeps minds from
+# seeing each other's processes.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -58,21 +63,19 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
-RestrictNamespaces=yes
+RestrictNamespaces=user mnt pid net
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 RemoveIPC=yes
 UMask=0077
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-SystemCallFilter=~@mount @reboot @swap @module @raw-io @obsolete @clock @debug @cpu-emulation
+SystemCallFilter=~@reboot @swap @module @raw-io @obsolete @clock @debug @cpu-emulation
 SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 

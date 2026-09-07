@@ -5,5 +5,17 @@
     { "marketplace": "claude-plugins-official", "plugin": "discord" },
     { "marketplace": "claude-plugins-official", "plugin": "imessage" },
     { "marketplace": "silta-local", "plugin": "silta-claude" }
-  ]
+  ],
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "credentials": {
+      "envVars": [ { "name": "CLAUDE_CODE_OAUTH_TOKEN", "mode": "deny" } ],
+      "files": [ { "path": "/run/credentials", "mode": "deny" } ]
+    }
+  },
+  "permissions": {
+    "deny": [ "Read(//run/credentials/**)", "Read(//proc/**)" ]
+  }
 }
