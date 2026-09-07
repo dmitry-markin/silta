@@ -13,6 +13,24 @@
     }
   },
   "permissions": {
-    "deny": [ "Read(//run/credentials/**)", "Read(//proc/**)" ]
+    "deny": [
+      "Read(//run/credentials/**)",
+      "Read(//proc/**)",
+      "Edit(//var/lib/silta/*/.claude/settings.json)",
+      "Edit(//var/lib/silta/*/.claude/settings.local.json)",
+      "Edit(//var/lib/silta/*/.claude/plugins/**)",
+      "Edit(//var/lib/silta/*/.claude/agents/**)",
+      "Edit(//var/lib/silta/*/.claude/skills/**)",
+      "Edit(//var/lib/silta/*/.claude/hooks/**)",
+      "Edit(//var/lib/silta/*/.claude/commands/**)",
+      "Edit(//var/lib/silta/*/.claude/projects/*/*.jsonl)",
+      "Edit(//var/lib/silta/*/.claude.json)",
+      "Edit(//var/lib/silta/*/.cache/**)",
+      "Edit(//var/lib/silta/*/.config/**)",
+      "Edit(//var/lib/silta/*/.local/**)",
+      "Edit(//var/lib/silta/*/session-id)",
+      "Edit(//var/lib/silta/*/session.err)",
+      "Edit(//var/lib/silta/*/session.fifo)"
+    ]
   }
 }
