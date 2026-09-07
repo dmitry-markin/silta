@@ -1,9 +1,6 @@
 {
   "channelsEnabled": true,
   "allowedChannelPlugins": [
-    { "marketplace": "claude-plugins-official", "plugin": "telegram" },
-    { "marketplace": "claude-plugins-official", "plugin": "discord" },
-    { "marketplace": "claude-plugins-official", "plugin": "imessage" },
     { "marketplace": "silta-local", "plugin": "silta-claude" }
   ],
   "sandbox": {
