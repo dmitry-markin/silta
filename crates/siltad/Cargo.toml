@@ -42,7 +42,7 @@ adds a mind, a daily backup of the store."""
 section = "net"
 priority = "optional"
 depends = "$auto, systemd, passwd, bubblewrap, socat"
-recommends = "curl"
+recommends = "curl, python3, pandoc, fonts-dejavu, fonts-noto-core, fonts-noto-color-emoji"
 maintainer-scripts = "debian"
 assets = [
   ["target/release/siltad", "usr/bin/", "755"],
@@ -60,6 +60,16 @@ assets = [
   ["../../deploy/siltad.example.toml", "etc/silta/siltad.toml", "600"],
   ["../../assistant/persona.md", "etc/silta/persona.md", "644"],
   ["../../assistant/managed-settings.json", "etc/claude-code/managed-settings.json", "644"],
+  # Skills and agents every mind gets, in the policy scope Claude Code reads next to
+  # managed-settings.json: /etc/claude-code/.claude/{skills,agents}. Conffiles like the
+  # rest of etc/, so a local edit survives an upgrade.
+  ["../../assistant/skills/md2pdf/SKILL.md", "etc/claude-code/.claude/skills/md2pdf/", "644"],
+  ["../../assistant/skills/md2pdf/md2pdf.sh", "etc/claude-code/.claude/skills/md2pdf/", "755"],
+  ["../../assistant/skills/md2pdf/md2pdf.yaml", "etc/claude-code/.claude/skills/md2pdf/", "644"],
+  ["../../assistant/skills/md2pdf/md2pdf.typ", "etc/claude-code/.claude/skills/md2pdf/", "644"],
+  ["../../assistant/skills/research/SKILL.md", "etc/claude-code/.claude/skills/research/", "644"],
+  ["../../assistant/skills/research/cite.py", "etc/claude-code/.claude/skills/research/", "755"],
+  ["../../assistant/agents/researcher.md", "etc/claude-code/.claude/agents/", "644"],
   ["../../assistant/marketplace/.claude-plugin/marketplace.json", "usr/share/silta/marketplace/.claude-plugin/", "644"],
   ["../../assistant/marketplace/silta-claude/.claude-plugin/plugin.json", "usr/share/silta/marketplace/silta-claude/.claude-plugin/", "644"],
   ["../../assistant/marketplace/silta-claude/.mcp.json", "usr/share/silta/marketplace/silta-claude/", "644"],

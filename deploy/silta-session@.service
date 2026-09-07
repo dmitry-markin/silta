@@ -29,9 +29,11 @@ Environment=SILTA_SESSION_LOG=/usr/lib/silta/silta-session-log
 Environment=CLAUDE_BIN=/opt/claude/.local/bin/claude
 Environment=DISABLE_AUTOUPDATER=1
 # Pinned by full name so nothing follows a moving alias.
-Environment=SILTA_MODEL=claude-opus-5
+Environment=SILTA_MODEL=claude-fable-5-1
 Environment=SILTA_EFFORT=high
-Environment=SILTA_FALLBACK_MODEL=claude-sonnet-5
+Environment=SILTA_FALLBACK_MODEL=claude-opus-5
+# Subagents a mind spawns: read by Claude Code itself, not by silta-session.
+Environment=CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-5
 LoadCredential=oauth-token:/etc/silta/oauth-token
 ExecStart=/usr/lib/silta/silta-session
 Restart=always

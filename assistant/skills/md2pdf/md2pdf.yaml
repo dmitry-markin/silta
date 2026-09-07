@@ -1,0 +1,8 @@
+# Defaults for md2pdf.sh (pandoc --metadata-file). A document's own YAML header overrides these.
+papersize: a4
+margin:
+  x: 2cm
+  y: 2cm
+mainfont: DejaVu Sans
+monofont: DejaVu Sans Mono
+fontsize: 11pt
