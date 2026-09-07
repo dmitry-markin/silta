@@ -1,8 +1,9 @@
 #!/bin/sh
 # postinst for silta: users, directories, units. The daemon is enabled but not started
 # on a first install (the configuration has no password yet); an upgrade restarts a
-# running daemon. Session instances are never touched here: a session restart rewrites
-# its whole context, so it stays a deliberate step (silta-session-add <name>).
+# running daemon. Session instances and their target are never started or restarted
+# here: a session restart rewrites its whole context, so it stays a deliberate step
+# (silta-session-add <name>, or systemctl restart silta-session.target).
 set -e
 
 case "$1" in
@@ -11,7 +12,7 @@ case "$1" in
     systemd-tmpfiles --create silta.conf
     if [ -d /run/systemd/system ]; then
       systemctl --system daemon-reload >/dev/null || true
-      for unit in siltad.service silta-backup.timer; do
+      for unit in siltad.service silta-backup.timer silta-session.target; do
         deb-systemd-helper unmask "$unit" >/dev/null || true
         if deb-systemd-helper --quiet was-enabled "$unit"; then
           deb-systemd-helper enable "$unit" >/dev/null || true

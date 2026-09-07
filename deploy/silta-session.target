@@ -1,0 +1,15 @@
+# All Silta sessions (minds) as one handle. Every enabled silta-session@<name>.service
+# is wanted by this target and PartOf it, so start, stop and restart of the target act
+# on all of them: systemctl restart silta-session.target after a Claude Code update,
+# systemctl list-dependencies silta-session.target to see the minds. A propagated
+# restart also starts an enabled mind that was stopped by hand; a mind meant to stay
+# down is disabled (systemctl disable --now silta-session@<name>). The package enables
+# the target and never starts or restarts it: a mind's restart rewrites its whole
+# context and stays deliberate.
+[Unit]
+Description=Silta sessions (all minds)
+After=siltad.service
+Wants=siltad.service
+
+[Install]
+WantedBy=multi-user.target

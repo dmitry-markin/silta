@@ -4,9 +4,10 @@
 # As root. Creates the system user silta-<name> in the silta group with
 # /var/lib/silta/<name> as its home and the workspace below it, registers the packaged
 # marketplace and installs the silta-claude plugin at project scope as that user,
-# enables and starts silta-session@<name>.service, and prints the [[sessions]] entry
-# for /etc/silta/siltad.toml. Safe to run again for an existing mind: it reinstalls the
-# plugin (after a package upgrade, say) and restarts the unit.
+# enables silta-session@<name>.service under silta-session.target and starts it, and
+# prints the [[sessions]] entry for /etc/silta/siltad.toml. Safe to run again for an
+# existing mind: it reinstalls the plugin (after a package upgrade, say), refreshes the
+# unit's enablement and restarts the unit.
 set -euo pipefail
 name="${1:-}"
 if [ -z "$name" ] || ! [[ "$name" =~ ^[a-z][a-z0-9-]*$ ]]; then
@@ -49,7 +50,7 @@ as_user() { runuser -u "$user" -- env -i HOME="$home" PATH=/usr/bin:/bin DISABLE
 echo "plugin silta-claude installed for $user in $workspace"
 
 systemctl daemon-reload
-systemctl enable "silta-session@$name.service" > /dev/null
+systemctl reenable "silta-session@$name.service" > /dev/null 2>&1
 systemctl restart "silta-session@$name.service"
 echo "silta-session@$name.service enabled and started"
 cat <<EOT

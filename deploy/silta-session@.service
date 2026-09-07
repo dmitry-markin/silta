@@ -1,12 +1,14 @@
 # One Silta session (a "mind") per instance: silta-session@alice.service runs as the
 # Unix user silta-alice with /var/lib/silta/alice as its home and state, and announces
 # itself to the daemon as session "alice". Instances are created with
-# silta-session-add. Per-instance overrides (a model, a version pin) go in a drop-in:
+# silta-session-add and hang off silta-session.target, the handle for all minds at
+# once. Per-instance overrides (a model, a version pin) go in a drop-in:
 # systemctl edit silta-session@alice.
 [Unit]
 Description=Silta session %i (Claude Code with the silta channel)
 After=network-online.target siltad.service
 Wants=network-online.target siltad.service
+PartOf=silta-session.target
 StartLimitIntervalSec=0
 
 [Service]
@@ -80,4 +82,4 @@ SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=silta-session.target
