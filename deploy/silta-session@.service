@@ -50,14 +50,15 @@ TasksMax=512
 # what Claude Code's Bash sandbox needs (bubblewrap, switched on for every mind in
 # /etc/claude-code/managed-settings.json): the user, mnt, pid and net namespaces it asks
 # for, and the mount syscalls inside its user namespace, hence no @mount in the
-# denylist. Not ProtectKernelTunables or ProtectKernelLogs: both put locked mounts over
-# parts of /proc, and the kernel then refuses the sandbox's fresh /proc ("Can't mount
-# proc", reproduced 2026-09-07); a process without capabilities cannot write there
-# anyway. No MemoryDenyWriteExecute: the Claude Code binary is a JavaScript runtime with
-# a JIT. A denylist of privileged syscall groups rather than an allowlist, because a
-# mind runs arbitrary developer tools. PrivateTmp keeps Claude Code's messaging socket
-# (/tmp/cc-socks-<uid>) private to the mind. ProtectProc=invisible keeps minds from
-# seeing each other's processes.
+# denylist. Four hardenings we would otherwise set break that sandbox (bisected on the
+# dev host 2026-09-07); each is kept commented-out below with its reason so it can be
+# restored when the blocker is gone. All four are harmless to drop here: the mind has an
+# empty CapabilityBoundingSet and NoNewPrivileges, so it holds none of the privileges
+# they guard against. No MemoryDenyWriteExecute: the Claude Code binary is a JavaScript
+# runtime with a JIT. A denylist of privileged syscall groups rather than an allowlist,
+# because a mind runs arbitrary developer tools. PrivateTmp keeps Claude Code's messaging
+# socket (/tmp/cc-socks-<uid>) private to the mind. ProtectProc=invisible keeps minds
+# from seeing each other's processes.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -68,11 +69,13 @@ PrivateDevices=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ProtectClock=yes
-ProtectHostname=yes
+# ProtectKernelTunables=yes   # off: ro bind-mount over /proc/sys is locked in the mind's namespace and blocks the sandbox's fresh /proc ("Can't mount proc"). A mind cannot write these anyway.
+# ProtectKernelLogs=yes       # off: same, its bind-mount over /proc/kmsg blocks the sandbox's /proc.
+# ProtectHostname=yes         # off: same, ro bind-mounts over /proc/sys/kernel/{host,domain}name. Replace with ProtectHostname=private (a UTS namespace, no bind mount) once on systemd 258; changing the hostname needs CAP_SYS_ADMIN the mind lacks.
 ProtectProc=invisible
 RestrictNamespaces=user mnt pid net
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# RestrictSUIDSGID=yes        # off: it makes systemd block openat2 with ENOSYS, and bubblewrap opens its bind sources with openat2 and does not fall back ("Can't open source …: Function not implemented"). Empty caps + NoNewPrivileges already void any suid bit.
 LockPersonality=yes
 RemoveIPC=yes
 UMask=0077
