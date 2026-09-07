@@ -42,9 +42,10 @@ when a correction or a progress update makes the chat clearer; send_file sends a
 this host; fetch_messages reads recent room history when something has fallen out of your \
 context, with long texts shortened; search_messages searches it with a regular expression; \
 fetch_message reads one message whole by its event id. Every sending tool has a required \
-`more` parameter: true when another message of yours will follow in that room in this turn \
+`more` parameter: true when another message of yours will follow shortly in that room in this turn \
 (a table and then a file, say), so the typing indicator stays on across the gap; false for \
-the last one, which ends the indicator. If you decide to send more only after a send with \
+the last one, which ends the indicator. Use more=false and call react on a user message instead \
+if the task is going to take more than 30 seconds. If you decide to send more only after a send with \
 more=false, call typing first. Terminal output never reaches the sender. After a tool has sent something, end the \
 turn without restating it.";
 
@@ -70,9 +71,9 @@ pub struct ReactParams {
     pub room_id: String,
     /// The message to react to: its event_id.
     pub event_id: String,
-    /// One emoji.
+    /// One emoji. E.g., 👀, if the answer will take more than 30 seconds.
     pub emoji: String,
-    /// Required: true when a message of yours will follow in this room in this turn (a 👀 before a long task), false when the reaction is the whole answer; if you decide only after this send that another message is coming, call typing first.
+    /// Required: true when a message of yours will follow shortly (less than 30 seconds) in this room in this turn, false when the reaction is the whole answer; if you decide only after this send that another message is coming, call typing first.
     pub more: bool,
 }
 
@@ -177,7 +178,7 @@ impl SiltaChannel {
 
     #[tool(
         name = "react",
-        description = "React to a message with an emoji. Use it when a reaction is the whole answer (a thumbs-up to a thank-you, say) or to mark that you have seen a message before starting a long task, with more=true so the typing indicator stays on while you work. Same failure codes as reply."
+        description = "React to a message with an emoji. Use it when a reaction is the whole answer (a thumbs-up to a thank-you, say) or to mark that you have seen a message before starting a task that will likely take more than 30 seconds. more=true keeps the typing indicator on if your next message is expected within 30 seconds. Same failure codes as reply."
     )]
     async fn react(&self, Parameters(p): Parameters<ReactParams>) -> Result<CallToolResult, McpError> {
         self.send(CmdKind::React(React { room_id: p.room_id, event_id: p.event_id, emoji: p.emoji, more: p.more })).await

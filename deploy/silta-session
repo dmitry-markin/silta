@@ -65,7 +65,22 @@ else
   echo "new session $id" >&2
 fi
 args+=(--channels plugin:silta-claude@silta-local)
-initial='{"type":"user","message":{"role":"user","content":"You are connected to the family chat through the silta channel. Wait for messages and answer each one through the reply tool."}}'
+
+# The message that starts the first turn: without one, no channel event is ever delivered
+# at all. It is sent on every start, so a restart also seeds a turn in which the mind
+# can notice a tool that broke while it was down. On a resume it lands in the middle of
+# the existing conversation, which is why it names the host as its sender and says that
+# nothing is waiting; the mind counts the earlier such lines in its own history when it
+# needs to know how often it has restarted. Interpolated values must hold no quote and no
+# backslash, because the JSON is assembled by hand below: the session name is
+# [a-z][a-z0-9-]* from silta-session-add, the stamp is date's own output.
+now=$(date -u '+%Y-%m-%d %H:%M')
+if [ "$resumed" = 1 ]; then
+  intro="Session $SILTA_SESSION restarted at $now UTC and resumed its history. You are connected to the family chat through the silta channel. This line comes from the host at every start, not from a person. If there is no work to do from before the session restart, end this turn and stay idle until a message arrives."
+else
+  intro="Session $SILTA_SESSION started at $now UTC: a new conversation, no history. You are connected to the family chat through the silta channel. This line comes from the host, not from a person, and no one is waiting on you yet, so use this turn to look around the workspace and check that your tools work. Bash commands run in a sandbox, so some paths and hosts are refused by design and that is not a fault. Then end the turn and stay idle until a message arrives."
+fi
+initial="{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"$intro\"}}"
 
 : > "$errfile"
 "$claude_bin" "${args[@]}" < "$fifo" > >(exec "$log_filter") 2> >(exec tee -a "$errfile" >&2) &
