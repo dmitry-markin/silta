@@ -27,10 +27,11 @@ case "$1" in
 silta: next steps, as root
   1. install Claude Code once, as the claude user:
        runuser -u claude -- bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
-  2. edit /etc/silta/siltad.toml: the homeserver, the bot's password, the people, the sessions
-  3. install -m 0600 /dev/stdin /etc/silta/oauth-token    # paste the output of: claude setup-token
-  4. systemctl start siltad
-  5. silta-session-add hub, then silta-session-add <name> for each person
+  2. install -m 0600 /dev/stdin /etc/silta/oauth-token    # paste the output of: claude setup-token
+  3. silta-session-add hub, then silta-session-add <name> for each person
+     (the daemon refuses to start while a configured session's user does not exist)
+  4. edit /etc/silta/siltad.toml: the homeserver, the bot's password, the people, the sessions
+  5. systemctl start siltad
 See /usr/share/doc/silta/README.md.
 NOTE
       fi

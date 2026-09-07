@@ -5,7 +5,10 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -190,10 +193,16 @@ impl Daemon {
 
     /// Keep sending the typing notice in a room until the reply goes out or the cap.
     /// With `watch`, reaching the cap is reported as a silent session (a delivery
-    /// that got nothing back); a send with `more = true` restarts the notice without it.
+    /// that got nothing back). A call without it (a part sent with `more = true`, a
+    /// typing request) keeps a running task, whose cap still counts from the delivery,
+    /// but clears its watch: the session has shown something, so a long task alerts
+    /// nobody.
     pub fn typing_start(&self, session: &str, room: Room, watch: bool) {
         let mut tasks = self.typing.lock().unwrap();
-        if tasks.contains_key(room.room_id()) {
+        if let Some(task) = tasks.get(room.room_id()) {
+            if !watch {
+                task.watch.store(false, Ordering::Relaxed);
+            }
             return;
         }
         let generation = {
@@ -202,7 +211,11 @@ impl Daemon {
             *g
         };
         let cancel = CancellationToken::new();
-        tasks.insert(room.room_id().to_owned(), TypingTask { session: session.to_owned(), generation, cancel: cancel.clone() });
+        let watch = Arc::new(AtomicBool::new(watch));
+        tasks.insert(
+            room.room_id().to_owned(),
+            TypingTask { session: session.to_owned(), generation, cancel: cancel.clone(), watch: watch.clone() },
+        );
         drop(tasks);
 
         let tasks = self.typing.clone();
@@ -221,7 +234,7 @@ impl Daemon {
                 }
                 if started.elapsed() > TYPING_MAX {
                     debug!(room = %room.room_id(), "typing notice cap reached");
-                    if watch {
+                    if watch.load(Ordering::Relaxed) {
                         let _ = silence.send(Silence { session, room_id: room.room_id().to_string(), delivered_ms: started_ms });
                     }
                     break;
@@ -261,6 +274,8 @@ struct TypingTask {
     session: String,
     generation: u64,
     cancel: CancellationToken,
+    /// Whether reaching the cap counts as a silent session.
+    watch: Arc<AtomicBool>,
 }
 
 /// Per-room watermarks of the last delivered message, persisted so a restart neither

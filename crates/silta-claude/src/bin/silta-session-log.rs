@@ -60,14 +60,17 @@ fn system(map: &serde_json::Map<String, Value>) -> String {
         );
     }
     // Other system lines are short and operational (api_retry with its status, compaction
-    // boundaries); keep their scalar fields, drop nested content and the ids.
+    // boundaries); keep their scalar fields, drop nested content and the ids. A string
+    // stays only when it is an identifier or an enum (no whitespace): a task
+    // notification's summary or a hook's output is prose that may carry the
+    // conversation's content.
     let mut parts = Vec::new();
     for (key, value) in map {
         if matches!(key.as_str(), "type" | "subtype" | "session_id" | "uuid") {
             continue;
         }
         match value {
-            Value::String(s) => parts.push(format!("{key}={}", shorten(s, 200))),
+            Value::String(s) if !s.contains(char::is_whitespace) => parts.push(format!("{key}={}", shorten(s, 200))),
             Value::Number(n) => parts.push(format!("{key}={n}")),
             Value::Bool(b) => parts.push(format!("{key}={b}")),
             _ => {}
@@ -212,6 +215,8 @@ mod tests {
             summarize(line),
             "system api_retry: attempt=1 error=authentication_failed error_status=401 max_retries=10 retry_delay_ms=599"
         );
+        let task = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"Agent finished: the private answer","session_id":"af92"}"#;
+        assert_eq!(summarize(task), "system task_notification: status=completed task_id=t1");
     }
 
     #[test]
