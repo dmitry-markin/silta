@@ -3,11 +3,19 @@
 #
 # As root. Creates the system user silta-<name> in the silta group with
 # /var/lib/silta/<name> as its home and the workspace below it, registers the packaged
-# marketplace and installs the silta-claude plugin at project scope as that user,
-# enables silta-session@<name>.service under silta-session.target and starts it, and
-# prints the [[sessions]] entry for /etc/silta/siltad.toml. Safe to run again for an
-# existing mind: it reinstalls the plugin (after a package upgrade, say), refreshes the
-# unit's enablement and restarts the unit.
+# marketplace and installs the silta-claude plugin at project scope as that user, and
+# prints the [[sessions]] entry for /etc/silta/siltad.toml with the commands that put
+# the mind to work. It touches no unit: enabling, starting and restarting
+# silta-session@<name>.service stay the operator's, so a running mind is never
+# interrupted behind their back.
+#
+# Running it again for an existing mind reinstalls the plugin. That is rarely what is
+# needed: a session spawns the MCP server from ${SILTA_CLAUDE_BIN:-silta-claude} on PATH
+# at every start, so a new /usr/bin/silta-claude only needs a restart of the unit. Only
+# a change to the plugin's own marketplace files (.mcp.json above all) needs the
+# reinstall, because Claude Code copies those into the user's plugin cache at install
+# time and keeps running the copy. The reinstall takes effect when the operator restarts
+# the unit.
 set -euo pipefail
 name="${1:-}"
 if [ -z "$name" ] || ! [[ "$name" =~ ^[a-z][a-z0-9-]*$ ]]; then
@@ -49,17 +57,18 @@ as_user() { runuser -u "$user" -- env -i HOME="$home" PATH=/usr/bin:/bin DISABLE
 )
 echo "plugin silta-claude installed for $user in $workspace"
 
-systemctl daemon-reload
-systemctl reenable "silta-session@$name.service" > /dev/null 2>&1
-systemctl restart "silta-session@$name.service"
-echo "silta-session@$name.service enabled and started"
 cat <<EOT
 
 Give the daemon the session in /etc/silta/siltad.toml (a personal mind below; the hub
-is receive = "groups"), then: systemctl restart siltad
+is receive = "groups"):
 
 [[sessions]]
 name = "$name"
 receive = { people = ["<Person>"] }
 user = "$user"
+
+After this is done:
+
+systemctl restart siltad
+systemctl enable --now "silta-session@$name.service"
 EOT
