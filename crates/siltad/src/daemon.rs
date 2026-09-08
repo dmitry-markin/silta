@@ -157,7 +157,7 @@ impl Daemon {
             Err(DeliverError::NotConnected) => {
                 let (waiting, evicted) = self.registry.enqueue(session, ts_ms, event, now_ms());
                 if evicted > 0 {
-                    warn!(session, evicted, "dropped queued messages beyond the backlog limits");
+                    warn!(dir = "in", session, evicted, "permanently lost incoming messages queued beyond the backlog limits");
                 }
                 let _ = room;
                 Dispatch::Queued(waiting)
@@ -175,9 +175,9 @@ impl Daemon {
         for attachment in &event.attachments {
             let _ = fs::remove_file(self.spool.inbox_path(&attachment.transfer));
         }
-        debug!(session, event_id = %event.event_id, "acknowledged");
+        debug!(dir = "in", session, event_id = %event.event_id, "the session acknowledged the event");
         let Some(room) = RoomId::parse(&event.room_id).ok().and_then(|id| self.client.get_room(&id)) else {
-            debug!(room = %event.room_id, "no room object for the read marker");
+            debug!(dir = "out", room = %event.room_id, "no room object for the read marker");
             return;
         };
         self.mark_read(&room, &event.event_id);
@@ -191,14 +191,14 @@ impl Daemon {
     /// when the answer comes back. Fire and forget: a failed receipt costs nothing.
     fn mark_read(&self, room: &Room, event_id: &str) {
         let Ok(event_id) = EventId::parse(event_id) else {
-            debug!(event_id, "cannot parse the event id for the read marker");
+            debug!(dir = "out", event_id, "cannot parse the event id for the read marker");
             return;
         };
         let room = room.clone();
         tokio::spawn(async move {
             let receipts = Receipts::new().fully_read_marker(event_id.clone()).public_read_receipt(event_id);
             if let Err(err) = room.send_multiple_receipts(receipts).await {
-                debug!(room = %room.room_id(), "read marker failed: {err}");
+                debug!(dir = "out", room = %room.room_id(), "cannot move the room's read marker: {err}");
             }
         });
     }
@@ -238,7 +238,7 @@ impl Daemon {
             let started_ms = now_ms();
             loop {
                 if let Err(err) = room.typing_notice(true).await {
-                    debug!(room = %room.room_id(), "typing notice failed: {err}");
+                    debug!(dir = "out", room = %room.room_id(), "cannot show the typing indicator: {err}");
                 }
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -463,7 +463,7 @@ impl Drop for Claim {
         self.registry.inner.lock().unwrap().remove(&self.session);
         let (returned, evicted) = self.registry.restore(&self.session, now_ms());
         if returned > 0 {
-            warn!(session = %self.session, returned, evicted, "events the session never acknowledged wait for its next connection");
+            warn!(dir = "in", session = %self.session, returned, evicted, "events the session never acknowledged wait for its next connection");
         }
         info!(session = %self.session, "session released");
     }

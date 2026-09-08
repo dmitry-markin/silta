@@ -133,17 +133,17 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
     // Messages that arrived while the session was away, oldest first.
     let (queued, evicted) = daemon.registry.take_backlog(&session, now_ms());
     if evicted > 0 {
-        warn!(session, evicted, "dropped queued messages older than the replay window");
+        warn!(dir = "in", session, evicted, "permanently lost incoming messages queued longer than the replay window");
     }
     let count = queued.len();
     for (_, event) in queued {
         if let Err(err) = write_event(&daemon, &mut writer, &session, &event).await {
-            warn!(session, "write failed while delivering the backlog: {err}");
+            warn!(dir = "in", session, "could not deliver the queued messages, they wait for the session's next connection: {err}");
             return;
         }
     }
     if count > 0 {
-        info!(session, count, "delivered the messages queued while the session was away");
+        info!(dir = "in", session, count, "delivered the messages queued while the session was away");
     }
 
     // From here on one task writes the socket and this one reads it, so a file streaming
@@ -182,10 +182,10 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
                 kind => daemon.execute(&session, Cmd { id: cmd.id, kind }).await,
             }),
             Ok(Incoming::Message(ClientMessage::File(header))) => {
-                debug!(session, transfer = %header.transfer, name = %header.name, size = header.size, "file transfer begins");
+                debug!(dir = "out", session, transfer = %header.transfer, name = %header.name, size = header.size, "the session begins sending a file");
                 let transfer = header.transfer.clone();
                 if let Err(err) = receiver.begin(header).await {
-                    warn!(session, transfer, "file transfer refused: {err}");
+                    warn!(dir = "out", session, transfer, "refusing a file the session offered: {err}");
                     failed.insert(transfer, err.to_string());
                 }
                 None
@@ -195,7 +195,7 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
                 if let Err(err) = receiver.chunk(chunk).await {
                     // Logged once per transfer, not once per chunk.
                     if let Entry::Vacant(slot) = failed.entry(transfer) {
-                        warn!(session, transfer = %slot.key(), "file transfer failed: {err}");
+                        warn!(dir = "out", session, transfer = %slot.key(), "a file the session is sending failed: {err}");
                         slot.insert(err.to_string());
                     }
                 }
@@ -205,12 +205,12 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
                 let transfer = end.transfer.clone();
                 match receiver.end(end).await {
                     Ok(done) => {
-                        debug!(session, transfer, bytes = done.header.size, "file transfer complete");
+                        debug!(dir = "out", session, transfer, bytes = done.header.size, "spooled a file from the session, waiting for the send that names it");
                         received.insert(transfer, done);
                     }
                     Err(err) => {
                         if let Entry::Vacant(slot) = failed.entry(transfer) {
-                            warn!(session, transfer = %slot.key(), "file transfer failed: {err}");
+                            warn!(dir = "out", session, transfer = %slot.key(), "a file the session sent failed: {err}");
                             slot.insert(err.to_string());
                         }
                     }
@@ -220,7 +220,7 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
             Ok(Incoming::Message(ClientMessage::Ack(ack))) => {
                 match daemon.registry.ack(&session, &ack.event_id) {
                     Some((ts_ms, event)) => daemon.acked(&session, &event, ts_ms),
-                    None => warn!(session, event_id = %ack.event_id, "acknowledgement for an event that is not in flight"),
+                    None => warn!(dir = "in", session, event_id = %ack.event_id, "the session acknowledged an event that is not in flight"),
                 }
                 None
             }
@@ -298,7 +298,7 @@ async fn write_event(daemon: &Daemon, writer: &mut OwnedWriteHalf, session: &str
         match transfer::send(writer, header, &path, wrap).await {
             Ok(()) => debug!(session, transfer = %attachment.transfer, bytes = attachment.size, "attachment transferred"),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                warn!(session, transfer = %attachment.transfer, "attachment is gone from the spool; the event goes without it");
+                warn!(dir = "in", session, transfer = %attachment.transfer, "attachment is gone from the spool; the event goes to the session without it");
             }
             Err(err) => return Err(err),
         }

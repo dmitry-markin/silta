@@ -83,7 +83,7 @@ pub async fn search_messages(daemon: &Daemon, session: &str, id: u64, cmd: Searc
 pub async fn typing(daemon: &Daemon, session: &str, id: u64, cmd: Typing) -> CmdResult {
     match writable_room(daemon, session, &cmd.room_id).await {
         Ok(room) => {
-            info!(session, room = %room.room_id(), "typing indicator requested");
+            info!(dir = "out", session, room = %room.room_id(), "showing the typing indicator in the room again");
             daemon.typing_start(session, room, false);
             CmdResult::done(id)
         }
@@ -145,7 +145,7 @@ async fn writable_room(daemon: &Daemon, session: &str, room_id: &str) -> Result<
     let members = member_ids(&room).await?;
     let shape = room_shape(&room).await;
     if daemon.routing.may_send(session, room.room_id().as_str(), members.iter().map(String::as_str), shape).is_err() {
-        warn!(session, room = %room.room_id(), "send refused by policy");
+        warn!(dir = "out", session, room = %room.room_id(), "refusing to post: the session may not write to this room");
         return Err((ResultError::RoomNotAllowed, format!("session {session} may not send to {}", room.room_id())));
     }
     Ok(room)
@@ -157,7 +157,7 @@ async fn readable_room(daemon: &Daemon, session: &str, room_id: &str) -> Result<
     let members = member_ids(&room).await?;
     let shape = room_shape(&room).await;
     if daemon.routing.may_read(session, room.room_id().as_str(), members.iter().map(String::as_str), shape).is_err() {
-        warn!(session, room = %room.room_id(), "history refused by policy");
+        warn!(dir = "in", session, room = %room.room_id(), "refusing to read: the session may not read this room");
         return Err((ResultError::RoomNotAllowed, format!("session {session} may not read {}", room.room_id())));
     }
     Ok(room)
@@ -261,7 +261,7 @@ async fn do_reply(daemon: &Daemon, session: &str, reply: Reply) -> Result<OwnedE
         }
     }
     after_send(daemon, session, &room, reply.more).await;
-    info!(session, room = %room.room_id(), chunks = chunks.len(), bytes = reply.text.len(), in_thread, more = reply.more, "sent");
+    info!(dir = "out", session, room = %room.room_id(), chunks = chunks.len(), bytes = reply.text.len(), in_thread, more = reply.more, "posted a reply to the room");
     Ok(last.expect("at least one chunk"))
 }
 
@@ -277,7 +277,7 @@ async fn do_react(daemon: &Daemon, session: &str, react: React) -> Result<OwnedE
         .await
         .map_err(|e| (ResultError::SendFailed, format!("reacting in {} failed: {e}", room.room_id())))?;
     after_send(daemon, session, &room, react.more).await;
-    info!(session, room = %room.room_id(), %target, emoji = %react.emoji, more = react.more, "reacted");
+    info!(dir = "out", session, room = %room.room_id(), %target, emoji = %react.emoji, more = react.more, "posted a reaction to the room");
     Ok(sent.response.event_id)
 }
 
@@ -318,7 +318,7 @@ async fn do_edit(daemon: &Daemon, session: &str, edit: Edit) -> Result<OwnedEven
         .await
         .map_err(|e| (ResultError::SendFailed, format!("editing {target} in {} failed: {e}", room.room_id())))?;
     after_send(daemon, session, &room, edit.more).await;
-    info!(session, room = %room.room_id(), %target, bytes = edit.text.len(), more = edit.more, "edited");
+    info!(dir = "out", session, room = %room.room_id(), %target, bytes = edit.text.len(), more = edit.more, "posted an edit of our earlier message");
     Ok(sent.response.event_id)
 }
 
@@ -370,7 +370,7 @@ async fn do_send_file(daemon: &Daemon, session: &str, cmd: SendFile, received: &
         .await
         .map_err(|e| (ResultError::SendFailed, format!("sending {name} to {} failed: {e}", room.room_id())))?;
     after_send(daemon, session, &room, cmd.more).await;
-    info!(session, room = %room.room_id(), name, bytes, mime = %mime, more = cmd.more, "file sent");
+    info!(dir = "out", session, room = %room.room_id(), name, bytes, mime = %mime, more = cmd.more, "uploaded a file to the room");
     Ok(response.event_id)
 }
 
@@ -445,7 +445,7 @@ async fn do_fetch_messages(daemon: &Daemon, session: &str, cmd: FetchMessages) -
     let room = readable_room(daemon, session, &cmd.room_id).await?;
     let limit = cmd.limit.unwrap_or(HISTORY_DEFAULT).clamp(1, HISTORY_MAX);
     let scan = scan_history(daemon, &room, cmd.from, limit, limit as usize, HISTORY_MAX_PAGES, |_| true).await?;
-    info!(session, room = %room.room_id(), count = scan.messages.len(), scanned = scan.scanned, more = scan.more.is_some(), "history fetched");
+    info!(dir = "in", session, room = %room.room_id(), count = scan.messages.len(), scanned = scan.scanned, more = scan.more.is_some(), "read history back to the session");
     Ok((scan.messages, scan.more))
 }
 
@@ -469,7 +469,7 @@ async fn do_search_messages(daemon: &Daemon, session: &str, cmd: SearchMessages)
         }
     })
     .await?;
-    info!(session, room = %room.room_id(), pattern = %cmd.pattern, matches = scan.messages.len(), scanned = scan.scanned, more = scan.more.is_some(), "history searched");
+    info!(dir = "in", session, room = %room.room_id(), pattern = %cmd.pattern, matches = scan.messages.len(), scanned = scan.scanned, more = scan.more.is_some(), "searched history for the session");
     Ok(scan)
 }
 
@@ -484,7 +484,7 @@ async fn do_fetch_message(daemon: &Daemon, session: &str, cmd: FetchMessage) -> 
         .map_err(|e| (ResultError::NotFound, format!("cannot fetch {target}: {e}")))?;
     let message = history_message(daemon, &event)
         .ok_or_else(|| (ResultError::NotFound, format!("{target} is not a message from a registered person or the bot")))?;
-    info!(session, room = %room.room_id(), %target, bytes = message.text.len(), "message fetched");
+    info!(dir = "in", session, room = %room.room_id(), %target, bytes = message.text.len(), "read one message back to the session");
     Ok(message)
 }
 

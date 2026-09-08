@@ -20,7 +20,7 @@ use matrix_sdk::{
     Client, Room, RoomState,
 };
 use silta::{
-    config::{Inbound, PersonConfig},
+    config::{DropReason, Inbound, PersonConfig},
     protocol::{Attachment, Event, EventKind},
     replay::{verdict, Verdict},
     time::rfc3339_utc,
@@ -93,36 +93,44 @@ async fn on_invite(event: StrippedRoomMemberEvent, room: Room, client: Client, C
 async fn admit<'a>(daemon: &'a Daemon, room: &Room, sender: &str, event_id: &str, ts: u64, what: &str) -> Option<(&'a str, &'a PersonConfig)> {
     let room_id = room.room_id().as_str();
     // Without the members a group room cannot be told from a DM, and a group room must
-    // never reach a personal mind. Nothing is marked delivered, so a restart within the
-    // replay window brings the message back.
+    // never reach a personal mind, so the message goes no further. It is gone: the SDK
+    // commits the sync token before it calls this handler, so the next sync — this run's
+    // or a later run's — starts after the message. The replay window covers the daemon's
+    // downtime, not a failure inside a run.
     let members = match member_ids(room).await {
         Ok(members) => members,
-        Err((_, message)) => {
-            warn!(room = room_id, sender, "dropping a {what}: {message}");
+        Err((_, reason)) => {
+            warn!(dir = "in", room = room_id, sender, "permanently lost an incoming {what}: {reason}");
             return None;
         }
     };
     let shape = room_shape(room).await;
     debug!(room = room_id, direct = shape.direct, named = shape.named, members = members.len(), "room shape");
     let (session, person) = match daemon.routing.inbound(sender, room_id, members.iter().map(String::as_str), shape) {
+        // Our own event coming back through sync is not traffic for anyone; the other
+        // two reasons are a deliberate refusal, not a loss.
+        Inbound::Drop(DropReason::OwnMessage) => {
+            debug!(dir = "in", room = room_id, "ignoring our own {what} coming back through sync");
+            return None;
+        }
         Inbound::Drop(reason) => {
-            info!(room = room_id, sender, "dropping a {what}: {reason}");
+            info!(dir = "in", room = room_id, sender, "{what} not routed to a session: {reason}");
             return None;
         }
         Inbound::Deliver { session, person } => (session, person),
     };
     match verdict(ts, event_id, daemon.watermark(room_id).as_ref(), daemon.started_at_ms, daemon.replay_window_ms) {
         Verdict::AlreadyDelivered => {
-            debug!(room = room_id, event_id, "skipping a {what} delivered by an earlier run");
+            debug!(dir = "in", room = room_id, event_id, "not delivering a {what} an earlier run already delivered");
             None
         }
         Verdict::TooOld => {
-            debug!(room = room_id, event_id, "skipping a {what} older than the replay window");
+            debug!(dir = "in", room = room_id, event_id, "not delivering a {what} older than the replay window");
             None
         }
         Verdict::Deliver { behind_start_ms: 0 } => Some((session, person)),
         Verdict::Deliver { behind_start_ms } => {
-            info!(room = room_id, person = %person.name, "{what} from {} s before the daemon started, within the replay window", behind_start_ms / 1000);
+            info!(dir = "in", room = room_id, person = %person.name, "received a {what} from {} s before the daemon started, within the replay window", behind_start_ms / 1000);
             Some((session, person))
         }
     }
@@ -143,11 +151,11 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, Ctx(daemon)
     let parsed = content::parse(&event.content);
     match &parsed.body {
         Body::Edit => {
-            debug!(room = room_id, sender, "skipping an edit");
+            debug!(dir = "in", room = room_id, sender, "not delivering an edit of an earlier message, the bridge does not carry edits");
             return;
         }
         Body::Other(msgtype) => {
-            info!(room = room_id, sender, msgtype, "skipping a message type the bridge does not carry");
+            info!(dir = "in", room = room_id, sender, msgtype, "not delivering a message the bridge does not carry this type of");
             return;
         }
         Body::Text(_) | Body::Media(_) => {}
@@ -199,7 +207,7 @@ async fn fetch_attachment(daemon: &Daemon, message: &mut Event, media: Media) {
         format!("[attachment \"{name}\" ({mime}{size}) {detail}]")
     };
     if size.is_some_and(|s| s > max) {
-        info!(room = %message.room_id, name, "attachment not downloaded: over the {} limit", human_size(max));
+        info!(dir = "in", room = %message.room_id, name, "attachment not received: over the {} limit", human_size(max));
         note(message, describe(&format!("not downloaded: over the {} limit", human_size(max))));
         return;
     }
@@ -208,19 +216,19 @@ async fn fetch_attachment(daemon: &Daemon, message: &mut Event, media: Media) {
     let path = daemon.spool.inbox_path(&transfer);
     match timeout(DOWNLOAD_TIMEOUT, spool::download(&daemon.client, source, &path, max)).await {
         Ok(Ok(bytes)) => {
-            info!(room = %message.room_id, name, bytes, "attachment downloaded to the spool as {transfer}");
+            info!(dir = "in", room = %message.room_id, name, bytes, "received an attachment into the spool as {transfer}");
             message.attachments.push(Attachment { transfer, name, mime, size: bytes });
         }
         Ok(Err(DownloadError::TooLarge(bytes))) => {
-            info!(room = %message.room_id, name, bytes, "attachment not downloaded: over the {} limit", human_size(max));
+            info!(dir = "in", room = %message.room_id, name, bytes, "attachment not received: over the {} limit", human_size(max));
             note(message, describe(&format!("not downloaded: {} is over the {} limit", human_size(bytes), human_size(max))));
         }
         Ok(Err(DownloadError::Failed(err))) => {
-            warn!(room = %message.room_id, name, "attachment download failed: {err:#}");
+            warn!(dir = "in", room = %message.room_id, name, "attachment not received: the download failed: {err:#}");
             note(message, describe(&format!("could not be downloaded: {err}")));
         }
         Err(_) => {
-            warn!(room = %message.room_id, name, "attachment download timed out after {DOWNLOAD_TIMEOUT:?}");
+            warn!(dir = "in", room = %message.room_id, name, "attachment not received: the download timed out after {DOWNLOAD_TIMEOUT:?}");
             note(message, describe("could not be downloaded: timed out"));
         }
     }
@@ -256,12 +264,12 @@ async fn on_reaction(event: OriginalSyncReactionEvent, room: Room, Ctx(daemon): 
         Ok(target_event) => match target_event.sender() {
             Some(s) if daemon.routing.is_bot(s.as_str()) => {}
             _ => {
-                debug!(room = room_id, sender, target = %target, "ignoring a reaction on a message that is not the bot's");
+                debug!(dir = "in", room = room_id, sender, target = %target, "ignoring a reaction on a message that is not ours");
                 return;
             }
         },
         Err(err) => {
-            warn!(room = room_id, sender, target = %target, "cannot fetch the target of a reaction: {err}");
+            warn!(dir = "in", room = room_id, sender, target = %target, "permanently lost an incoming reaction, cannot fetch what it reacts to: {err}");
             return;
         }
     }
@@ -288,11 +296,13 @@ fn deliver(daemon: &Daemon, session: &str, room: &Room, event: Event, ts: u64) {
     let what = event.kind.as_str();
     let (room_id, person, bytes, files) = (event.room_id.clone(), event.person.clone(), event.text.len(), event.attachments.len());
     match daemon.dispatch(session, room, event, ts) {
-        Dispatch::Delivered => info!(room = %room_id, %person, session, bytes, files, "sent {what} to the session"),
+        Dispatch::Delivered => info!(dir = "in", room = %room_id, %person, session, bytes, files, "delivered a {what} to the session"),
         Dispatch::Queued(waiting) => {
-            warn!(room = %room_id, %person, session, waiting, "session is not connected, {what} queued")
+            warn!(dir = "in", room = %room_id, %person, session, waiting, "queued a {what} for the session, which is not connected")
         }
-        Dispatch::Dropped(why) => warn!(room = %room_id, %person, session, "dropping a {what}: {why}"),
+        Dispatch::Dropped(reason) => {
+            warn!(dir = "in", room = %room_id, %person, session, "permanently lost an incoming {what}: {reason}")
+        }
     }
 }
 
