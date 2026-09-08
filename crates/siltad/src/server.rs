@@ -141,7 +141,6 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
             warn!(session, "write failed while delivering the backlog: {err}");
             return;
         }
-        daemon.handed_over(&session, &event);
     }
     if count > 0 {
         info!(session, count, "delivered the messages queued while the session was away");

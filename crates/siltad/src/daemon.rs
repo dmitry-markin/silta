@@ -13,7 +13,8 @@ use std::{
 };
 
 use matrix_sdk::{
-    ruma::{OwnedRoomId, RoomId},
+    room::Receipts,
+    ruma::{EventId, OwnedRoomId, RoomId},
     Client, Room,
 };
 use silta::{
@@ -152,10 +153,7 @@ impl Daemon {
     /// Hand a message to its session, or queue it while the session is away.
     pub fn dispatch(&self, session: &str, room: &Room, event: Event, ts_ms: u64) -> Dispatch {
         match self.registry.deliver(session, event.clone(), ts_ms) {
-            Ok(()) => {
-                self.handed_over(session, &event);
-                Dispatch::Delivered
-            }
+            Ok(()) => Dispatch::Delivered,
             Err(DeliverError::NotConnected) => {
                 let (waiting, evicted) = self.registry.enqueue(session, ts_ms, event, now_ms());
                 if evicted > 0 {
@@ -168,27 +166,41 @@ impl Daemon {
         }
     }
 
-    /// The session acknowledged an event, so it is delivered: the room's watermark
-    /// moves past it and its attachments leave the spool.
+    /// The session acknowledged an event, so it reached Claude Code: the room's
+    /// watermark moves past it, its attachments leave the spool, and the sender sees
+    /// the message read. For a message the typing indicator then runs until the
+    /// session's first visible action; a reaction expects no answer.
     pub fn acked(&self, session: &str, event: &Event, ts_ms: u64) {
         self.marks.set(&event.room_id, Watermark { ts_ms, event_id: event.event_id.clone() });
         for attachment in &event.attachments {
             let _ = fs::remove_file(self.spool.inbox_path(&attachment.transfer));
         }
         debug!(session, event_id = %event.event_id, "acknowledged");
+        let Some(room) = RoomId::parse(&event.room_id).ok().and_then(|id| self.client.get_room(&id)) else {
+            debug!(room = %event.room_id, "no room object for the read marker");
+            return;
+        };
+        self.mark_read(&room, &event.event_id);
+        if event.kind == EventKind::Message {
+            self.typing_start(session, room, true);
+        }
     }
 
-    /// Once an event is on its way to a session: for a message, keep the typing
-    /// indicator alive until the session's first visible action. A reaction expects no
-    /// answer. The watermark waits for the acknowledgement.
-    pub fn handed_over(&self, session: &str, event: &Event) {
-        if event.kind != EventKind::Message {
+    /// Move the room's read marker and read receipt to the acknowledged event, so the
+    /// sender's client stops showing it unread when it reaches the session rather than
+    /// when the answer comes back. Fire and forget: a failed receipt costs nothing.
+    fn mark_read(&self, room: &Room, event_id: &str) {
+        let Ok(event_id) = EventId::parse(event_id) else {
+            debug!(event_id, "cannot parse the event id for the read marker");
             return;
-        }
-        match RoomId::parse(&event.room_id).ok().and_then(|id| self.client.get_room(&id)) {
-            Some(room) => self.typing_start(session, room, true),
-            None => debug!(room = %event.room_id, "no room object for the typing notice"),
-        }
+        };
+        let room = room.clone();
+        tokio::spawn(async move {
+            let receipts = Receipts::new().fully_read_marker(event_id.clone()).public_read_receipt(event_id);
+            if let Err(err) = room.send_multiple_receipts(receipts).await {
+                debug!(room = %room.room_id(), "read marker failed: {err}");
+            }
+        });
     }
 
     /// Keep sending the typing notice in a room until the reply goes out or the cap.

@@ -197,7 +197,7 @@ async fn with_relation(
     }
 }
 
-/// The typing indicator runs from delivery until the session's first visible action
+/// The typing indicator runs from the acknowledgement until the session's first visible action
 /// in the room; every command that sends something ends it.
 async fn stop_typing(daemon: &Daemon, room: &Room) {
     daemon.typing_stop(room.room_id());
