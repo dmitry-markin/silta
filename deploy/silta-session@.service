@@ -24,6 +24,10 @@ Environment=SILTA_SOCKET=/run/siltad/siltad.sock
 Environment=SILTA_PERSONA=/etc/silta/persona.md
 Environment=SILTA_CLAUDE_BIN=/usr/bin/silta-claude
 Environment=SILTA_SESSION_LOG=/usr/lib/silta/silta-session-log
+# How long silta-session waits for claude to finish its turn and exit after stdin is
+# closed, before killing it. Kept below TimeoutStopSec so the script, not systemd,
+# is the one that ends the session.
+Environment=SILTA_STOP_GRACE=120
 # Claude Code: the install owned by the claude user, read-only here, never updating
 # itself. CLAUDE_BIN may name /opt/claude/.local/share/claude/versions/<n> to pin one.
 Environment=CLAUDE_BIN=/opt/claude/.local/bin/claude
@@ -41,7 +45,7 @@ RestartSec=10
 RestartSteps=6
 RestartMaxDelaySec=10min
 KillMode=mixed
-TimeoutStopSec=30
+TimeoutStopSec=150
 MemoryMax=2G
 TasksMax=512
 

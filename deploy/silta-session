@@ -4,13 +4,13 @@
 # From the unit: SILTA_SESSION (the instance name), HOME (the state directory), the
 # credential oauth-token, and the pins SILTA_MODEL, SILTA_EFFORT, SILTA_FALLBACK_MODEL.
 # Overridable: SILTA_SOCKET, SILTA_PERSONA, SILTA_CLAUDE_BIN, SILTA_SESSION_LOG,
-# CLAUDE_BIN. The workspace is $HOME/workspace with inbox/ and out/. The session id is
-# chosen here on the first start (--session-id), saved in $HOME/session-id and resumed
-# afterwards as long as its transcript exists under $HOME/.claude/projects. Claude
-# Code's stdout (stream-json) goes through silta-session-log to the journal: the
-# operational lines stay, the conversation's texts do not. Its stderr goes to the
-# journal and to $HOME/session.err (truncated at every start), which decides after an
-# exit whether the saved id can still be resumed.
+# SILTA_STOP_GRACE, CLAUDE_BIN. The workspace is $HOME/workspace with inbox/ and out/.
+# The session id is chosen here on the first start (--session-id), saved in
+# $HOME/session-id and resumed afterwards as long as its transcript exists under
+# $HOME/.claude/projects. Claude Code's stdout (stream-json) goes through
+# silta-session-log to the journal: the operational lines stay, the conversation's texts
+# do not. Its stderr goes to the journal and to $HOME/session.err (truncated at every
+# start), which decides after an exit whether the saved id can still be resumed.
 #
 # stdin is a FIFO this script holds open, one initial user message
 # starts the first turn, channel events arrive as turns; closing the FIFO ends the
@@ -22,6 +22,9 @@ workspace="$state/workspace"
 persona="${SILTA_PERSONA:-/etc/silta/persona.md}"
 claude_bin="${CLAUDE_BIN:-/opt/claude/.local/bin/claude}"
 log_filter="${SILTA_SESSION_LOG:-/usr/lib/silta/silta-session-log}"
+# Seconds to wait after closing stdin before killing claude; must stay below the unit's
+# TimeoutStopSec, which kills the whole cgroup once it runs out.
+stop_grace="${SILTA_STOP_GRACE:-120}"
 export SILTA_CLAUDE_BIN="${SILTA_CLAUDE_BIN:-/usr/bin/silta-claude}"
 export SILTA_SOCKET="${SILTA_SOCKET:-/run/siltad/siltad.sock}"
 export SILTA_INBOX="$workspace/inbox"
@@ -90,8 +93,8 @@ printf '%s\n' "$initial" >&3
 
 stop() {
   exec 3>&-
-  for _ in $(seq 1 150); do kill -0 "$pid" 2>/dev/null || exit 0; sleep 0.1; done
-  echo "claude did not exit on stdin EOF within 15 s, killing it" >&2
+  for _ in $(seq 1 $((stop_grace * 10))); do kill -0 "$pid" 2>/dev/null || exit 0; sleep 0.1; done
+  echo "claude did not exit on stdin EOF within $stop_grace s, killing it" >&2
   kill -9 "$pid" 2>/dev/null || true
 }
 trap stop INT TERM
