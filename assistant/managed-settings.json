@@ -8,7 +8,7 @@
   "disableSideloadFlags": true,
   "disableSkillShellExecution": true,
   "allowManagedMcpServersOnly": true,
-  "allowedMcpServers": [ "plugin:silta-claude:silta" ],
+  "allowedMcpServers": [ { "serverName": "plugin:silta-claude:silta" } ],
   "strictKnownMarketplaces": [
     { "source": "directory", "path": "/usr/share/silta/marketplace" },
     { "source": "skills-dir" }
