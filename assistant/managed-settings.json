@@ -4,6 +4,22 @@
     { "marketplace": "silta-local", "plugin": "silta-claude" }
   ],
   "disableRemoteControl": true,
+  "allowManagedHooksOnly": true,
+  "disableSideloadFlags": true,
+  "disableSkillShellExecution": true,
+  "allowManagedMcpServersOnly": true,
+  "allowedMcpServers": [ "plugin:silta-claude:silta" ],
+  "disableClaudeAiConnectors": true,
+  "syncClaudeAiSkills": false,
+  "syncClaudeAiPlugins": false,
+  "autoUploadSessions": false,
+  "enableArtifact": false,
+  "crossSessionInbound": "refuse",
+  "isolatePeerMachines": true,
+  "disableAgentView": true,
+  "feedbackDrafts": "off",
+  "attribution": { "sessionUrl": false },
+  "remoteControl": { "shareHostProfile": "off" },
   "sandbox": {
     "enabled": true,
     "failIfUnavailable": true,
@@ -14,6 +30,7 @@
     }
   },
   "permissions": {
+    "disableBypassPermissionsMode": "disable",
     "deny": [
       "Read(//run/credentials/**)",
       "Read(//proc/**)",
