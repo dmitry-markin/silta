@@ -9,6 +9,10 @@
   "disableSkillShellExecution": true,
   "allowManagedMcpServersOnly": true,
   "allowedMcpServers": [ "plugin:silta-claude:silta" ],
+  "strictKnownMarketplaces": [
+    { "source": "directory", "path": "/usr/share/silta/marketplace" },
+    { "source": "skills-dir" }
+  ],
   "disableClaudeAiConnectors": true,
   "syncClaudeAiSkills": false,
   "syncClaudeAiPlugins": false,
