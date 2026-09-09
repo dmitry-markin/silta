@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Clears the Remote Control bridge a mind's conversation remembers:
+#   silta-session-clear-rc-bridge <name>
+#
+# As root, with the mind stopped. Claude Code keeps the bridge of a Remote Control
+# session in the transcript itself, as `{"type":"bridge-session", ...}` lines, and the
+# last one for a session id wins when the transcript is replayed: on `--resume` it
+# reattaches the bridge, and the conversation is on claude.ai again. That path never
+# looks at `remoteControlAtStartup`, which decides new sessions only, so a mind that was
+# connected once keeps reconnecting until the record is cleared. `disableRemoteControl`
+# in the managed settings stops the bridge before any of it runs; this script removes
+# what a mind still carries from before.
+#
+# Clearing is what Claude Code does itself when Remote Control is switched off in a
+# session: one more line with an empty bridgeSessionId, which replays as "no bridge".
+# Nothing is deleted and the conversation is untouched. Only the transcript of the
+# session in session-id is cleared, the one a start resumes; older transcripts a
+# rotation left behind are not resumed and stay as they are.
+#
+# It touches no unit. The mind has to be stopped, because a running session appends its
+# own record after ours; the script refuses while the unit is active and prints the
+# commands.
+set -euo pipefail
+name="${1:-}"
+if [ -z "$name" ] || ! [[ "$name" =~ ^[a-z][a-z0-9-]*$ ]]; then
+  echo "usage: silta-session-clear-rc-bridge <name>    (the session name in siltad.toml)" >&2
+  exit 2
+fi
+[ "$(id -u)" = 0 ] || { echo "silta-session-clear-rc-bridge: run as root" >&2; exit 1; }
+home="/var/lib/silta/$name"
+[ -d "$home" ] || { echo "silta-session-clear-rc-bridge: no mind $name ($home is missing)" >&2; exit 1; }
+
+if systemctl is-active --quiet "silta-session@$name.service"; then
+  echo "silta-session-clear-rc-bridge: silta-session@$name.service is running; a live session would" >&2
+  echo "  append its own record after this one. Stop it, clear, start it again:" >&2
+  echo "    systemctl stop silta-session@$name.service" >&2
+  echo "    silta-session-clear-rc-bridge $name" >&2
+  echo "    systemctl start silta-session@$name.service" >&2
+  exit 1
+fi
+
+idfile="$home/session-id"
+[ -s "$idfile" ] || { echo "$name has no session-id yet: no conversation to clear"; exit 0; }
+sid=$(tr -d '[:space:]' < "$idfile")
+shopt -s nullglob
+transcripts=("$home/.claude/projects"/*/"$sid.jsonl")
+shopt -u nullglob
+if [ "${#transcripts[@]}" = 0 ]; then
+  echo "session $sid of $name has no transcript under $home/.claude/projects: nothing to clear"
+  exit 0
+fi
+transcript="${transcripts[0]}"
+
+# The last bridge-session line decides; an empty bridgeSessionId in it means the bridge
+# is already cleared. Claude Code writes one line per record, so grep and tail are enough.
+last=$(grep '"type": *"bridge-session"' "$transcript" | tail -1 || true)
+bridge=""
+[ -n "$last" ] && bridge=$(printf '%s' "$last" | grep -o '"bridgeSessionId": *"[^"]*"' | sed 's/.*: *"//; s/"$//' || true)
+if [ -z "$bridge" ]; then
+  if [ -n "$last" ]; then
+    echo "session $sid of $name has no bridge (already cleared)"
+  else
+    echo "session $sid of $name was never bridged"
+  fi
+  exit 0
+fi
+
+# Appended as root: the transcript keeps its owner and mode, so the mind writes on.
+printf '{"type":"bridge-session","sessionId":"%s","bridgeSessionId":"","lastSequenceNum":0}\n' \
+  "$sid" >> "$transcript"
+echo "cleared bridge $bridge of session $sid in $transcript"
+echo "start the mind again: systemctl start silta-session@$name.service"

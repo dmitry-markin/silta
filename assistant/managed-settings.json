@@ -3,6 +3,7 @@
   "allowedChannelPlugins": [
     { "marketplace": "silta-local", "plugin": "silta-claude" }
   ],
+  "disableRemoteControl": true,
   "sandbox": {
     "enabled": true,
     "failIfUnavailable": true,
