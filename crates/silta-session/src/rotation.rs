@@ -9,9 +9,7 @@
 //! bound the two waits; the first expiry cuts the turn and resumes once for the
 //! handoff, the second gives up on it.
 //! A handoff turn that fails is retried after a pause, at most `HANDOFF_ATTEMPTS`
-//! times in all; a failure because the prompt exceeds the window is final at once,
-//! since no pause shrinks it. That signal is consulted only for the handoff turn's own
-//! failure and never starts or changes a rotation on its own.
+//! times in all.
 
 use std::{
     collections::BTreeSet,
@@ -65,8 +63,6 @@ pub enum Action {
 pub enum Reason {
     /// A cap expired again after the one cut-and-resume.
     CutTwice,
-    /// The handoff turn failed because the prompt exceeds the model's window.
-    PromptTooLong,
     /// `HANDOFF_ATTEMPTS` handoff turns failed.
     Failures,
 }
@@ -89,8 +85,6 @@ pub struct Tracker {
     not_before: Option<Instant>,
     retry_used: bool,
     failures: u32,
-    /// The prompt-too-long signal was seen in the turn in progress.
-    too_long: bool,
     /// The handoff note has been written since it was requested, as the supervisor
     /// found on disk before the turn's `result`.
     note_written: bool,
@@ -111,7 +105,6 @@ impl Tracker {
             not_before: None,
             retry_used: false,
             failures: 0,
-            too_long: false,
             note_written: true,
             phase: Phase::Idle,
         }
@@ -165,8 +158,7 @@ impl Tracker {
     }
 
     /// The background tasks still running, for the journal: Claude Code's level
-    /// signal replaces the set whenever it arrives, and the start and end edges keep it
-    /// current in between.
+    /// signal replaces the set whenever it arrives.
     pub fn agents(&self) -> &BTreeSet<String> {
         &self.agents
     }
@@ -195,19 +187,16 @@ impl Tracker {
 
     pub fn event(&mut self, event: &Event, now: Instant) -> Vec<Action> {
         match event {
-            Event::Assistant { context_tokens, prompt_too_long } => {
+            Event::Assistant { subagent, context_tokens } => {
                 self.turn = true;
-                self.too_long |= *prompt_too_long;
-                if let Some(n) = context_tokens {
+                if let (false, Some(n)) = (subagent, context_tokens) {
                     self.context = *n;
                 }
             }
             Event::User => self.turn = true,
-            Event::Result { is_error, prompt_too_long } => {
+            Event::Result { is_error } => {
                 self.turn = false;
                 self.last_result = now;
-                let too_long = self.too_long || *prompt_too_long;
-                self.too_long = false;
                 if let Phase::Handoff { .. } = self.phase {
                     if !*is_error && !self.note_written {
                         return vec![Action::AwaitHandoff];
@@ -215,8 +204,6 @@ impl Tracker {
                     self.phase = Phase::Idle;
                     return if !*is_error {
                         vec![Action::Rotate]
-                    } else if too_long {
-                        vec![Action::GiveUp { reason: Reason::PromptTooLong }]
                     } else {
                         self.failures += 1;
                         if self.failures >= HANDOFF_ATTEMPTS {
@@ -228,18 +215,10 @@ impl Tracker {
                     };
                 }
             }
-            Event::TaskStarted { id, background } => {
-                if *background {
-                    self.agents.insert(id.clone());
-                }
-            }
-            Event::TaskDone { id } => {
-                self.agents.remove(id);
-            }
             Event::BackgroundTasks { ids } => {
                 self.agents = ids.iter().cloned().collect();
             }
-            Event::Init { .. } | Event::Other => {}
+            Event::Init { .. } | Event::Compacted { .. } | Event::Other => {}
         }
         self.advance(now)
     }
@@ -319,13 +298,15 @@ mod tests {
     }
 
     fn assistant(context: u64) -> Event {
-        Event::Assistant { context_tokens: Some(context), prompt_too_long: false }
+        Event::Assistant { subagent: false, context_tokens: Some(context) }
     }
 
-    const OK: Event = Event::Result { is_error: false, prompt_too_long: false };
-    const ERR: Event = Event::Result { is_error: true, prompt_too_long: false };
-    const TOO_LONG: Event = Event::Assistant { context_tokens: Some(0), prompt_too_long: true };
-    const ERR_TOO_LONG: Event = Event::Result { is_error: true, prompt_too_long: true };
+    fn tasks(ids: &[&str]) -> Event {
+        Event::BackgroundTasks { ids: ids.iter().map(|s| s.to_string()).collect() }
+    }
+
+    const OK: Event = Event::Result { is_error: false };
+    const ERR: Event = Event::Result { is_error: true };
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
@@ -357,6 +338,10 @@ mod tests {
         tr.event(&assistant(100_000), t0);
         tr.event(&OK, t0);
         assert!(tr.tick(t0 + secs(10 * 3600)).is_empty());
+        // A subagent's prompt does not count.
+        tr.event(&Event::Assistant { subagent: true, context_tokens: Some(900_000) }, t0);
+        tr.event(&OK, t0);
+        assert!(tr.tick(t0 + secs(20 * 3600)).is_empty());
         // A turn that started 5 hours ago without a result: not idle.
         tr.event(&assistant(400_000), t0 + secs(3600));
         assert!(tr.tick(t0 + secs(10 * 3600)).is_empty());
@@ -369,28 +354,27 @@ mod tests {
         let mut tr = Tracker::new(limits(), t0);
         tr.event(&OK, t0);
         tr.event(&assistant(50_000), t0 + secs(1));
-        tr.event(&Event::TaskStarted { id: "a1".into(), background: true }, t0 + secs(2));
+        tr.event(&tasks(&["a1"]), t0 + secs(2));
         assert!(tr.marker_seen(t0 + secs(3)).is_empty());
         assert!(tr.is_pending());
         // Turn ends, the agent still runs: keep waiting.
         assert!(tr.event(&OK, t0 + secs(10)).is_empty());
         assert_eq!(tr.agents().len(), 1);
-        // The agent reports: quiet.
-        assert_eq!(tr.event(&Event::TaskDone { id: "a1".into() }, t0 + secs(20)), vec![Action::RequestHandoff]);
+        // The set is empty again: quiet.
+        assert_eq!(tr.event(&tasks(&[]), t0 + secs(20)), vec![Action::RequestHandoff]);
         // A second marker sighting changes nothing.
         assert!(tr.marker_seen(t0 + secs(21)).is_empty());
     }
 
     #[test]
-    fn foreground_agents_do_not_count_and_the_level_signal_replaces_the_set() {
+    fn the_level_signal_replaces_the_set() {
         let t0 = Instant::now();
         let mut tr = Tracker::new(limits(), t0);
-        tr.event(&Event::TaskStarted { id: "fg".into(), background: false }, t0);
-        tr.event(&Event::TaskStarted { id: "bg".into(), background: true }, t0);
+        tr.event(&tasks(&["a", "b"]), t0);
+        tr.event(&tasks(&["b"]), t0);
         assert_eq!(tr.event(&OK, t0 + secs(1)), vec![]);
-        assert_eq!(tr.agents().iter().collect::<Vec<_>>(), vec!["bg"]);
-        // The level signal says the set is empty: a missed completion cannot wedge it.
-        tr.event(&Event::BackgroundTasks { ids: vec![] }, t0 + secs(2));
+        assert_eq!(tr.agents().iter().collect::<Vec<_>>(), vec!["b"]);
+        tr.event(&tasks(&[]), t0 + secs(2));
         assert!(tr.quiet());
         assert_eq!(tr.marker_seen(t0 + secs(3)), vec![Action::RequestHandoff]);
     }
@@ -469,40 +453,6 @@ mod tests {
         assert_eq!(tr.tick(t0 + secs(900)), vec![Action::RequestHandoff]);
         tr.event(&assistant(50_000), t0 + secs(901));
         assert_eq!(tr.event(&ERR, t0 + secs(930)), vec![Action::GiveUp { reason: Reason::Failures }]);
-    }
-
-    #[test]
-    fn a_prompt_too_long_failure_of_the_handoff_turn_is_final_at_once() {
-        let t0 = Instant::now();
-        let mut tr = Tracker::new(limits(), t0);
-        tr.event(&OK, t0);
-        assert_eq!(tr.marker_seen(t0 + secs(1)), vec![Action::RequestHandoff]);
-        assert!(tr.event(&TOO_LONG, t0 + secs(2)).is_empty());
-        assert_eq!(tr.event(&ERR, t0 + secs(3)), vec![Action::GiveUp { reason: Reason::PromptTooLong }]);
-        // The same from the result's text alone.
-        let mut tr = Tracker::new(limits(), t0);
-        tr.event(&OK, t0);
-        tr.marker_seen(t0 + secs(1));
-        assert_eq!(tr.event(&ERR_TOO_LONG, t0 + secs(3)), vec![Action::GiveUp { reason: Reason::PromptTooLong }]);
-    }
-
-    #[test]
-    fn prompt_too_long_outside_the_handoff_turn_changes_nothing() {
-        let t0 = Instant::now();
-        let mut tr = Tracker::new(limits(), t0);
-        // In the start turn, with no rotation pending: nothing.
-        assert!(tr.event(&TOO_LONG, t0 + secs(1)).is_empty());
-        assert!(tr.event(&ERR_TOO_LONG, t0 + secs(2)).is_empty());
-        assert!(!tr.is_pending());
-        assert!(tr.tick(t0 + secs(10)).is_empty());
-        // While waiting for quiet: the turn's error is a turn end, the handoff is still
-        // requested, and the earlier signal does not carry into it.
-        tr.event(&assistant(50_000), t0 + secs(20));
-        tr.marker_seen(t0 + secs(21));
-        tr.event(&TOO_LONG, t0 + secs(22));
-        assert_eq!(tr.event(&ERR_TOO_LONG, t0 + secs(23)), vec![Action::RequestHandoff]);
-        tr.event(&assistant(50_000), t0 + secs(24));
-        assert_eq!(tr.event(&ERR, t0 + secs(25)), vec![Action::Postpone { failures: 1 }]);
     }
 
     #[test]

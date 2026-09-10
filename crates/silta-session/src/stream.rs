@@ -14,26 +14,22 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// The `system init` line of a start.
-    Init { session_id: String },
-    /// An assistant message. `context_tokens` is the size of the prompt of the API call
-    /// that produced it (input plus cache read plus cache creation), `None` for a
-    /// subagent's message or a line without usage. `prompt_too_long` marks the
-    /// synthetic message Claude Code emits when the API refused the prompt for its size.
-    Assistant { context_tokens: Option<u64>, prompt_too_long: bool },
+    Init { session_id: String, version: String },
+    /// An assistant message. `subagent` marks a line of a subagent (a
+    /// `parent_tool_use_id`). `context_tokens` is the size of the prompt of the API call
+    /// that produced it (input plus cache read plus cache creation); `None` on a
+    /// main-line message means the usage is missing, which the contract check reports.
+    Assistant { subagent: bool, context_tokens: Option<u64> },
     /// A user message: a tool result or a delivered message; a turn is in progress.
     User,
-    /// The end of a turn; `prompt_too_long` when its error text is the API's refusal
-    /// of the prompt for its size.
-    Result { is_error: bool, prompt_too_long: bool },
-    /// A task was registered; `background` is false for a foreground agent, whose
-    /// tool call blocks the turn on it.
-    TaskStarted { id: String, background: bool },
-    /// A task reported its end (any status).
-    TaskDone { id: String },
+    /// The end of a turn.
+    Result { is_error: bool },
     /// Every live background task after a change, replacing what was known before
     /// (Claude Code's level signal, which cannot be wedged by a missed edge). Ambient
     /// tasks, which live as long as the session, are left out.
     BackgroundTasks { ids: Vec<String> },
+    /// Claude Code compacted the conversation; `auto` when on its own.
+    Compacted { auto: bool },
     /// Anything else.
     Other,
 }
@@ -46,15 +42,11 @@ pub fn read(line: &str) -> (String, Event) {
     let kind = map.get("type").and_then(Value::as_str).unwrap_or("?");
     match kind {
         "system" => (system(&map), system_event(&map)),
-        "assistant" => (
-            message("assistant", &map),
-            Event::Assistant { context_tokens: context_of(&map), prompt_too_long: assistant_too_long(&map) },
-        ),
+        "assistant" => (message("assistant", &map), Event::Assistant { subagent: subagent(&map), context_tokens: context_of(&map) }),
         "user" => (message("user", &map), Event::User),
         "result" => {
             let is_error = map.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-            let prompt_too_long = is_error && map.get("result").and_then(Value::as_str).is_some_and(api_too_long);
-            (result(&map), Event::Result { is_error, prompt_too_long })
+            (result(&map), Event::Result { is_error })
         }
         "stream_event" => {
             let event = map.get("event").and_then(|e| e.get("type")).and_then(Value::as_str).unwrap_or("?");
@@ -77,17 +69,14 @@ fn summarize(line: &str) -> String {
 }
 
 fn system_event(map: &Map<String, Value>) -> Event {
-    let id = || {
-        map.get("task_id")
-            .or_else(|| map.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or("?")
-            .to_owned()
-    };
     match map.get("subtype").and_then(Value::as_str) {
-        Some("init") => Event::Init { session_id: str_of(map, "session_id").to_owned() },
-        Some("task_started") => Event::TaskStarted { id: id(), background: map.get("is_backgrounded").and_then(Value::as_bool) != Some(false) },
-        Some("task_notification") => Event::TaskDone { id: id() },
+        Some("init") => Event::Init {
+            session_id: str_of(map, "session_id").to_owned(),
+            version: str_of(map, "claude_code_version").to_owned(),
+        },
+        Some("compact_boundary") => Event::Compacted {
+            auto: map.get("compact_metadata").and_then(|m| m.get("trigger")).and_then(Value::as_str) == Some("auto"),
+        },
         Some("background_tasks_changed") => Event::BackgroundTasks {
             ids: map
                 .get("tasks")
@@ -105,34 +94,13 @@ fn system_event(map: &Map<String, Value>) -> Event {
     }
 }
 
-/// Claude Code's own signal of a prompt the API refused for its size (read from the
-/// bundle of 2.1.267 and a transcript of 2026-09-09; re-check on an upgrade): the
-/// synthetic assistant message it emits in place of the answer starts with this text,
-/// followed by what it tried ("· automatic compaction failed: …").
-const PROMPT_TOO_LONG_PREFIX: &str = "prompt is too long";
-
-/// The API's own wordings, which Claude Code matches case-insensitively.
-const PROMPT_TOO_LONG_API: [&str; 2] = ["prompt is too long", "input is too long for requested model"];
-
-fn assistant_too_long(map: &Map<String, Value>) -> bool {
-    let Some(Value::Array(blocks)) = map.get("message").and_then(|m| m.get("content")) else { return false };
-    blocks
-        .iter()
-        .find(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-        .and_then(|b| b.get("text").and_then(Value::as_str))
-        .is_some_and(|t| t.trim_start().to_lowercase().starts_with(PROMPT_TOO_LONG_PREFIX))
+/// A line of a subagent's conversation rather than the main one.
+fn subagent(map: &Map<String, Value>) -> bool {
+    map.get("parent_tool_use_id").is_some_and(|v| !v.is_null())
 }
 
-fn api_too_long(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    PROMPT_TOO_LONG_API.iter().any(|needle| lower.contains(needle))
-}
-
-/// The prompt size of the call behind a main-line assistant message.
+/// The prompt size of the call behind an assistant message, if the line carries usage.
 fn context_of(map: &Map<String, Value>) -> Option<u64> {
-    if map.get("parent_tool_use_id").is_some_and(|v| !v.is_null()) {
-        return None;
-    }
     let usage = map.get("message")?.get("usage")?;
     let n = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     Some(n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens"))
@@ -235,11 +203,10 @@ fn message(role: &str, map: &Map<String, Value>) -> String {
     if let Some(stop) = message.and_then(|m| m.get("stop_reason")).and_then(Value::as_str) {
         parts.push(format!("stop {stop}"));
     }
-    if let Some(context) = context_of(map) {
-        parts.push(format!("context {context}"));
-    }
-    if role == "assistant" && assistant_too_long(map) {
-        parts.push("API error: prompt too long".to_owned());
+    if role == "assistant" && !subagent(map) {
+        if let Some(context) = context_of(map) {
+            parts.push(format!("context {context}"));
+        }
     }
     format!("{role}: {}", parts.join(", "))
 }
@@ -306,7 +273,7 @@ mod tests {
             summarize(line),
             "system init: session af92, model claude-opus-5, Claude Code 2.1.263, permission mode auto, 3 tools, 1 mcp servers, 0 plugins"
         );
-        assert_eq!(read(line).1, Event::Init { session_id: "af92".into() });
+        assert_eq!(read(line).1, Event::Init { session_id: "af92".into(), version: "2.1.263".into() });
     }
 
     #[test]
@@ -319,11 +286,10 @@ mod tests {
         assert_eq!(read(line).1, Event::Other);
         let task = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"Agent finished: the private answer","session_id":"af92"}"#;
         assert_eq!(summarize(task), "system task_notification: status=completed task_id=t1");
-        assert_eq!(read(task).1, Event::TaskDone { id: "t1".into() });
-        let started = r#"{"type":"system","subtype":"task_started","task_id":"t1","description":"look things up","is_backgrounded":true,"session_id":"af92"}"#;
-        assert_eq!(read(started).1, Event::TaskStarted { id: "t1".into(), background: true });
-        let foreground = r#"{"type":"system","subtype":"task_started","task_id":"t2","description":"look","is_backgrounded":false,"session_id":"af92"}"#;
-        assert_eq!(read(foreground).1, Event::TaskStarted { id: "t2".into(), background: false });
+        assert_eq!(read(task).1, Event::Other);
+        let compacted = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":167000},"session_id":"af92"}"#;
+        assert_eq!(summarize(compacted), "system compact_boundary: ");
+        assert_eq!(read(compacted).1, Event::Compacted { auto: true });
         let changed = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"t1","task_type":"local_agent","description":"look things up"},{"task_id":"m1","task_type":"monitor_ws","description":"watch","ambient":true}],"session_id":"af92"}"#;
         assert_eq!(summarize(changed), "system background_tasks_changed: tasks=2");
         assert_eq!(read(changed).1, Event::BackgroundTasks { ids: vec!["t1".into()] });
@@ -337,9 +303,13 @@ mod tests {
         let (s, event) = read(assistant);
         assert_eq!(s, "assistant: 1 text (23 bytes), tool_use mcp__plugin_silta-claude_silta__reply, model claude-opus-5, stop tool_use, context 37250");
         assert!(!s.contains("secret"));
-        assert_eq!(event, Event::Assistant { context_tokens: Some(37250), prompt_too_long: false });
+        assert_eq!(event, Event::Assistant { subagent: false, context_tokens: Some(37250) });
         let subagent = r#"{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":0}},"parent_tool_use_id":"toolu_1"}"#;
-        assert_eq!(read(subagent).1, Event::Assistant { context_tokens: None, prompt_too_long: false });
+        let (s, event) = read(subagent);
+        assert_eq!(event, Event::Assistant { subagent: true, context_tokens: Some(105) });
+        assert!(!s.contains("context"), "{s}");
+        let no_usage = r#"{"type":"assistant","message":{"role":"assistant","content":[]},"parent_tool_use_id":null}"#;
+        assert_eq!(read(no_usage).1, Event::Assistant { subagent: false, context_tokens: None });
         let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"sent","is_error":false},{"type":"tool_result","tool_use_id":"y","content":[{"type":"text","text":"boom"}],"is_error":true}]}}"#;
         assert_eq!(summarize(user), "user: 2 tool_result (8 bytes, 1 failed)");
         assert_eq!(read(user).1, Event::User);
@@ -355,32 +325,13 @@ mod tests {
         let (s, event) = read(ok);
         assert_eq!(s, "result success: 3 turns, 8123 ms (api 7000 ms), tokens in 12 out 345 cache read 250000 write 1000, cost $0.0421");
         assert!(!s.contains("private"));
-        assert_eq!(event, Event::Result { is_error: false, prompt_too_long: false });
+        assert_eq!(event, Event::Result { is_error: false });
         let err = r#"{"type":"result","subtype":"success","is_error":true,"num_turns":1,"duration_ms":2000,"duration_api_ms":0,"result":"Failed to authenticate. API Error: 401 OAuth access token is invalid.","total_cost_usd":0,"usage":{},"permission_denials":[{"tool_name":"Bash"}]}"#;
         assert_eq!(
             summarize(err),
             "result success ERROR: 1 turns, 2000 ms (api 0 ms), tokens in 0 out 0 cache read 0 write 0, cost $0.0000, 1 permission denials; Failed to authenticate. API Error: 401 OAuth access token is invalid."
         );
-        assert_eq!(read(err).1, Event::Result { is_error: true, prompt_too_long: false });
-    }
-
-    #[test]
-    fn the_prompt_too_long_signal_is_recognised_in_both_places() {
-        // The text of a real occurrence (a Silta transcript of 2026-09-09).
-        let assistant = r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"Prompt is too long · automatic compaction failed: There's an issue with the selected model (opus5). It may not exist or you may not have access to it. Run --model to pick a different model."}],"usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"parent_tool_use_id":null}"#;
-        let (s, event) = read(assistant);
-        assert_eq!(event, Event::Assistant { context_tokens: Some(0), prompt_too_long: true });
-        assert!(s.ends_with("API error: prompt too long"), "{s}");
-        assert!(!s.contains("opus5"));
-        // A reply that merely mentions it is not the signal.
-        let chat = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I saw a 'prompt is too long' error earlier."}]}}"#;
-        assert_eq!(read(chat).1, Event::Assistant { context_tokens: None, prompt_too_long: false });
-        let api = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"API Error: 400 invalid_request_error: prompt is too long: 1013456 tokens > 1000000 maximum","usage":{}}"#;
-        assert_eq!(read(api).1, Event::Result { is_error: true, prompt_too_long: true });
-        let other = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Input is too long for requested model.","usage":{}}"#;
-        assert_eq!(read(other).1, Event::Result { is_error: true, prompt_too_long: true });
-        let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"prompt is too long, I shortened it","usage":{}}"#;
-        assert_eq!(read(ok).1, Event::Result { is_error: false, prompt_too_long: false });
+        assert_eq!(read(err).1, Event::Result { is_error: true });
     }
 
     #[test]

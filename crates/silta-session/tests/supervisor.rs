@@ -269,44 +269,7 @@ async fn two_failed_handoff_turns_give_the_handoff_up() {
 }
 
 #[tokio::test]
-async fn prompt_too_long_is_final_in_the_handoff_turn_and_inert_elsewhere() {
-    let fx = Fixture::new("toolong");
-    fx.set("fake-context", "10");
-    fx.set("fake-mode", "toolong");
-    let cfg = fx.config();
-    let stop = CancellationToken::new();
-    let run = tokio::spawn({
-        let cfg = cfg.clone();
-        let stop = stop.clone();
-        async move { silta_session::run(&cfg, stop).await }
-    });
-    // The start turn itself fails with the message, and nothing is pending: the
-    // session stays as it is.
-    fx.until(10, |l| l.contains("line Session test started")).await;
-    let first = fx.id();
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    let log = fx.log();
-    assert_eq!(starts(&log).len(), 1);
-    assert!(!log.contains(handoff()));
-    assert!(!fx.home.join("rotate-requested").exists());
-    // Now a rotation is pending: the handoff turn fails the same way, and that is
-    // final at once, no pause, no resume.
-    fx.set("rotate-requested", "test");
-    let log = fx.until(15, |l| starts(l).len() == 2).await;
-    assert_eq!(log.matches(handoff()).count(), 1);
-    assert_ne!(fx.id(), first);
-    assert_eq!(starts(&log)[1], format!("start {} ", fx.id()), "fresh, not resumed");
-    // The fake logs its start before it reads the start line, so wait for the line.
-    fx.until(10, |l| l.contains("could not finish its handoff")).await;
-    assert!(!fx.home.join("rotate-requested").exists());
-    assert!(!fx.home.join("rotation.json").exists());
-    stop.cancel();
-    assert_eq!(run.await.unwrap(), 0);
-    fs::remove_dir_all(&fx.home).unwrap();
-}
-
-#[tokio::test]
-async fn the_rotation_waits_for_background_tasks_but_not_for_foreground_agents() {
+async fn the_rotation_waits_for_background_tasks() {
     let fx = Fixture::new("agents");
     fx.set("fake-context", "10");
     let cfg = fx.config();
@@ -320,11 +283,10 @@ async fn the_rotation_waits_for_background_tasks_but_not_for_foreground_agents()
     stop.cancel();
     assert_eq!(run.await.unwrap(), 0);
     let first = fx.id();
-    // A rotation is pending at the next start, whose start turn launches a foreground
-    // agent that never reports and a background one that the level signal drops two
-    // seconds later, within the quiet cap. The handoff must follow that signal: not
-    // requested while the background agent runs, and not after a cut for the foreground
-    // one.
+    // A rotation is pending at the next start, whose start turn launches a background
+    // agent that the level signal drops two seconds later, within the quiet cap. The
+    // handoff must follow that signal: not requested while the agent runs, and not
+    // after a cut.
     fx.set("fake-mode", "agents");
     fx.set("rotate-requested", "test");
     let stop = CancellationToken::new();
