@@ -57,6 +57,8 @@
       "Edit(//var/lib/silta/*/.config/**)",
       "Edit(//var/lib/silta/*/.local/**)",
       "Edit(//var/lib/silta/*/session-id)",
+      "Edit(//var/lib/silta/*/session.err)",
+      "Edit(//var/lib/silta/*/session.fifo)",
       "Edit(//var/lib/silta/*/rotate-requested)",
       "Edit(//var/lib/silta/*/rotation.json)",
       "Edit(//var/lib/silta/*/backups/**)"
