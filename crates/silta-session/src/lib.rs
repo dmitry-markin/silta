@@ -311,10 +311,16 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
                     }
                 } else {
                     ticks += 1;
-                    if cfg.limits.enabled && ticks.is_multiple_of(5) && !run.tracker.is_pending() && paths.marker_exists() {
-                        eprintln!("rotation: marker found; rotating at the next quiet moment");
-                        let actions = run.tracker.marker_seen(now);
-                        run.act(actions).await;
+                    if cfg.limits.enabled && ticks.is_multiple_of(5) {
+                        let marker = paths.marker_exists();
+                        if marker && !run.tracker.is_pending() {
+                            eprintln!("rotation: marker found; rotating at the next quiet moment");
+                            let actions = run.tracker.marker_seen(now);
+                            run.act(actions).await;
+                        } else if !marker && run.tracker.cancel() {
+                            eprintln!("rotation: marker removed; the pending rotation is cancelled");
+                            let _ = paths.write_next(Next::Normal);
+                        }
                     }
                     let actions = run.tracker.tick(now);
                     run.act(actions).await;

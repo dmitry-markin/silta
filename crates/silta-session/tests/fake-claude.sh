@@ -4,8 +4,10 @@
 # Code, and logs what it was started with and every line it received to HOME/fake.log.
 # HOME/fake-mode (read per turn) is ok (default), error (the turn ends with an error
 # result), toolong (Claude Code's prompt-too-long message, then an error result), hang
-# (the turn never ends) or noresume (a --resume is refused). HOME/fake-context
-# is the context size reported in every assistant line.
+# (the turn never ends), agents (the turn starts a foreground agent that never reports
+# a completion and a background one that reports it two seconds after the turn, through
+# the level signal alone) or noresume (a --resume is refused). HOME/fake-context is the
+# context size reported in every assistant line.
 set -u
 id=""; resume=""
 while [ $# -gt 0 ]; do
@@ -33,6 +35,13 @@ while IFS= read -r line; do
   echo "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"usage\":{\"input_tokens\":1,\"cache_read_input_tokens\":$context,\"cache_creation_input_tokens\":0}},\"parent_tool_use_id\":null}"
   case "$(mode)" in
     hang) sleep 30; exit 0 ;;
+    agents)
+      echo '{"type":"system","subtype":"task_started","task_id":"fg1","description":"foreground","is_backgrounded":false}'
+      echo '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bg1","task_type":"local_agent","description":"background"}]}'
+      echo '{"type":"system","subtype":"task_started","task_id":"bg1","description":"background","is_backgrounded":true}'
+      ( sleep 2; echo "background done" >> "$HOME/fake.log"; echo '{"type":"system","subtype":"background_tasks_changed","tasks":[]}' ) &
+      echo ok > "$HOME/fake-mode"
+      ;;
     error) echo '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"result":"API Error: 529 overloaded","usage":{}}'; continue ;;
     toolong)
       echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Prompt is too long · automatic compaction failed: There is an issue with the selected model (opus5)."}],"usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"parent_tool_use_id":null}'

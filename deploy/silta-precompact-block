@@ -7,10 +7,11 @@
 # compaction, and the line on stderr lands in the session's context. Outside a mind
 # (no SILTA_SESSION: the owner's own sessions on a host with the packaged settings) the
 # compaction is allowed, as it is when the marker cannot be written or when rotation is
-# switched off for the mind (SILTA_ROTATE=0 in its unit, inherited from the supervisor).
+# switched off for the mind (SILTA_ROTATE=0 in its unit, inherited from the supervisor;
+# the spellings accepted here are the supervisor's, so that the two never disagree).
 set -u
 [ -n "${SILTA_SESSION:-}" ] || exit 0
-[ "${SILTA_ROTATE:-1}" != 0 ] || exit 0
+case "$(printf '%s' "${SILTA_ROTATE:-1}" | tr '[:upper:]' '[:lower:]')" in 0|false|no|off) exit 0;; esac
 state="${STATE_DIRECTORY:-$HOME}"
 input=$(cat)
 printf '%s\n' "$input" > "$state/rotate-requested.tmp" && mv "$state/rotate-requested.tmp" "$state/rotate-requested" || exit 0

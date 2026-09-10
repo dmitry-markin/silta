@@ -25,10 +25,15 @@ pub enum Event {
     /// The end of a turn; `prompt_too_long` when its error text is the API's refusal
     /// of the prompt for its size.
     Result { is_error: bool, prompt_too_long: bool },
-    /// A background agent was started.
-    TaskStarted { id: String },
-    /// A background agent reported its end (any status).
+    /// A task was registered; `background` is false for a foreground agent, whose
+    /// tool call blocks the turn on it.
+    TaskStarted { id: String, background: bool },
+    /// A task reported its end (any status).
     TaskDone { id: String },
+    /// Every live background task after a change, replacing what was known before
+    /// (Claude Code's level signal, which cannot be wedged by a missed edge). Ambient
+    /// tasks, which live as long as the session, are left out.
+    BackgroundTasks { ids: Vec<String> },
     /// Anything else.
     Other,
 }
@@ -81,8 +86,21 @@ fn system_event(map: &Map<String, Value>) -> Event {
     };
     match map.get("subtype").and_then(Value::as_str) {
         Some("init") => Event::Init { session_id: str_of(map, "session_id").to_owned() },
-        Some("task_started") => Event::TaskStarted { id: id() },
+        Some("task_started") => Event::TaskStarted { id: id(), background: map.get("is_backgrounded").and_then(Value::as_bool) != Some(false) },
         Some("task_notification") => Event::TaskDone { id: id() },
+        Some("background_tasks_changed") => Event::BackgroundTasks {
+            ids: map
+                .get("tasks")
+                .and_then(Value::as_array)
+                .map(|tasks| {
+                    tasks
+                        .iter()
+                        .filter(|t| t.get("ambient").and_then(Value::as_bool) != Some(true))
+                        .filter_map(|t| t.get("task_id").and_then(Value::as_str).map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        },
         _ => Event::Other,
     }
 }
@@ -135,10 +153,10 @@ fn system(map: &Map<String, Value>) -> String {
         );
     }
     // Other system lines are short and operational (api_retry with its status, compaction
-    // boundaries); keep their scalar fields, drop nested content and the ids. A string
-    // stays only when it is an identifier or an enum (no whitespace): a task
-    // notification's summary or a hook's output is prose that may carry the
-    // conversation's content.
+    // boundaries); keep their scalar fields and the size of lists, drop nested content
+    // and the ids. A string stays only when it is an identifier or an enum (no
+    // whitespace): a task notification's summary or a hook's output is prose that may
+    // carry the conversation's content.
     let mut parts = Vec::new();
     for (key, value) in map {
         if matches!(key.as_str(), "type" | "subtype" | "session_id" | "uuid") {
@@ -148,6 +166,7 @@ fn system(map: &Map<String, Value>) -> String {
             Value::String(s) if !s.contains(char::is_whitespace) => parts.push(format!("{key}={}", shorten(s, 200))),
             Value::Number(n) => parts.push(format!("{key}={n}")),
             Value::Bool(b) => parts.push(format!("{key}={b}")),
+            Value::Array(items) => parts.push(format!("{key}={}", items.len())),
             _ => {}
         }
     }
@@ -301,8 +320,15 @@ mod tests {
         let task = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"Agent finished: the private answer","session_id":"af92"}"#;
         assert_eq!(summarize(task), "system task_notification: status=completed task_id=t1");
         assert_eq!(read(task).1, Event::TaskDone { id: "t1".into() });
-        let started = r#"{"type":"system","subtype":"task_started","task_id":"t1","description":"look things up","session_id":"af92"}"#;
-        assert_eq!(read(started).1, Event::TaskStarted { id: "t1".into() });
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"t1","description":"look things up","is_backgrounded":true,"session_id":"af92"}"#;
+        assert_eq!(read(started).1, Event::TaskStarted { id: "t1".into(), background: true });
+        let foreground = r#"{"type":"system","subtype":"task_started","task_id":"t2","description":"look","is_backgrounded":false,"session_id":"af92"}"#;
+        assert_eq!(read(foreground).1, Event::TaskStarted { id: "t2".into(), background: false });
+        let changed = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"t1","task_type":"local_agent","description":"look things up"},{"task_id":"m1","task_type":"monitor_ws","description":"watch","ambient":true}],"session_id":"af92"}"#;
+        assert_eq!(summarize(changed), "system background_tasks_changed: tasks=2");
+        assert_eq!(read(changed).1, Event::BackgroundTasks { ids: vec!["t1".into()] });
+        let none = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"session_id":"af92"}"#;
+        assert_eq!(read(none).1, Event::BackgroundTasks { ids: vec![] });
     }
 
     #[test]

@@ -3,9 +3,10 @@
 //!
 //! A rotation is pending once the marker exists (written by the pre-compaction hook
 //! or by the supervisor's own threshold). It proceeds at the first quiet moment, no
-//! turn in progress and no background agent outstanding, with a handoff request, and
-//! ends with the handoff turn's `result`. Two caps bound the two waits; the first
-//! expiry cuts the turn and resumes once for the handoff, the second gives up on it.
+//! turn in progress and no background task (an agent, a command) outstanding, with a
+//! handoff request, and ends with the handoff turn's `result`. Two caps bound the two
+//! waits; the first expiry cuts the turn and resumes once for the handoff, the second
+//! gives up on it.
 //! A handoff turn that fails is retried after a pause, at most `HANDOFF_ATTEMPTS`
 //! times in all; a failure because the prompt exceeds the window is final at once,
 //! since no pause shrinks it. That signal is consulted only for the handoff turn's own
@@ -145,9 +146,24 @@ impl Tracker {
         !self.turn && self.agents.is_empty()
     }
 
-    /// The background agents without a completion, for the journal.
+    /// The background tasks still running, for the journal: Claude Code's level
+    /// signal replaces the set whenever it arrives, and the start and end edges keep it
+    /// current in between.
     pub fn agents(&self) -> &BTreeSet<String> {
         &self.agents
+    }
+
+    /// The marker was removed by hand: a rotation still waiting for its quiet moment is
+    /// cancelled; one whose handoff is under way goes on. Says whether it cancelled.
+    pub fn cancel(&mut self) -> bool {
+        if !self.pending || !matches!(self.phase, Phase::Waiting { .. }) {
+            return false;
+        }
+        self.pending = false;
+        self.not_before = None;
+        self.failures = 0;
+        self.phase = Phase::Idle;
+        true
     }
 
     /// The marker appeared on disk.
@@ -191,11 +207,16 @@ impl Tracker {
                     };
                 }
             }
-            Event::TaskStarted { id } => {
-                self.agents.insert(id.clone());
+            Event::TaskStarted { id, background } => {
+                if *background {
+                    self.agents.insert(id.clone());
+                }
             }
             Event::TaskDone { id } => {
                 self.agents.remove(id);
+            }
+            Event::BackgroundTasks { ids } => {
+                self.agents = ids.iter().cloned().collect();
             }
             Event::Init { .. } | Event::Other => {}
         }
@@ -327,7 +348,7 @@ mod tests {
         let mut tr = Tracker::new(limits(), t0);
         tr.event(&OK, t0);
         tr.event(&assistant(50_000), t0 + secs(1));
-        tr.event(&Event::TaskStarted { id: "a1".into() }, t0 + secs(2));
+        tr.event(&Event::TaskStarted { id: "a1".into(), background: true }, t0 + secs(2));
         assert!(tr.marker_seen(t0 + secs(3)).is_empty());
         assert!(tr.is_pending());
         // Turn ends, the agent still runs: keep waiting.
@@ -337,6 +358,20 @@ mod tests {
         assert_eq!(tr.event(&Event::TaskDone { id: "a1".into() }, t0 + secs(20)), vec![Action::RequestHandoff]);
         // A second marker sighting changes nothing.
         assert!(tr.marker_seen(t0 + secs(21)).is_empty());
+    }
+
+    #[test]
+    fn foreground_agents_do_not_count_and_the_level_signal_replaces_the_set() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(limits(), t0);
+        tr.event(&Event::TaskStarted { id: "fg".into(), background: false }, t0);
+        tr.event(&Event::TaskStarted { id: "bg".into(), background: true }, t0);
+        assert_eq!(tr.event(&OK, t0 + secs(1)), vec![]);
+        assert_eq!(tr.agents().iter().collect::<Vec<_>>(), vec!["bg"]);
+        // The level signal says the set is empty: a missed completion cannot wedge it.
+        tr.event(&Event::BackgroundTasks { ids: vec![] }, t0 + secs(2));
+        assert!(tr.quiet());
+        assert_eq!(tr.marker_seen(t0 + secs(3)), vec![Action::RequestHandoff]);
     }
 
     #[test]
@@ -438,6 +473,24 @@ mod tests {
         tr.event(&assistant(1), t0 + secs(5));
         assert!(tr.tick(pause_end + secs(1799)).is_empty());
         assert_eq!(tr.tick(pause_end + secs(1800)), vec![Action::Retry]);
+    }
+
+    #[test]
+    fn removing_the_marker_cancels_a_waiting_rotation_but_not_a_handoff() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(limits(), t0);
+        tr.event(&assistant(50_000), t0);
+        tr.marker_seen(t0 + secs(1));
+        assert!(tr.is_pending());
+        assert!(tr.cancel());
+        assert!(!tr.is_pending());
+        // The turn ends: nothing happens, and the cap is gone with the rotation.
+        assert!(tr.event(&OK, t0 + secs(2)).is_empty());
+        assert!(tr.tick(t0 + secs(2 + 1800)).is_empty());
+        // Once the handoff is requested it runs to its end.
+        assert_eq!(tr.marker_seen(t0 + secs(3)), vec![Action::RequestHandoff]);
+        assert!(!tr.cancel());
+        assert_eq!(tr.event(&OK, t0 + secs(4)), vec![Action::Rotate]);
     }
 
     #[test]

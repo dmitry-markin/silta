@@ -306,6 +306,46 @@ async fn prompt_too_long_is_final_in_the_handoff_turn_and_inert_elsewhere() {
 }
 
 #[tokio::test]
+async fn the_rotation_waits_for_background_tasks_but_not_for_foreground_agents() {
+    let fx = Fixture::new("agents");
+    fx.set("fake-context", "10");
+    let cfg = fx.config();
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| l.contains("line Session test started")).await;
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    let first = fx.id();
+    // A rotation is pending at the next start, whose start turn launches a foreground
+    // agent that never reports and a background one that the level signal drops two
+    // seconds later, within the quiet cap. The handoff must follow that signal: not
+    // requested while the background agent runs, and not after a cut for the foreground
+    // one.
+    fx.set("fake-mode", "agents");
+    fx.set("rotate-requested", "test");
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    let log = fx.until(20, |l| starts(l).len() == 3).await;
+    let done = log.find("background done").expect("the background task reported");
+    let handoff = log.find(&format!("line {HANDOFF_LINE}")).expect("the handoff was requested");
+    assert!(handoff > done, "the handoff was requested before the background task ended:\n{log}");
+    assert!(log.contains(&format!("handoff {first}")));
+    assert_eq!(starts(&log)[1], format!("start {first} resumed"));
+    assert_eq!(starts(&log)[2], format!("start {} ", fx.id()), "fresh, not resumed after a cut: {log}");
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
 async fn a_unit_stop_during_the_wait_keeps_the_rotation_pending() {
     let fx = Fixture::new("pending");
     fx.set("fake-context", "10");
