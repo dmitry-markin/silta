@@ -88,31 +88,35 @@ enum Outcome {
 }
 
 /// Runs sessions until claude exits on its own or `shutdown` is cancelled; the exit
-/// code for the unit.
+/// code for the unit. Every way out is one journal line naming the code and the
+/// reason, so that an exit the unit's restart would otherwise hide can be read back.
 pub async fn run(cfg: &Config, shutdown: CancellationToken) -> i32 {
+    let (code, reason) = supervise(cfg, &shutdown).await;
+    eprintln!("supervisor exiting with code {code}: {reason}");
+    code
+}
+
+async fn supervise(cfg: &Config, shutdown: &CancellationToken) -> (i32, String) {
     let paths = Paths::new(&cfg.state);
     let workspace = paths.workspace();
     for dir in [workspace.join("inbox"), workspace.join("out")] {
         if let Err(err) = std::fs::create_dir_all(&dir) {
-            eprintln!("cannot create {}: {err}", dir.display());
-            return 1;
+            return (1, format!("cannot create {}: {err}", dir.display()));
         }
     }
     paths.prune_cache();
     let mut not_before = None;
     loop {
         if shutdown.is_cancelled() {
-            return 0;
+            return (0, "stopped between two runs of claude".to_owned());
         }
         let start = match plan_start(cfg, &paths) {
             Ok(start) => start,
-            Err(err) => {
-                eprintln!("cannot prepare the session: {err}");
-                return 1;
-            }
+            Err(err) => return (1, format!("cannot prepare the session: {err}")),
         };
-        match run_once(cfg, &paths, &start, not_before, &shutdown).await {
-            Outcome::Exit(code) => return code,
+        match run_once(cfg, &paths, &start, not_before, shutdown).await {
+            Outcome::Exit(code) if shutdown.is_cancelled() => return (code, "stopped".to_owned()),
+            Outcome::Exit(code) => return (code, format!("claude exited on its own with {code}")),
             Outcome::Again { not_before: pause } => not_before = pause,
         }
     }

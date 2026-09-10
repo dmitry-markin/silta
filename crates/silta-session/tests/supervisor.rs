@@ -296,7 +296,8 @@ async fn prompt_too_long_is_final_in_the_handoff_turn_and_inert_elsewhere() {
     assert_eq!(log.matches(HANDOFF_LINE).count(), 1);
     assert_ne!(fx.id(), first);
     assert_eq!(starts(&log)[1], format!("start {} ", fx.id()), "fresh, not resumed");
-    assert!(log.contains("could not finish its handoff"));
+    // The fake logs its start before it reads the start line, so wait for the line.
+    fx.until(10, |l| l.contains("could not finish its handoff")).await;
     assert!(!fx.home.join("rotate-requested").exists());
     assert!(!fx.home.join("rotation.json").exists());
     stop.cancel();
