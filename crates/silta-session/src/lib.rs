@@ -9,6 +9,7 @@
 //! compact on its own (`docs/session-rotation-design.md`). Closing stdin is the
 //! graceful stop; a session that does not exit within the grace is killed.
 
+pub mod contract;
 pub mod rotation;
 pub mod state;
 pub mod stream;
@@ -28,6 +29,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use contract::Contract;
 use rotation::{Action, Limits, Reason, Tracker, HANDOFF_ATTEMPTS};
 use state::{HandoffWatch, Next, Paths, HANDOFF_NOTE};
 
@@ -36,10 +38,6 @@ pub const CHANNEL: &str = "plugin:silta-claude@silta-local";
 
 /// The stderr line of a `--resume` whose transcript Claude Code does not know.
 const NO_CONVERSATION: &str = "No conversation found with session ID";
-
-/// The Claude Code versions whose output the supervisor was checked against
-/// (`docs/claude-code-contract.md`); any other version gets a `contract:` line at start.
-pub const TESTED_VERSIONS: &[&str] = &["2.1.263", "2.1.267"];
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -249,7 +247,7 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
         after: None,
         tracker: Tracker::new(cfg.limits.clone(), now),
         watch: None,
-        contract: Contract::new(now),
+        contract: Contract::default(),
     };
     if start.kind == Kind::Retry {
         run.watch = Some(paths.watch_handoff());
@@ -286,7 +284,9 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
                 Some(Msg::Out(line)) => {
                     let (summary, event) = stream::read(&line);
                     println!("{summary}");
-                    run.contract.event(&event, cfg.limits.enabled, Instant::now());
+                    if let Some(line) = run.contract.event(&event, cfg.limits.enabled, Instant::now()) {
+                        eprintln!("contract: {line}");
+                    }
                     if run.stopping.is_none() {
                         if matches!(event, stream::Event::Result { .. }) && run.tracker.awaiting_handoff() {
                             let written = run.watch.as_ref().is_some_and(|w| paths.handoff_written(w));
@@ -335,7 +335,9 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
                     }
                     let actions = run.tracker.tick(now);
                     run.act(actions).await;
-                    run.contract.tick(now, cfg.limits.quiet);
+                    if let Some(line) = run.contract.tick(now, cfg.limits.quiet) {
+                        eprintln!("contract: {line}");
+                    }
                 }
             }
         }
@@ -387,59 +389,8 @@ struct Run<'a> {
     tracker: Tracker,
     /// What the handoff request found on disk, while the handoff turn is awaited.
     watch: Option<HandoffWatch>,
+    /// The watch on Claude Code's output for what no longer matches the contract.
     contract: Contract,
-}
-
-/// Watches for Claude Code output that no longer matches what the supervisor assumes
-/// (`docs/claude-code-contract.md`), so that a schema change after an upgrade shows in
-/// the journal as a `contract:` line instead of a silently blind supervisor.
-struct Contract {
-    /// The last turn end, or the start; and whether the main line has spoken since.
-    since_result: Instant,
-    spoke: bool,
-    warned_usage: bool,
-    warned_turn: bool,
-}
-
-impl Contract {
-    fn new(now: Instant) -> Self {
-        Self { since_result: now, spoke: false, warned_usage: false, warned_turn: false }
-    }
-
-    fn event(&mut self, event: &stream::Event, rotation: bool, now: Instant) {
-        match event {
-            stream::Event::Init { version, .. } => {
-                if !TESTED_VERSIONS.contains(&version.as_str()) {
-                    eprintln!("contract: Claude Code {version} was not checked against this supervisor (checked: {}); re-check docs/claude-code-contract.md", TESTED_VERSIONS.join(", "));
-                }
-            }
-            stream::Event::Assistant { subagent: false, context_tokens } => {
-                self.spoke = true;
-                if context_tokens.is_none() && !self.warned_usage {
-                    self.warned_usage = true;
-                    eprintln!("contract: an assistant line without usage; the context size is unknown and the threshold rotation is blind");
-                }
-            }
-            stream::Event::Result { .. } => {
-                self.since_result = now;
-                self.spoke = false;
-                self.warned_turn = false;
-            }
-            stream::Event::Compacted { auto: true } if rotation => {
-                eprintln!("contract: Claude Code compacted the conversation on its own; the PreCompact hook did not block it");
-            }
-            _ => {}
-        }
-    }
-
-    /// A turn longer than the quiet cap is more likely a missing `result` line than a
-    /// turn.
-    fn tick(&mut self, now: Instant, cap: Duration) {
-        if self.spoke && !self.warned_turn && now.duration_since(self.since_result) >= cap {
-            self.warned_turn = true;
-            eprintln!("contract: no result line for {} s after an assistant line; a very long turn, or the result line has changed", cap.as_secs());
-        }
-    }
 }
 
 impl Run<'_> {

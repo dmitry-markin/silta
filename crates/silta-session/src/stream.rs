@@ -126,8 +126,10 @@ fn system(map: &Map<String, Value>) -> String {
     // whitespace): a task notification's summary or a hook's output is prose that may
     // carry the conversation's content.
     let mut parts = Vec::new();
-    for (key, value) in map {
-        if matches!(key.as_str(), "type" | "subtype" | "session_id" | "uuid") {
+    // A compaction's numbers are one level down.
+    let nested = map.get("compact_metadata").and_then(Value::as_object).into_iter().flatten();
+    for (key, value) in map.iter().chain(nested) {
+        if matches!(key.as_str(), "type" | "subtype" | "session_id" | "uuid" | "compact_metadata") {
             continue;
         }
         match value {
@@ -288,7 +290,7 @@ mod tests {
         assert_eq!(summarize(task), "system task_notification: status=completed task_id=t1");
         assert_eq!(read(task).1, Event::Other);
         let compacted = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":167000},"session_id":"af92"}"#;
-        assert_eq!(summarize(compacted), "system compact_boundary: ");
+        assert_eq!(summarize(compacted), "system compact_boundary: pre_tokens=167000 trigger=auto");
         assert_eq!(read(compacted).1, Event::Compacted { auto: true });
         let changed = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"t1","task_type":"local_agent","description":"look things up"},{"task_id":"m1","task_type":"monitor_ws","description":"watch","ambient":true}],"session_id":"af92"}"#;
         assert_eq!(summarize(changed), "system background_tasks_changed: tasks=2");

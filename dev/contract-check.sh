@@ -13,7 +13,7 @@
 set -uo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 claude=${CLAUDE_BIN:-claude}
-tested=$(grep -o 'TESTED_VERSIONS: &\[&str\] = &\[[^]]*\]' "$repo/crates/silta-session/src/lib.rs" | grep -o '"[0-9.]*"' | tr -d '"' | tr '\n' ' ')
+tested=$(grep -o 'TESTED_VERSIONS: &\[&str\] = &\[[^]]*\]' "$repo/crates/silta-session/src/contract.rs" | grep -o '"[0-9.]*"' | tr -d '"' | tr '\n' ' ')
 out=$(mktemp "${TMPDIR:-/tmp}/contract-check.XXXXXX")
 trap 'rm -f "$out"' EXIT
 printf '%s\n' '{"type":"user","message":{"role":"user","content":"Reply with the single word ok and nothing else."}}' \
