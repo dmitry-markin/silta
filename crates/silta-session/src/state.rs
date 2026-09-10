@@ -3,6 +3,7 @@
 //! and the pruning of Claude Code's cache.
 
 use std::{
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -26,6 +27,25 @@ pub enum Next {
     /// The saved session is rotated out: start a new one, and say whether its handoff
     /// turn ended normally.
     Fresh { handoff: bool },
+}
+
+/// The handoff note the persona keeps, in the memory directory of the workspace's
+/// project.
+pub const HANDOFF_NOTE: &str = "handoff.md";
+
+/// What a handoff request found on disk, for `Paths::handoff_written`.
+#[derive(Debug, Clone, Copy)]
+pub struct HandoffWatch {
+    /// The request, in whole seconds since the epoch: the coarsest mtime any file
+    /// system keeps, so a write in the request's own second still counts.
+    since_secs: u64,
+    note_existed: bool,
+}
+
+impl HandoffWatch {
+    pub fn note_existed(&self) -> bool {
+        self.note_existed
+    }
 }
 
 pub struct Paths {
@@ -114,18 +134,54 @@ impl Paths {
         let _ = fs::remove_file(self.rotation());
     }
 
-    /// A dated copy of every project's memory directory under `backups/`, keeping the
-    /// last `keep`. Returns the number of files copied.
-    pub fn backup_memory(&self, keep: usize) -> io::Result<usize> {
-        let mut sources = Vec::new();
-        if let Ok(dirs) = fs::read_dir(self.projects()) {
-            for dir in dirs.flatten() {
+    /// The memory directory of every project, with the project's slug.
+    fn memory_dirs(&self) -> Vec<(OsString, PathBuf)> {
+        let mut dirs = Vec::new();
+        if let Ok(entries) = fs::read_dir(self.projects()) {
+            for dir in entries.flatten() {
                 let memory = dir.path().join("memory");
                 if memory.is_dir() {
-                    sources.push((dir.file_name(), memory));
+                    dirs.push((dir.file_name(), memory));
                 }
             }
         }
+        dirs
+    }
+
+    /// Taken when the handoff is requested.
+    pub fn watch_handoff(&self) -> HandoffWatch {
+        HandoffWatch {
+            since_secs: unix_millis() / 1000,
+            note_existed: self.memory_dirs().iter().any(|(_, m)| m.join(HANDOFF_NOTE).is_file()),
+        }
+    }
+
+    /// Whether the handoff has been written since the request. When the note existed,
+    /// only its own rewrite counts: a session that has the note reuses it. When it did
+    /// not, any write under a memory directory counts (the note created under that
+    /// name, or under another), a looser test than a wait for the exact name that a
+    /// session might never use.
+    pub fn handoff_written(&self, watch: &HandoffWatch) -> bool {
+        let written = |path: &Path| {
+            fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .is_some_and(|d| d.as_secs() >= watch.since_secs)
+        };
+        self.memory_dirs().iter().any(|(_, memory)| {
+            if watch.note_existed {
+                written(&memory.join(HANDOFF_NOTE))
+            } else {
+                any_file(memory, &written)
+            }
+        })
+    }
+
+    /// A dated copy of every project's memory directory under `backups/`, keeping the
+    /// last `keep`. Returns the number of files copied.
+    pub fn backup_memory(&self, keep: usize) -> io::Result<usize> {
+        let sources = self.memory_dirs();
         if sources.is_empty() {
             return Ok(0);
         }
@@ -164,6 +220,19 @@ fn prune_older(dir: &Path, cutoff: SystemTime) {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+/// Whether any file below `dir` satisfies `pred`.
+fn any_file(dir: &Path, pred: &dyn Fn(&Path) -> bool) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else { return false };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            any_file(&path, pred)
+        } else {
+            pred(&path)
+        }
+    })
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> io::Result<usize> {
@@ -256,6 +325,35 @@ mod tests {
         assert!(!paths.marker_exists());
         paths.drop_id();
         assert_eq!(paths.read_id(), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_handoff_check_wants_the_note_when_it_exists_and_any_memory_write_otherwise() {
+        let dir = scratch("handoff");
+        let paths = Paths::new(&dir);
+        let memory = dir.join(".claude/projects/-w/memory");
+        fs::create_dir_all(&memory).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(120);
+        let touch = |name: &str, when: SystemTime| {
+            let path = memory.join(name);
+            fs::write(&path, "x").unwrap();
+            fs::File::open(&path).unwrap().set_modified(when).unwrap();
+        };
+        // No note yet: nothing written, then another note written, then the note itself.
+        let watch = paths.watch_handoff();
+        assert!(!paths.handoff_written(&watch));
+        touch("MEMORY.md", old);
+        assert!(!paths.handoff_written(&watch));
+        touch("self-and-alice.md", SystemTime::now());
+        assert!(paths.handoff_written(&watch));
+        // The note exists: only its own rewrite counts.
+        touch(HANDOFF_NOTE, old);
+        let watch = paths.watch_handoff();
+        touch("self-and-alice.md", SystemTime::now());
+        assert!(!paths.handoff_written(&watch));
+        touch(HANDOFF_NOTE, SystemTime::now());
+        assert!(paths.handoff_written(&watch));
         fs::remove_dir_all(dir).unwrap();
     }
 

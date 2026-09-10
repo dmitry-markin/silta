@@ -4,9 +4,10 @@
 //! A rotation is pending once the marker exists (written by the pre-compaction hook
 //! or by the supervisor's own threshold). It proceeds at the first quiet moment, no
 //! turn in progress and no background task (an agent, a command) outstanding, with a
-//! handoff request, and ends with the handoff turn's `result`. Two caps bound the two
-//! waits; the first expiry cuts the turn and resumes once for the handoff, the second
-//! gives up on it.
+//! handoff request, and ends with the `result` of a turn that wrote the handoff note
+//! (a turn a person's message started can end first, and does not count). Two caps
+//! bound the two waits; the first expiry cuts the turn and resumes once for the
+//! handoff, the second gives up on it.
 //! A handoff turn that fails is retried after a pause, at most `HANDOFF_ATTEMPTS`
 //! times in all; a failure because the prompt exceeds the window is final at once,
 //! since no pause shrinks it. That signal is consulted only for the handoff turn's own
@@ -45,6 +46,8 @@ pub enum Action {
     MarkPending,
     /// Send the handoff request line.
     RequestHandoff,
+    /// A turn ended without the handoff note written: keep waiting for the handoff.
+    AwaitHandoff,
     /// The handoff turn ended normally: stop claude and start a fresh session.
     Rotate,
     /// A cap expired with the retry unused: cut the turn, resume once with the combined
@@ -88,6 +91,9 @@ pub struct Tracker {
     failures: u32,
     /// The prompt-too-long signal was seen in the turn in progress.
     too_long: bool,
+    /// The handoff note has been written since it was requested, as the supervisor
+    /// found on disk before the turn's `result`.
+    note_written: bool,
     phase: Phase,
 }
 
@@ -106,6 +112,7 @@ impl Tracker {
             retry_used: false,
             failures: 0,
             too_long: false,
+            note_written: true,
             phase: Phase::Idle,
         }
     }
@@ -144,6 +151,17 @@ impl Tracker {
 
     pub fn quiet(&self) -> bool {
         !self.turn && self.agents.is_empty()
+    }
+
+    /// The handoff has been requested and its turn has not ended.
+    pub fn awaiting_handoff(&self) -> bool {
+        matches!(self.phase, Phase::Handoff { .. })
+    }
+
+    /// What the disk says before a `result` while awaiting the handoff: whether the note
+    /// has been written since the request. Without this call every turn end counts.
+    pub fn set_note_written(&mut self, written: bool) {
+        self.note_written = written;
     }
 
     /// The background tasks still running, for the journal: Claude Code's level
@@ -191,6 +209,9 @@ impl Tracker {
                 let too_long = self.too_long || *prompt_too_long;
                 self.too_long = false;
                 if let Phase::Handoff { .. } = self.phase {
+                    if !*is_error && !self.note_written {
+                        return vec![Action::AwaitHandoff];
+                    }
                     self.phase = Phase::Idle;
                     return if !*is_error {
                         vec![Action::Rotate]
@@ -389,6 +410,31 @@ mod tests {
         tr.event(&assistant(50_000), t1 + secs(1));
         assert!(tr.tick(t1 + secs(899)).is_empty());
         assert_eq!(tr.tick(t1 + secs(900)), vec![Action::GiveUp { reason: Reason::CutTwice }]);
+    }
+
+    #[test]
+    fn a_turn_without_the_note_does_not_end_the_handoff() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(limits(), t0);
+        tr.event(&OK, t0);
+        assert_eq!(tr.marker_seen(t0 + secs(1)), vec![Action::RequestHandoff]);
+        assert!(tr.awaiting_handoff());
+        // A person's message started a turn that ended first: keep waiting.
+        tr.event(&assistant(50_000), t0 + secs(2));
+        tr.set_note_written(false);
+        assert_eq!(tr.event(&OK, t0 + secs(3)), vec![Action::AwaitHandoff]);
+        assert!(tr.awaiting_handoff());
+        // The handoff cap still counts from the request.
+        assert!(tr.tick(t0 + secs(1) + secs(899)).is_empty());
+        // The handoff turn ends with the note written: rotate.
+        tr.set_note_written(true);
+        assert_eq!(tr.event(&OK, t0 + secs(4)), vec![Action::Rotate]);
+        // An error result ends the handoff turn whatever the disk says.
+        let mut tr = Tracker::new(limits(), t0);
+        tr.event(&OK, t0);
+        tr.marker_seen(t0 + secs(1));
+        tr.set_note_written(false);
+        assert_eq!(tr.event(&ERR, t0 + secs(2)), vec![Action::Postpone { failures: 1 }]);
     }
 
     #[test]

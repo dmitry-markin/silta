@@ -346,6 +346,44 @@ async fn the_rotation_waits_for_background_tasks_but_not_for_foreground_agents()
 }
 
 #[tokio::test]
+async fn the_handoff_turn_is_the_one_that_rewrites_the_note() {
+    let fx = Fixture::new("note");
+    fx.set("fake-context", "10");
+    let mut cfg = fx.config();
+    // Room for the fake's aside turn, its four seconds, and the handoff.
+    cfg.limits.handoff = Duration::from_secs(10);
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| l.contains("line Session test started")).await;
+    let first = fx.id();
+    // The note exists from before: only its rewrite ends the handoff. The fake answers
+    // the handoff line with an unrelated turn first, which writes another note, and
+    // ends it; the supervisor must not take that as the handoff, or the fake is killed
+    // in the stop grace before it writes the note.
+    let memory = fx.home.join(".claude/projects/-workspace/memory");
+    fs::create_dir_all(&memory).unwrap();
+    let note = memory.join("handoff.md");
+    fs::write(&note, "nothing pending").unwrap();
+    fs::File::open(&note).unwrap().set_modified(std::time::SystemTime::now() - Duration::from_secs(60)).unwrap();
+    fx.set("fake-mode", "busy");
+    fx.set("rotate-requested", "test");
+    let log = fx.until(25, |l| starts(l).len() == 2).await;
+    let aside = log.find(&format!("aside {first}")).expect("the aside turn ran");
+    let handoff = log.find(&format!("handoff {first}")).expect("the handoff was written after the aside turn");
+    assert!(aside < handoff);
+    assert_eq!(starts(&log)[1], format!("start {} ", fx.id()), "fresh, not resumed: {log}");
+    fx.until(10, |l| l.contains("the previous session's handoff is in memory")).await;
+    assert_eq!(fs::read_to_string(&note).unwrap().trim(), format!("handoff of {first}"));
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
 async fn a_unit_stop_during_the_wait_keeps_the_rotation_pending() {
     let fx = Fixture::new("pending");
     fx.set("fake-context", "10");

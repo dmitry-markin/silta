@@ -6,8 +6,10 @@
 # result), toolong (Claude Code's prompt-too-long message, then an error result), hang
 # (the turn never ends), agents (the turn starts a foreground agent that never reports
 # a completion and a background one that reports it two seconds after the turn, through
-# the level signal alone) or noresume (a --resume is refused). HOME/fake-context is the
-# context size reported in every assistant line.
+# the level signal alone), busy (a turn that writes another memory note ends first, as
+# if a person's message had come with the line, and the handoff follows four seconds
+# later) or noresume (a --resume is refused). HOME/fake-context is the context size
+# reported in every assistant line.
 set -u
 id=""; resume=""
 while [ $# -gt 0 ]; do
@@ -40,6 +42,14 @@ while IFS= read -r line; do
       echo '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bg1","task_type":"local_agent","description":"background"}]}'
       echo '{"type":"system","subtype":"task_started","task_id":"bg1","description":"background","is_backgrounded":true}'
       ( sleep 2; echo "background done" >> "$HOME/fake.log"; echo '{"type":"system","subtype":"background_tasks_changed","tasks":[]}' ) &
+      echo ok > "$HOME/fake-mode"
+      ;;
+    busy)
+      mkdir -p "$proj/memory"
+      echo "note of $id" > "$proj/memory/self-and-alice.md"
+      echo "aside $id" >> "$HOME/fake.log"
+      echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":1,"duration_api_ms":1,"total_cost_usd":0.001,"usage":{}}'
+      sleep 4
       echo ok > "$HOME/fake-mode"
       ;;
     error) echo '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"result":"API Error: 529 overloaded","usage":{}}'; continue ;;

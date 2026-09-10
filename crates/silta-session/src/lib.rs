@@ -29,7 +29,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use rotation::{Action, Limits, Reason, Tracker, HANDOFF_ATTEMPTS};
-use state::{Next, Paths};
+use state::{HandoffWatch, Next, Paths, HANDOFF_NOTE};
 
 /// The channel plugin, last on the command line because `--channels` is variadic.
 pub const CHANNEL: &str = "plugin:silta-claude@silta-local";
@@ -37,8 +37,9 @@ pub const CHANNEL: &str = "plugin:silta-claude@silta-local";
 /// The stderr line of a `--resume` whose transcript Claude Code does not know.
 const NO_CONVERSATION: &str = "No conversation found with session ID";
 
-/// The host line that asks for the handoff (design section 6).
-pub const HANDOFF_LINE: &str = "Write your handoff now: the session is about to be rotated. This line comes from the host, not from a person. End your turn when the handoff note is written.";
+/// The host line that asks for the handoff (design section 6). It names the note's
+/// file: the supervisor takes the turn that rewrites it as the handoff turn.
+pub const HANDOFF_LINE: &str = "Write your handoff now: the session is about to be rotated. This line comes from the host, not from a person. Rewrite the memory note `handoff` (the file handoff.md in your memory directory) even if nothing is pending, and end your turn when it is written.";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -247,7 +248,11 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
         stopping: None,
         after: None,
         tracker: Tracker::new(cfg.limits.clone(), now),
+        watch: None,
     };
+    if start.kind == Kind::Retry {
+        run.watch = Some(paths.watch_handoff());
+    }
     run.send(&intro(&cfg.session, start.kind)).await;
     match start.kind {
         Kind::Retry => run.tracker = run.tracker.retrying(now),
@@ -281,6 +286,10 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
                     let (summary, event) = stream::read(&line);
                     println!("{summary}");
                     if run.stopping.is_none() {
+                        if matches!(event, stream::Event::Result { .. }) && run.tracker.awaiting_handoff() {
+                            let written = run.watch.as_ref().is_some_and(|w| paths.handoff_written(w));
+                            run.tracker.set_note_written(written);
+                        }
                         let actions = run.tracker.event(&event, Instant::now());
                         run.act(actions).await;
                     }
@@ -373,6 +382,8 @@ struct Run<'a> {
     stopping: Option<Instant>,
     after: Option<Outcome>,
     tracker: Tracker,
+    /// What the handoff request found on disk, while the handoff turn is awaited.
+    watch: Option<HandoffWatch>,
 }
 
 impl Run<'_> {
@@ -405,8 +416,17 @@ impl Run<'_> {
                     eprintln!("rotation: {why}; rotating at the next quiet moment");
                 }
                 Action::RequestHandoff => {
-                    eprintln!("rotation: requesting the handoff (context {} tokens)", self.tracker.context());
+                    let watch = self.paths.watch_handoff();
+                    eprintln!(
+                        "rotation: requesting the handoff (context {} tokens); waiting for {}",
+                        self.tracker.context(),
+                        if watch.note_existed() { format!("{HANDOFF_NOTE} to be rewritten") } else { format!("a memory write, there is no {HANDOFF_NOTE} yet") }
+                    );
+                    self.watch = Some(watch);
                     self.send(HANDOFF_LINE).await;
+                }
+                Action::AwaitHandoff => {
+                    eprintln!("rotation: a turn ended without the handoff note written; still waiting for the handoff turn");
                 }
                 Action::Rotate => {
                     eprintln!("rotation: handoff written; stopping the session for a fresh start");
@@ -496,13 +516,13 @@ fn intro(session: &str, kind: Kind) -> String {
             "Session {session} restarted at {now} UTC and resumed its history. {channel} This line comes from the host at every start, not from a person. If there is no work to do from before the session restart, end this turn and stay idle until a message arrives."
         ),
         Kind::AfterRotation { handoff: true } => format!(
-            "Session {session} started at {now} UTC after a rotation: a new conversation, and the previous session's handoff is in memory. {channel} This line comes from the host, not from a person. Read the handoff note first and act on what it says is pending, then rewrite it to say that nothing is pending. Then end the turn and stay idle until a message arrives."
+            "Session {session} started at {now} UTC after a rotation: a new conversation, and the previous session's handoff is in memory. {channel} This line comes from the host, not from a person. Read the memory note `handoff` first and act on what it says is pending, then rewrite it to say that nothing is pending. Then end the turn and stay idle until a message arrives."
         ),
         Kind::AfterRotation { handoff: false } => format!(
             "Session {session} started at {now} UTC after a rotation: a new conversation. The previous session could not finish its handoff, so the handoff note in memory may be stale. {channel} This line comes from the host, not from a person. Read the handoff note, then look for dangling work as after a restart: unanswered messages in the room, a promised step, an agent worth rerunning. Say what may have been interrupted, rewrite the handoff note to say that nothing is pending, and stay idle until a message arrives."
         ),
         Kind::Retry => format!(
-            "Session {session} restarted at {now} UTC and resumed its history. Its last turn was cut by the host because it ran too long, and the session is about to be rotated. This line comes from the host, not from a person. Write your handoff now: the task in progress and its state, questions waiting on the person, promises made, background agents worth resuming. Do not resume the work; end your turn as soon as the handoff note is written."
+            "Session {session} restarted at {now} UTC and resumed its history. Its last turn was cut by the host because it ran too long, and the session is about to be rotated. This line comes from the host, not from a person. Write your handoff now into the memory note `handoff` (the file handoff.md in your memory directory): the task in progress and its state, questions waiting on the person, promises made, background agents worth resuming. Do not resume the work; end your turn as soon as the note is written."
         ),
     }
 }
