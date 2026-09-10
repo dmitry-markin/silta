@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use silta_session::{rotation::Limits, Config, HANDOFF_LINE};
+use silta_session::{handoff, rotation::Limits, Config};
 use tokio_util::sync::CancellationToken;
 
 struct Fixture {
@@ -144,13 +144,13 @@ async fn threshold_rotation_with_handoff() {
     // Large context, and idle for 2 s after the start turn: the handoff is requested,
     // the fake writes the note and ends the turn, a fresh session starts. The fresh
     // session must report a small context, or it rotates too.
-    fx.until(20, |l| l.contains(HANDOFF_LINE)).await;
+    fx.until(20, |l| l.contains(handoff())).await;
     fx.set("fake-context", "10");
     let log = fx.until(20, |l| starts(l).len() == 2).await;
     let first = starts(&log)[0].split(' ').nth(1).unwrap().to_owned();
     let second = fx.id();
     assert_ne!(first, second);
-    assert!(log.contains(&format!("line {HANDOFF_LINE}")));
+    assert!(log.contains(&format!("line {}", handoff())));
     assert!(log.contains(&format!("handoff {first}")));
     assert!(log.contains(&format!("eof {first}")));
     assert!(starts(&log)[1].ends_with(&format!("{second} ")), "fresh, not resumed: {log}");
@@ -228,7 +228,7 @@ async fn a_failed_handoff_turn_is_retried_after_the_pause() {
     // After the pause the handoff is requested again and succeeds.
     fx.set("fake-mode", "ok");
     let log = fx.until(20, |l| starts(l).len() == 3).await;
-    assert_eq!(log.matches(HANDOFF_LINE).count(), 2);
+    assert_eq!(log.matches(handoff()).count(), 2);
     assert!(log.contains(&format!("handoff {first}")));
     assert_ne!(fx.id(), first);
     stop.cancel();
@@ -257,7 +257,7 @@ async fn two_failed_handoff_turns_give_the_handoff_up() {
     assert_eq!(s[1], format!("start {first} resumed"));
     assert_ne!(fx.id(), first);
     assert_eq!(s[2], format!("start {} ", fx.id()));
-    assert_eq!(log.matches(HANDOFF_LINE).count(), 2);
+    assert_eq!(log.matches(handoff()).count(), 2);
     assert!(!log.contains(&format!("handoff {first}")));
     fx.set("fake-mode", "ok");
     fx.until(10, |l| l.contains("could not finish its handoff")).await;
@@ -287,13 +287,13 @@ async fn prompt_too_long_is_final_in_the_handoff_turn_and_inert_elsewhere() {
     tokio::time::sleep(Duration::from_secs(4)).await;
     let log = fx.log();
     assert_eq!(starts(&log).len(), 1);
-    assert!(!log.contains(HANDOFF_LINE));
+    assert!(!log.contains(handoff()));
     assert!(!fx.home.join("rotate-requested").exists());
     // Now a rotation is pending: the handoff turn fails the same way, and that is
     // final at once, no pause, no resume.
     fx.set("rotate-requested", "test");
     let log = fx.until(15, |l| starts(l).len() == 2).await;
-    assert_eq!(log.matches(HANDOFF_LINE).count(), 1);
+    assert_eq!(log.matches(handoff()).count(), 1);
     assert_ne!(fx.id(), first);
     assert_eq!(starts(&log)[1], format!("start {} ", fx.id()), "fresh, not resumed");
     // The fake logs its start before it reads the start line, so wait for the line.
@@ -335,7 +335,7 @@ async fn the_rotation_waits_for_background_tasks_but_not_for_foreground_agents()
     });
     let log = fx.until(20, |l| starts(l).len() == 3).await;
     let done = log.find("background done").expect("the background task reported");
-    let handoff = log.find(&format!("line {HANDOFF_LINE}")).expect("the handoff was requested");
+    let handoff = log.find(&format!("line {}", handoff())).expect("the handoff was requested");
     assert!(handoff > done, "the handoff was requested before the background task ended:\n{log}");
     assert!(log.contains(&format!("handoff {first}")));
     assert_eq!(starts(&log)[1], format!("start {first} resumed"));
@@ -400,7 +400,7 @@ async fn a_unit_stop_during_the_wait_keeps_the_rotation_pending() {
     fx.until(10, |l| l.contains("line Session test started")).await;
     fx.set("rotate-requested", "test");
     tokio::time::sleep(Duration::from_secs(4)).await;
-    assert!(!fx.log().contains(HANDOFF_LINE));
+    assert!(!fx.log().contains(handoff()));
     stop.cancel();
     assert_eq!(run.await.unwrap(), 0);
     let first = fx.id();

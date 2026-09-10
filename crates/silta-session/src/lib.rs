@@ -37,10 +37,6 @@ pub const CHANNEL: &str = "plugin:silta-claude@silta-local";
 /// The stderr line of a `--resume` whose transcript Claude Code does not know.
 const NO_CONVERSATION: &str = "No conversation found with session ID";
 
-/// The host line that asks for the handoff (design section 6). It names the note's
-/// file: the supervisor takes the turn that rewrites it as the handoff turn.
-pub const HANDOFF_LINE: &str = "Write your handoff now: the session is about to be rotated. This line comes from the host, not from a person. Rewrite the memory note `handoff` (the file handoff.md in your memory directory) even if nothing is pending, and end your turn when it is written.";
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub session: String,
@@ -423,7 +419,7 @@ impl Run<'_> {
                         if watch.note_existed() { format!("{HANDOFF_NOTE} to be rewritten") } else { format!("a memory write, there is no {HANDOFF_NOTE} yet") }
                     );
                     self.watch = Some(watch);
-                    self.send(HANDOFF_LINE).await;
+                    self.send(handoff()).await;
                 }
                 Action::AwaitHandoff => {
                     eprintln!("rotation: a turn ended without the handoff note written; still waiting for the handoff turn");
@@ -522,7 +518,14 @@ fn intro(session: &str, kind: Kind) -> String {
             "Session {session} started at {now} UTC after a rotation: a new conversation. The previous session could not finish its handoff, so the handoff note in memory may be stale. {channel} This line comes from the host, not from a person. Read the handoff note, then look for dangling work as after a restart: unanswered messages in the room, a promised step, an agent worth rerunning. Say what may have been interrupted, rewrite the handoff note to say that nothing is pending, and stay idle until a message arrives."
         ),
         Kind::Retry => format!(
-            "Session {session} restarted at {now} UTC and resumed its history. Its last turn was cut by the host because it ran too long, and the session is about to be rotated. This line comes from the host, not from a person. Write your handoff now into the memory note `handoff` (the file handoff.md in your memory directory): the task in progress and its state, questions waiting on the person, promises made, background agents worth resuming. Do not resume the work; end your turn as soon as the note is written."
+            "Session {session} restarted at {now} UTC and resumed its history. Its last turn was cut by the host because it ran too long, and the session is about to be rotated. This line comes from the host, not from a person. Write your handoff now into the memory note `handoff` (the file handoff.md in your memory directory; the host waits for that file to change and takes the turn that rewrites it as your handoff turn): the task in progress and its state, questions waiting on the person, promises made, background agents worth resuming. Do not resume the work; end your turn as soon as the note is written."
         ),
     }
+}
+
+/// The host line that asks for the handoff at the rotation's quiet moment (design
+/// section 6). It names the note's file and says why: the supervisor takes the turn that
+/// rewrites it as the handoff turn.
+pub fn handoff() -> &'static str {
+    "Write your handoff now: the session is about to be rotated. This line comes from the host, not from a person. Rewrite the memory note `handoff` (the file handoff.md in your memory directory) even if nothing is pending: the host waits for that file to change and takes the turn that rewrites it as your handoff turn. End your turn when it is written."
 }
