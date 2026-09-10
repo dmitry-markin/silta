@@ -6,6 +6,10 @@
 //! turn in progress and no background agent outstanding, with a handoff request, and
 //! ends with the handoff turn's `result`. Two caps bound the two waits; the first
 //! expiry cuts the turn and resumes once for the handoff, the second gives up on it.
+//! A handoff turn that fails is retried after a pause, at most `HANDOFF_ATTEMPTS`
+//! times in all; a failure because the prompt exceeds the window is final at once,
+//! since no pause shrinks it. That signal is consulted only for the handoff turn's own
+//! failure and never starts or changes a rotation on its own.
 
 use std::{
     collections::BTreeSet,
@@ -30,6 +34,9 @@ pub struct Limits {
     pub retry_pause: Duration,
 }
 
+/// Handoff turns attempted before the rotation gives up on the note.
+pub const HANDOFF_ATTEMPTS: u32 = 2;
+
 /// What the supervisor should do now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -37,15 +44,27 @@ pub enum Action {
     MarkPending,
     /// Send the handoff request line.
     RequestHandoff,
-    /// Stop claude and start a fresh session; `handoff` says whether the handoff turn
-    /// ended normally.
-    Rotate { handoff: bool },
+    /// The handoff turn ended normally: stop claude and start a fresh session.
+    Rotate,
     /// A cap expired with the retry unused: cut the turn, resume once with the combined
     /// line, and wait for the handoff again.
     Retry,
     /// The handoff turn ended with an error: stop, resume normally, and try again after
-    /// the pause.
-    Postpone,
+    /// the pause; `failures` counts the failed handoff turns so far.
+    Postpone { failures: u32 },
+    /// Stop claude and start a fresh session without a finished handoff.
+    GiveUp { reason: Reason },
+}
+
+/// Why a rotation gives the handoff up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// A cap expired again after the one cut-and-resume.
+    CutTwice,
+    /// The handoff turn failed because the prompt exceeds the model's window.
+    PromptTooLong,
+    /// `HANDOFF_ATTEMPTS` handoff turns failed.
+    Failures,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +84,9 @@ pub struct Tracker {
     pending: bool,
     not_before: Option<Instant>,
     retry_used: bool,
+    failures: u32,
+    /// The prompt-too-long signal was seen in the turn in progress.
+    too_long: bool,
     phase: Phase,
 }
 
@@ -81,18 +103,22 @@ impl Tracker {
             pending: false,
             not_before: None,
             retry_used: false,
+            failures: 0,
+            too_long: false,
             phase: Phase::Idle,
         }
     }
 
     /// The marker existed at the start: the rotation is pending from the first quiet
-    /// moment, once `not_before` (the pause after a failed handoff turn) has passed.
-    pub fn pending(mut self, now: Instant, not_before: Option<Instant>) -> Self {
+    /// moment, once `not_before` (the pause after a failed handoff turn) has passed;
+    /// `failures` is the count of failed handoff turns so far.
+    pub fn pending(mut self, now: Instant, not_before: Option<Instant>, failures: u32) -> Self {
         if !self.limits.enabled {
             return self;
         }
         self.pending = true;
         self.not_before = not_before;
+        self.failures = failures;
         let from = not_before.map_or(now, |t| t.max(now));
         self.phase = Phase::Waiting { deadline: from + self.limits.quiet };
         self
@@ -135,23 +161,33 @@ impl Tracker {
 
     pub fn event(&mut self, event: &Event, now: Instant) -> Vec<Action> {
         match event {
-            Event::Assistant { context_tokens } => {
+            Event::Assistant { context_tokens, prompt_too_long } => {
                 self.turn = true;
+                self.too_long |= *prompt_too_long;
                 if let Some(n) = context_tokens {
                     self.context = *n;
                 }
             }
             Event::User => self.turn = true,
-            Event::Result { is_error } => {
+            Event::Result { is_error, prompt_too_long } => {
                 self.turn = false;
                 self.last_result = now;
+                let too_long = self.too_long || *prompt_too_long;
+                self.too_long = false;
                 if let Phase::Handoff { .. } = self.phase {
                     self.phase = Phase::Idle;
-                    return if *is_error {
-                        self.not_before = Some(now + self.limits.retry_pause);
-                        vec![Action::Postpone]
+                    return if !*is_error {
+                        vec![Action::Rotate]
+                    } else if too_long {
+                        vec![Action::GiveUp { reason: Reason::PromptTooLong }]
                     } else {
-                        vec![Action::Rotate { handoff: true }]
+                        self.failures += 1;
+                        if self.failures >= HANDOFF_ATTEMPTS {
+                            vec![Action::GiveUp { reason: Reason::Failures }]
+                        } else {
+                            self.not_before = Some(now + self.limits.retry_pause);
+                            vec![Action::Postpone { failures: self.failures }]
+                        }
                     };
                 }
             }
@@ -217,7 +253,7 @@ impl Tracker {
     fn cut(&mut self) -> Vec<Action> {
         self.phase = Phase::Idle;
         if self.retry_used {
-            vec![Action::Rotate { handoff: false }]
+            vec![Action::GiveUp { reason: Reason::CutTwice }]
         } else {
             self.retry_used = true;
             vec![Action::Retry]
@@ -241,11 +277,13 @@ mod tests {
     }
 
     fn assistant(context: u64) -> Event {
-        Event::Assistant { context_tokens: Some(context) }
+        Event::Assistant { context_tokens: Some(context), prompt_too_long: false }
     }
 
-    const OK: Event = Event::Result { is_error: false };
-    const ERR: Event = Event::Result { is_error: true };
+    const OK: Event = Event::Result { is_error: false, prompt_too_long: false };
+    const ERR: Event = Event::Result { is_error: true, prompt_too_long: false };
+    const TOO_LONG: Event = Event::Assistant { context_tokens: Some(0), prompt_too_long: true };
+    const ERR_TOO_LONG: Event = Event::Result { is_error: true, prompt_too_long: true };
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
@@ -267,7 +305,7 @@ mod tests {
         // The handoff turn runs and ends: rotate with the handoff done.
         let t = t0 + secs(3 + 4 * 3600);
         assert!(tr.event(&assistant(310_100), t).is_empty());
-        assert_eq!(tr.event(&OK, t + secs(60)), vec![Action::Rotate { handoff: true }]);
+        assert_eq!(tr.event(&OK, t + secs(60)), vec![Action::Rotate]);
     }
 
     #[test]
@@ -315,7 +353,7 @@ mod tests {
         let mut tr = Tracker::new(limits(), t1).retrying(t1);
         tr.event(&assistant(50_000), t1 + secs(1));
         assert!(tr.tick(t1 + secs(899)).is_empty());
-        assert_eq!(tr.tick(t1 + secs(900)), vec![Action::Rotate { handoff: false }]);
+        assert_eq!(tr.tick(t1 + secs(900)), vec![Action::GiveUp { reason: Reason::CutTwice }]);
     }
 
     #[test]
@@ -323,7 +361,7 @@ mod tests {
         let t0 = Instant::now();
         let mut tr = Tracker::new(limits(), t0).retrying(t0);
         tr.event(&assistant(50_000), t0 + secs(1));
-        assert_eq!(tr.event(&OK, t0 + secs(120)), vec![Action::Rotate { handoff: true }]);
+        assert_eq!(tr.event(&OK, t0 + secs(120)), vec![Action::Rotate]);
     }
 
     #[test]
@@ -338,20 +376,65 @@ mod tests {
         let mut tr = Tracker::new(limits(), t0);
         tr.event(&OK, t0);
         assert_eq!(tr.marker_seen(t0 + secs(1)), vec![Action::RequestHandoff]);
-        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::Postpone]);
+        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::Postpone { failures: 1 }]);
+    }
+
+    #[test]
+    fn the_second_failed_handoff_turn_gives_up() {
+        let t0 = Instant::now();
+        // The resumed run after one failure carries the count.
+        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(t0 + secs(900)), 1);
+        tr.event(&OK, t0 + secs(5));
+        assert_eq!(tr.tick(t0 + secs(900)), vec![Action::RequestHandoff]);
+        tr.event(&assistant(50_000), t0 + secs(901));
+        assert_eq!(tr.event(&ERR, t0 + secs(930)), vec![Action::GiveUp { reason: Reason::Failures }]);
+    }
+
+    #[test]
+    fn a_prompt_too_long_failure_of_the_handoff_turn_is_final_at_once() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(limits(), t0);
+        tr.event(&OK, t0);
+        assert_eq!(tr.marker_seen(t0 + secs(1)), vec![Action::RequestHandoff]);
+        assert!(tr.event(&TOO_LONG, t0 + secs(2)).is_empty());
+        assert_eq!(tr.event(&ERR, t0 + secs(3)), vec![Action::GiveUp { reason: Reason::PromptTooLong }]);
+        // The same from the result's text alone.
+        let mut tr = Tracker::new(limits(), t0);
+        tr.event(&OK, t0);
+        tr.marker_seen(t0 + secs(1));
+        assert_eq!(tr.event(&ERR_TOO_LONG, t0 + secs(3)), vec![Action::GiveUp { reason: Reason::PromptTooLong }]);
+    }
+
+    #[test]
+    fn prompt_too_long_outside_the_handoff_turn_changes_nothing() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(limits(), t0);
+        // In the start turn, with no rotation pending: nothing.
+        assert!(tr.event(&TOO_LONG, t0 + secs(1)).is_empty());
+        assert!(tr.event(&ERR_TOO_LONG, t0 + secs(2)).is_empty());
+        assert!(!tr.is_pending());
+        assert!(tr.tick(t0 + secs(10)).is_empty());
+        // While waiting for quiet: the turn's error is a turn end, the handoff is still
+        // requested, and the earlier signal does not carry into it.
+        tr.event(&assistant(50_000), t0 + secs(20));
+        tr.marker_seen(t0 + secs(21));
+        tr.event(&TOO_LONG, t0 + secs(22));
+        assert_eq!(tr.event(&ERR_TOO_LONG, t0 + secs(23)), vec![Action::RequestHandoff]);
+        tr.event(&assistant(50_000), t0 + secs(24));
+        assert_eq!(tr.event(&ERR, t0 + secs(25)), vec![Action::Postpone { failures: 1 }]);
     }
 
     #[test]
     fn a_pending_start_honours_the_pause_then_rotates() {
         let t0 = Instant::now();
         let pause_end = t0 + secs(900);
-        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(pause_end));
+        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(pause_end), 0);
         // The start turn ends, but the pause is on.
         assert!(tr.event(&OK, t0 + secs(5)).is_empty());
         assert!(tr.tick(t0 + secs(899)).is_empty());
         assert_eq!(tr.tick(pause_end), vec![Action::RequestHandoff]);
         // The quiet cap counted from the end of the pause, not from the start.
-        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(pause_end));
+        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(pause_end), 0);
         tr.event(&assistant(1), t0 + secs(5));
         assert!(tr.tick(pause_end + secs(1799)).is_empty());
         assert_eq!(tr.tick(pause_end + secs(1800)), vec![Action::Retry]);
@@ -360,7 +443,7 @@ mod tests {
     #[test]
     fn disabled_ignores_markers_and_thresholds() {
         let t0 = Instant::now();
-        let mut tr = Tracker::new(Limits { enabled: false, ..limits() }, t0).pending(t0, None);
+        let mut tr = Tracker::new(Limits { enabled: false, ..limits() }, t0).pending(t0, None, 0);
         tr.event(&assistant(900_000), t0);
         tr.event(&OK, t0);
         assert!(tr.marker_seen(t0 + secs(1)).is_empty());

@@ -17,12 +17,14 @@ pub enum Event {
     Init { session_id: String },
     /// An assistant message. `context_tokens` is the size of the prompt of the API call
     /// that produced it (input plus cache read plus cache creation), `None` for a
-    /// subagent's message or a line without usage.
-    Assistant { context_tokens: Option<u64> },
+    /// subagent's message or a line without usage. `prompt_too_long` marks the
+    /// synthetic message Claude Code emits when the API refused the prompt for its size.
+    Assistant { context_tokens: Option<u64>, prompt_too_long: bool },
     /// A user message: a tool result or a delivered message; a turn is in progress.
     User,
-    /// The end of a turn.
-    Result { is_error: bool },
+    /// The end of a turn; `prompt_too_long` when its error text is the API's refusal
+    /// of the prompt for its size.
+    Result { is_error: bool, prompt_too_long: bool },
     /// A background agent was started.
     TaskStarted { id: String },
     /// A background agent reported its end (any status).
@@ -39,11 +41,15 @@ pub fn read(line: &str) -> (String, Event) {
     let kind = map.get("type").and_then(Value::as_str).unwrap_or("?");
     match kind {
         "system" => (system(&map), system_event(&map)),
-        "assistant" => (message("assistant", &map), Event::Assistant { context_tokens: context_of(&map) }),
+        "assistant" => (
+            message("assistant", &map),
+            Event::Assistant { context_tokens: context_of(&map), prompt_too_long: assistant_too_long(&map) },
+        ),
         "user" => (message("user", &map), Event::User),
         "result" => {
             let is_error = map.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-            (result(&map), Event::Result { is_error })
+            let prompt_too_long = is_error && map.get("result").and_then(Value::as_str).is_some_and(api_too_long);
+            (result(&map), Event::Result { is_error, prompt_too_long })
         }
         "stream_event" => {
             let event = map.get("event").and_then(|e| e.get("type")).and_then(Value::as_str).unwrap_or("?");
@@ -79,6 +85,29 @@ fn system_event(map: &Map<String, Value>) -> Event {
         Some("task_notification") => Event::TaskDone { id: id() },
         _ => Event::Other,
     }
+}
+
+/// Claude Code's own signal of a prompt the API refused for its size (read from the
+/// bundle of 2.1.267 and a transcript of 2026-09-09; re-check on an upgrade): the
+/// synthetic assistant message it emits in place of the answer starts with this text,
+/// followed by what it tried ("· automatic compaction failed: …").
+const PROMPT_TOO_LONG_PREFIX: &str = "prompt is too long";
+
+/// The API's own wordings, which Claude Code matches case-insensitively.
+const PROMPT_TOO_LONG_API: [&str; 2] = ["prompt is too long", "input is too long for requested model"];
+
+fn assistant_too_long(map: &Map<String, Value>) -> bool {
+    let Some(Value::Array(blocks)) = map.get("message").and_then(|m| m.get("content")) else { return false };
+    blocks
+        .iter()
+        .find(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .and_then(|b| b.get("text").and_then(Value::as_str))
+        .is_some_and(|t| t.trim_start().to_lowercase().starts_with(PROMPT_TOO_LONG_PREFIX))
+}
+
+fn api_too_long(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    PROMPT_TOO_LONG_API.iter().any(|needle| lower.contains(needle))
 }
 
 /// The prompt size of the call behind a main-line assistant message.
@@ -190,6 +219,9 @@ fn message(role: &str, map: &Map<String, Value>) -> String {
     if let Some(context) = context_of(map) {
         parts.push(format!("context {context}"));
     }
+    if role == "assistant" && assistant_too_long(map) {
+        parts.push("API error: prompt too long".to_owned());
+    }
     format!("{role}: {}", parts.join(", "))
 }
 
@@ -279,9 +311,9 @@ mod tests {
         let (s, event) = read(assistant);
         assert_eq!(s, "assistant: 1 text (23 bytes), tool_use mcp__plugin_silta-claude_silta__reply, model claude-opus-5, stop tool_use, context 37250");
         assert!(!s.contains("secret"));
-        assert_eq!(event, Event::Assistant { context_tokens: Some(37250) });
+        assert_eq!(event, Event::Assistant { context_tokens: Some(37250), prompt_too_long: false });
         let subagent = r#"{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":0}},"parent_tool_use_id":"toolu_1"}"#;
-        assert_eq!(read(subagent).1, Event::Assistant { context_tokens: None });
+        assert_eq!(read(subagent).1, Event::Assistant { context_tokens: None, prompt_too_long: false });
         let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"sent","is_error":false},{"type":"tool_result","tool_use_id":"y","content":[{"type":"text","text":"boom"}],"is_error":true}]}}"#;
         assert_eq!(summarize(user), "user: 2 tool_result (8 bytes, 1 failed)");
         assert_eq!(read(user).1, Event::User);
@@ -297,13 +329,32 @@ mod tests {
         let (s, event) = read(ok);
         assert_eq!(s, "result success: 3 turns, 8123 ms (api 7000 ms), tokens in 12 out 345 cache read 250000 write 1000, cost $0.0421");
         assert!(!s.contains("private"));
-        assert_eq!(event, Event::Result { is_error: false });
+        assert_eq!(event, Event::Result { is_error: false, prompt_too_long: false });
         let err = r#"{"type":"result","subtype":"success","is_error":true,"num_turns":1,"duration_ms":2000,"duration_api_ms":0,"result":"Failed to authenticate. API Error: 401 OAuth access token is invalid.","total_cost_usd":0,"usage":{},"permission_denials":[{"tool_name":"Bash"}]}"#;
         assert_eq!(
             summarize(err),
             "result success ERROR: 1 turns, 2000 ms (api 0 ms), tokens in 0 out 0 cache read 0 write 0, cost $0.0000, 1 permission denials; Failed to authenticate. API Error: 401 OAuth access token is invalid."
         );
-        assert_eq!(read(err).1, Event::Result { is_error: true });
+        assert_eq!(read(err).1, Event::Result { is_error: true, prompt_too_long: false });
+    }
+
+    #[test]
+    fn the_prompt_too_long_signal_is_recognised_in_both_places() {
+        // The text of a real occurrence (a Silta transcript of 2026-09-09).
+        let assistant = r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"Prompt is too long · automatic compaction failed: There's an issue with the selected model (opus5). It may not exist or you may not have access to it. Run --model to pick a different model."}],"usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"parent_tool_use_id":null}"#;
+        let (s, event) = read(assistant);
+        assert_eq!(event, Event::Assistant { context_tokens: Some(0), prompt_too_long: true });
+        assert!(s.ends_with("API error: prompt too long"), "{s}");
+        assert!(!s.contains("opus5"));
+        // A reply that merely mentions it is not the signal.
+        let chat = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I saw a 'prompt is too long' error earlier."}]}}"#;
+        assert_eq!(read(chat).1, Event::Assistant { context_tokens: None, prompt_too_long: false });
+        let api = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"API Error: 400 invalid_request_error: prompt is too long: 1013456 tokens > 1000000 maximum","usage":{}}"#;
+        assert_eq!(read(api).1, Event::Result { is_error: true, prompt_too_long: true });
+        let other = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Input is too long for requested model.","usage":{}}"#;
+        assert_eq!(read(other).1, Event::Result { is_error: true, prompt_too_long: true });
+        let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"prompt is too long, I shortened it","usage":{}}"#;
+        assert_eq!(read(ok).1, Event::Result { is_error: false, prompt_too_long: false });
     }
 
     #[test]

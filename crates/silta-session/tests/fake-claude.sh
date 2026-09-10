@@ -3,7 +3,8 @@
 # supervisor, keeps a transcript per session id under HOME/.claude/projects like Claude
 # Code, and logs what it was started with and every line it received to HOME/fake.log.
 # HOME/fake-mode (read per turn) is ok (default), error (the turn ends with an error
-# result), hang (the turn never ends) or noresume (a --resume is refused). HOME/fake-context
+# result), toolong (Claude Code's prompt-too-long message, then an error result), hang
+# (the turn never ends) or noresume (a --resume is refused). HOME/fake-context
 # is the context size reported in every assistant line.
 set -u
 id=""; resume=""
@@ -33,6 +34,10 @@ while IFS= read -r line; do
   case "$(mode)" in
     hang) sleep 30; exit 0 ;;
     error) echo '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"result":"API Error: 529 overloaded","usage":{}}'; continue ;;
+    toolong)
+      echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Prompt is too long · automatic compaction failed: There is an issue with the selected model (opus5)."}],"usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"parent_tool_use_id":null}'
+      echo '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"result":"Prompt is too long","usage":{}}'
+      continue ;;
   esac
   case "$text" in *"Write your handoff now"*)
     mkdir -p "$proj/memory"

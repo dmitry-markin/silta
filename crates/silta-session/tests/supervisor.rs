@@ -218,11 +218,12 @@ async fn a_failed_handoff_turn_is_retried_after_the_pause() {
     let first = fx.id();
     fx.set("fake-mode", "error");
     fx.set("rotate-requested", "test");
-    // The handoff turn fails: the session is resumed normally and the marker stays.
+    // The handoff turn fails: the session is resumed normally, the marker stays, and
+    // the failure is on record.
     let log = fx.until(15, |l| starts(l).len() == 2).await;
     assert_eq!(starts(&log)[1], format!("start {first} resumed"));
     assert!(fx.home.join("rotate-requested").exists());
-    assert!(!fx.home.join("rotation.json").exists());
+    assert_eq!(fs::read_to_string(fx.home.join("rotation.json")).unwrap().trim(), r#"{"next":"postponed","failures":1}"#);
     fx.until(10, |l| l.contains("resumed its history. You are connected")).await;
     // After the pause the handoff is requested again and succeeds.
     fx.set("fake-mode", "ok");
@@ -236,6 +237,74 @@ async fn a_failed_handoff_turn_is_retried_after_the_pause() {
 }
 
 #[tokio::test]
+async fn two_failed_handoff_turns_give_the_handoff_up() {
+    let fx = Fixture::new("failures");
+    fx.set("fake-context", "10");
+    let cfg = fx.config();
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| l.contains("line Session test started")).await;
+    let first = fx.id();
+    fx.set("fake-mode", "error");
+    fx.set("rotate-requested", "test");
+    // First failure: resumed. Second, after the pause: fresh without a handoff.
+    let log = fx.until(30, |l| starts(l).len() == 3).await;
+    let s = starts(&log);
+    assert_eq!(s[1], format!("start {first} resumed"));
+    assert_ne!(fx.id(), first);
+    assert_eq!(s[2], format!("start {} ", fx.id()));
+    assert_eq!(log.matches(HANDOFF_LINE).count(), 2);
+    assert!(!log.contains(&format!("handoff {first}")));
+    fx.set("fake-mode", "ok");
+    fx.until(10, |l| l.contains("could not finish its handoff")).await;
+    assert!(!fx.home.join("rotate-requested").exists());
+    assert!(!fx.home.join("rotation.json").exists());
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
+async fn prompt_too_long_is_final_in_the_handoff_turn_and_inert_elsewhere() {
+    let fx = Fixture::new("toolong");
+    fx.set("fake-context", "10");
+    fx.set("fake-mode", "toolong");
+    let cfg = fx.config();
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    // The start turn itself fails with the message, and nothing is pending: the
+    // session stays as it is.
+    fx.until(10, |l| l.contains("line Session test started")).await;
+    let first = fx.id();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let log = fx.log();
+    assert_eq!(starts(&log).len(), 1);
+    assert!(!log.contains(HANDOFF_LINE));
+    assert!(!fx.home.join("rotate-requested").exists());
+    // Now a rotation is pending: the handoff turn fails the same way, and that is
+    // final at once, no pause, no resume.
+    fx.set("rotate-requested", "test");
+    let log = fx.until(15, |l| starts(l).len() == 2).await;
+    assert_eq!(log.matches(HANDOFF_LINE).count(), 1);
+    assert_ne!(fx.id(), first);
+    assert_eq!(starts(&log)[1], format!("start {} ", fx.id()), "fresh, not resumed");
+    assert!(log.contains("could not finish its handoff"));
+    assert!(!fx.home.join("rotate-requested").exists());
+    assert!(!fx.home.join("rotation.json").exists());
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
 async fn a_unit_stop_during_the_wait_keeps_the_rotation_pending() {
     let fx = Fixture::new("pending");
     fx.set("fake-context", "10");
@@ -243,7 +312,6 @@ async fn a_unit_stop_during_the_wait_keeps_the_rotation_pending() {
     // Rotation off: the marker is ignored entirely.
     let mut off = cfg.clone();
     off.limits.enabled = false;
-    fx.set("rotate-requested", "test");
     let stop = CancellationToken::new();
     let run = tokio::spawn({
         let off = off.clone();
@@ -251,6 +319,7 @@ async fn a_unit_stop_during_the_wait_keeps_the_rotation_pending() {
         async move { silta_session::run(&off, stop).await }
     });
     fx.until(10, |l| l.contains("line Session test started")).await;
+    fx.set("rotate-requested", "test");
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert!(!fx.log().contains(HANDOFF_LINE));
     stop.cancel();

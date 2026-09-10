@@ -20,6 +20,9 @@ pub enum Next {
     Normal,
     /// Resume the saved session with the combined cut-and-handoff line.
     Retry,
+    /// Resume the saved session normally; the rotation stays pending after this many
+    /// failed handoff turns.
+    Postponed { failures: u32 },
     /// The saved session is rotated out: start a new one, and say whether its handoff
     /// turn ended normally.
     Fresh { handoff: bool },
@@ -222,6 +225,9 @@ mod tests {
         assert_eq!(paths.read_next(), Next::Fresh { handoff: true });
         paths.write_next(Next::Retry).unwrap();
         assert_eq!(paths.read_next(), Next::Retry);
+        paths.write_next(Next::Postponed { failures: 1 }).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("rotation.json")).unwrap(), "{\"next\":\"postponed\",\"failures\":1}\n");
+        assert_eq!(paths.read_next(), Next::Postponed { failures: 1 });
         paths.write_next(Next::Normal).unwrap();
         assert!(!dir.join("rotation.json").exists());
         paths.write_next(Next::Normal).unwrap();
