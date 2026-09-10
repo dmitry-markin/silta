@@ -1,9 +1,9 @@
 [workspace]
-members = ["crates/silta", "crates/siltad", "crates/silta-claude"]
+members = ["crates/silta", "crates/siltad", "crates/silta-claude", "crates/silta-session"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.93"
 license = "Apache-2.0 OR MIT"

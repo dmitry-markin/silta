@@ -47,8 +47,8 @@ maintainer-scripts = "debian"
 assets = [
   ["target/release/siltad", "usr/bin/", "755"],
   ["target/release/silta-claude", "usr/bin/", "755"],
-  ["target/release/silta-session-log", "usr/lib/silta/", "755"],
-  ["../../deploy/silta-session", "usr/lib/silta/", "755"],
+  ["target/release/silta-session", "usr/lib/silta/", "755"],
+  ["../../deploy/silta-precompact-block", "usr/lib/silta/", "755"],
   ["../../deploy/silta-session-add", "usr/sbin/", "755"],
   ["../../deploy/siltad.service", "usr/lib/systemd/system/", "644"],
   ["../../deploy/silta-session@.service", "usr/lib/systemd/system/", "644"],

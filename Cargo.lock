@@ -3467,7 +3467,7 @@ dependencies = [
 
 [[package]]
 name = "silta"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3481,7 +3481,7 @@ dependencies = [
 
 [[package]]
 name = "silta-claude"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3500,8 +3500,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "silta-session"
+version = "0.5.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "silta",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "siltad"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",

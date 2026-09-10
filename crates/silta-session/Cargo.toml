@@ -1,0 +1,16 @@
+[package]
+name = "silta-session"
+description = "Launcher and supervisor of one Silta session: runs Claude Code headless, reduces its stream for the journal, rotates the session when its context grows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+silta.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["process"] }
+tokio-util.workspace = true
