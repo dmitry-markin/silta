@@ -29,16 +29,19 @@ Environment=SILTA_CLAUDE_BIN=/usr/bin/silta-claude
 Environment=SILTA_STOP_GRACE=120
 # Session rotation (docs/session-rotation-design.md): a session whose context has
 # reached ROTATE_CONTEXT_TOKENS and that has been idle for ROTATE_IDLE_SECONDS, or whose
-# Claude Code wanted to compact, is asked for a handoff and replaced by a fresh one. The
-# two caps bound the wait for a quiet moment and the handoff turn; RETRY is the pause
-# after a handoff turn that failed. SILTA_ROTATE=0 switches it off for one mind.
+# Claude Code wanted to compact, is asked for a handoff and then compacted in place (a
+# session in use) or replaced by a fresh one (idle for ROTATE_IDLE_SECONDS). The two
+# caps bound the wait for a quiet moment and the handoff turn (the compaction too);
+# RETRY is the pause after a handoff turn that failed. SILTA_ROTATE=0 switches it off
+# for one mind.
 Environment=SILTA_ROTATE=1
 Environment=SILTA_ROTATE_CONTEXT_TOKENS=300000
 Environment=SILTA_ROTATE_IDLE_SECONDS=14400
 Environment=SILTA_ROTATE_QUIET_SECONDS=1800
 Environment=SILTA_ROTATE_HANDOFF_SECONDS=900
 Environment=SILTA_ROTATE_RETRY_SECONDS=900
-# Dated copies of the memory directory taken at every rotation, kept under backups/.
+# Rotations whose snapshots (memory and transcript, before and after the handoff) are
+# kept under backups/.
 Environment=SILTA_BACKUPS_KEEP=10
 # Claude Code: the install owned by the claude user, read-only here, never updating
 # itself. CLAUDE_BIN may name /opt/claude/.local/share/claude/versions/<n> to pin one.

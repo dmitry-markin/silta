@@ -4,9 +4,11 @@
 //! It runs Claude Code headless in stream-json mode, owns its stdin and stdout, sends
 //! the host line that starts the first turn, reduces every output line to a journal
 //! line (the conversation's texts never reach the journal), resumes the saved session
-//! id across restarts as long as its transcript exists, and rotates the session into a
-//! fresh one when its context has grown and it is idle, or when Claude Code wanted to
-//! compact on its own (`docs/session-rotation-design.md`). Closing stdin is the
+//! id across restarts as long as its transcript exists, and rotates the session when
+//! its context has grown and it is idle, or when Claude Code wanted to compact on its
+//! own (`docs/session-rotation-design.md`): a handoff note first, then a `/compact`
+//! in place for a warm session or a fresh id for a cold one, with memory and
+//! transcript copied to `backups/` before and after the handoff. Closing stdin is the
 //! graceful stop; a session that does not exit within the grace is killed.
 
 pub mod contract;
@@ -30,7 +32,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use contract::Contract;
-use rotation::{Action, Limits, Reason, Tracker, HANDOFF_ATTEMPTS};
+use rotation::{Action, Fresh, Limits, Moment, Reason, Tracker, HANDOFF_ATTEMPTS};
 use state::{HandoffWatch, Next, Paths, HANDOFF_NOTE};
 
 /// The channel plugin, last on the command line because `--channels` is variadic.
@@ -76,6 +78,8 @@ struct Start {
     kind: Kind,
     /// Failed handoff turns of the pending rotation so far.
     failures: u32,
+    /// A retry whose before-handoff snapshot is still due.
+    snapshot: bool,
 }
 
 enum Outcome {
@@ -129,14 +133,9 @@ fn plan_start(cfg: &Config, paths: &Paths) -> std::io::Result<Start> {
     let fresh = |paths: &Paths, kind: Kind| -> std::io::Result<Start> {
         let id = state::new_id()?;
         paths.write_id(&id)?;
-        Ok(Start { id, resume: false, kind, failures: 0 })
+        Ok(Start { id, resume: false, kind, failures: 0, snapshot: false })
     };
     let rotated = |paths: &Paths, handoff: bool| -> std::io::Result<Start> {
-        match paths.backup_memory(cfg.backups_keep) {
-            Ok(0) => eprintln!("rotation: no memory directory to back up"),
-            Ok(n) => eprintln!("rotation: memory backed up ({n} files)"),
-            Err(err) => eprintln!("rotation: memory backup failed: {err}"),
-        }
         let start = fresh(paths, Kind::AfterRotation { handoff })?;
         paths.clear_rotation();
         eprintln!(
@@ -150,10 +149,10 @@ fn plan_start(cfg: &Config, paths: &Paths) -> std::io::Result<Start> {
     let next = paths.read_next();
     match next {
         Next::Fresh { handoff } => rotated(paths, handoff),
-        Next::Retry => match resumable {
+        Next::Retry { snapshot } => match resumable {
             Some(id) => {
                 eprintln!("resuming session {id} for the handoff");
-                Ok(Start { id, resume: true, kind: Kind::Retry, failures: 0 })
+                Ok(Start { id, resume: true, kind: Kind::Retry, failures: 0, snapshot })
             }
             None => {
                 eprintln!("rotation: the session cannot be resumed for its handoff");
@@ -171,7 +170,7 @@ fn plan_start(cfg: &Config, paths: &Paths) -> std::io::Result<Start> {
                         0
                     }
                 };
-                Ok(Start { id, resume: true, kind: Kind::Resumed, failures })
+                Ok(Start { id, resume: true, kind: Kind::Resumed, failures, snapshot: false })
             }
             None => {
                 if let Some(id) = &saved {
@@ -242,6 +241,7 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
     let mut run = Run {
         cfg,
         paths,
+        id: &start.id,
         stdin: child.stdin.take(),
         stopping: None,
         after: None,
@@ -250,6 +250,10 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
         contract: Contract::default(),
     };
     if start.kind == Kind::Retry {
+        // The combined start line is the handoff request; the files are quiet now.
+        if start.snapshot {
+            run.snapshot(Moment::BeforeHandoff);
+        }
         run.watch = Some(paths.watch_handoff());
     }
     run.send(&intro(&cfg.session, start.kind)).await;
@@ -383,6 +387,8 @@ async fn wait_or_kill(child: &mut Child) -> std::process::ExitStatus {
 struct Run<'a> {
     cfg: &'a Config,
     paths: &'a Paths,
+    /// The session id of this run, for the transcript's snapshot.
+    id: &'a str,
     stdin: Option<ChildStdin>,
     stopping: Option<Instant>,
     after: Option<Outcome>,
@@ -412,9 +418,23 @@ impl Run<'_> {
         }
     }
 
+    /// Memory and transcript to `backups/`, at an idle moment.
+    fn snapshot(&self, moment: Moment) {
+        match self.paths.snapshot(moment.name(), self.id, self.cfg.backups_keep) {
+            Ok(snap) => eprintln!(
+                "rotation: snapshot {} ({} memory files, transcript {})",
+                snap.name,
+                snap.memory_files,
+                if snap.transcript { "copied" } else { "not found" }
+            ),
+            Err(err) => eprintln!("rotation: snapshot {} failed: {err}", moment.name()),
+        }
+    }
+
     async fn act(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
+                Action::Snapshot(moment) => self.snapshot(moment),
                 Action::MarkPending => {
                     let why = format!("threshold: context {} tokens, idle {} s", self.tracker.context(), self.cfg.limits.idle.as_secs());
                     if let Err(err) = self.paths.write_marker(&why) {
@@ -435,8 +455,25 @@ impl Run<'_> {
                 Action::AwaitHandoff => {
                     eprintln!("rotation: a turn ended without the handoff note written; still waiting for the handoff turn");
                 }
-                Action::Rotate => {
-                    eprintln!("rotation: handoff written; stopping the session for a fresh start");
+                Action::Compact => {
+                    eprintln!("rotation: handoff written; compacting the conversation in place (context {} tokens)", self.tracker.context());
+                    self.send(compact()).await;
+                }
+                Action::AwaitCompaction => {
+                    eprintln!("rotation: a turn ended without a compaction boundary; still waiting for the compaction");
+                }
+                Action::Compacted => {
+                    eprintln!("rotation: conversation compacted; the session goes on under the same id");
+                    self.paths.clear_rotation();
+                    self.send(&compacted(&self.cfg.session)).await;
+                }
+                Action::Rotate { reason } => {
+                    let why = match reason {
+                        Fresh::IdleGap => format!("handoff written; the session was idle for {} s, so the cache is cold", self.cfg.limits.idle.as_secs()),
+                        Fresh::CompactionFailed => "the compaction failed".to_owned(),
+                        Fresh::CompactionCut => format!("the compaction did not end within {} s", self.cfg.limits.handoff.as_secs()),
+                    };
+                    eprintln!("rotation: {why}; stopping the session for a fresh start");
                     self.finish(true);
                 }
                 Action::GiveUp { reason } => {
@@ -447,11 +484,11 @@ impl Run<'_> {
                     eprintln!("rotation: {why}; giving the handoff up and stopping the session for a fresh start");
                     self.finish(false);
                 }
-                Action::Retry => {
+                Action::Retry { handoff_requested } => {
                     let agents = self.tracker.agents();
                     let outstanding = if agents.is_empty() { String::new() } else { format!(" (agents outstanding: {})", agents.iter().cloned().collect::<Vec<_>>().join(", ")) };
                     eprintln!("rotation: the turn did not end within the cap{outstanding}; cutting it and resuming once for the handoff");
-                    if let Err(err) = self.paths.write_next(Next::Retry) {
+                    if let Err(err) = self.paths.write_next(Next::Retry { snapshot: !handoff_requested }) {
                         eprintln!("rotation: cannot record the next step: {err}");
                     }
                     self.after = Some(Outcome::Again { not_before: None });
@@ -538,4 +575,20 @@ fn intro(session: &str, kind: Kind) -> String {
 /// rewrites it as the handoff turn.
 pub fn handoff() -> &'static str {
     "Write your handoff now: the session is about to be rotated. This line comes from the host, not from a person. Rewrite the memory note `handoff` (the file handoff.md in your memory directory) even if nothing is pending: the host waits for that file to change and takes the turn that rewrites it as your handoff turn. End your turn when it is written."
+}
+
+/// The compaction command sent after the handoff of a warm session (design section
+/// 3a): a `/compact` with the instructions for the summary, written to stdin like a
+/// host line. Claude Code answers with a `compact_boundary` and a `result`.
+pub fn compact() -> &'static str {
+    "/compact Keep, in this order: the person's name and how we work together, in the voice of the conversation; decisions made in this session; open tasks and promises with their state; the ids of background agents and timers; then the most recent messages between the person and the assistant in the chat, the last ten from each side or so, as close to verbatim as space allows, as plain lines of the form `name, time: text`, one per message, where the name is the person's name as it appears in the chat or your own name, without the channel tags or tool-call wrappers, keeping the room id and the event ids of the last two incoming messages; timer wakeups, host lines and tool results are not messages. Drop tool output, research contents and anything already in memory."
+}
+
+/// The host line after a compaction: the summary carries the thread, the note carries
+/// the facts, and the session clears the note as a fresh one would.
+fn compacted(session: &str) -> String {
+    format!(
+        "Context was compacted at {} UTC; the handoff note is in memory. This line comes from the host, not from a person, and session {session} goes on under the same id: timers and background agents survive. Read the memory note `handoff`, act on what it says is pending, then rewrite it to say that nothing is pending. Then end the turn and stay idle until a message arrives.",
+        stamp()
+    )
 }

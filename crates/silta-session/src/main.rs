@@ -75,7 +75,8 @@ struct Args {
     #[arg(long, env = "SILTA_ROTATE_RETRY_SECONDS", default_value_t = 900)]
     rotate_retry_seconds: u64,
 
-    /// Memory backups kept under the state directory.
+    /// Rotations whose snapshots (memory and transcript, two per rotation) are kept
+    /// under the state directory's backups/.
     #[arg(long, env = "SILTA_BACKUPS_KEEP", default_value_t = 10)]
     backups_keep: usize,
 }

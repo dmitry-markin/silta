@@ -9,7 +9,7 @@ use crate::stream::Event;
 
 /// The Claude Code versions whose output the supervisor was checked against; any other
 /// version gets a line at every start until the list is extended.
-pub const TESTED_VERSIONS: &[&str] = &["2.1.263", "2.1.267"];
+pub const TESTED_VERSIONS: &[&str] = &["2.1.263", "2.1.267", "2.1.268"];
 
 #[derive(Debug, Default)]
 pub struct Contract {

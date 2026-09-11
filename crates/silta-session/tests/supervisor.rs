@@ -1,5 +1,7 @@
 //! The supervisor against a fake claude (`tests/fake-claude.sh`): starts, resumes, the
-//! resume rule, the graceful stop, and the rotation paths with caps of a few seconds.
+//! resume rule, the graceful stop, and the rotation paths with caps of a few seconds:
+//! the fresh id after an idle gap, the compaction in place of a warm session, the
+//! fall-backs, and the two snapshots.
 
 use std::{
     fs,
@@ -7,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use silta_session::{handoff, rotation::Limits, Config};
+use silta_session::{compact, handoff, rotation::Limits, Config};
 use tokio_util::sync::CancellationToken;
 
 struct Fixture {
@@ -39,7 +41,7 @@ impl Fixture {
             limits: Limits {
                 enabled: true,
                 context_tokens: 500,
-                idle: Duration::from_secs(2),
+                idle: Duration::from_secs(10),
                 quiet: Duration::from_secs(3),
                 handoff: Duration::from_secs(3),
                 retry_pause: Duration::from_secs(3),
@@ -60,6 +62,30 @@ impl Fixture {
         fs::read_to_string(self.home.join("session-id")).unwrap().trim().to_owned()
     }
 
+    /// The snapshot directories under `backups/`, oldest first; the fake's handoff is
+    /// so quick that both snapshots of a rotation share a second, so the moment
+    /// breaks the tie.
+    fn snapshots(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = fs::read_dir(self.home.join("backups")).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+        dirs.sort_by_key(|p| {
+            let n = name(p);
+            (n[..20].to_owned(), n.ends_with("-after-handoff"))
+        });
+        dirs
+    }
+
+    fn transcript(&self, id: &str) -> PathBuf {
+        self.home.join(format!(".claude/projects/-workspace/{id}.jsonl"))
+    }
+
+    /// Touches the marker and waits for the `nth` compaction in place of `id`, then
+    /// for the host line that follows it.
+    async fn rotate_by_marker_and_compact(&self, id: &str, nth: usize) -> String {
+        self.set("rotate-requested", "test");
+        self.until(20, |l| l.matches(&format!("compact {id}")).count() >= nth).await;
+        self.until(10, |l| l.matches("line Context was compacted at").count() >= nth).await
+    }
+
     /// Waits until the fake's log satisfies `pred`, up to `secs`.
     async fn until(&self, secs: u64, pred: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + Duration::from_secs(secs);
@@ -76,6 +102,10 @@ impl Fixture {
 
 fn starts(log: &str) -> Vec<&str> {
     log.lines().filter(|l| l.starts_with("start ")).collect()
+}
+
+fn name(path: &Path) -> String {
+    path.file_name().unwrap().to_string_lossy().into_owned()
 }
 
 #[tokio::test]
@@ -141,9 +171,10 @@ async fn threshold_rotation_with_handoff() {
         let stop = stop.clone();
         async move { silta_session::run(&cfg, stop).await }
     });
-    // Large context, and idle for 2 s after the start turn: the handoff is requested,
-    // the fake writes the note and ends the turn, a fresh session starts. The fresh
-    // session must report a small context, or it rotates too.
+    // Large context, and idle for 10 s after the start turn: the handoff is requested,
+    // the fake writes the note and ends the turn, and because the session was idle for
+    // the idle gap a fresh session starts rather than a compaction. The fresh session
+    // must report a small context, or it rotates too.
     fx.until(20, |l| l.contains(handoff())).await;
     fx.set("fake-context", "10");
     let log = fx.until(20, |l| starts(l).len() == 2).await;
@@ -157,9 +188,17 @@ async fn threshold_rotation_with_handoff() {
     fx.until(10, |l| l.contains("after a rotation: a new conversation, and the previous session's handoff is in memory")).await;
     assert!(!fx.home.join("rotate-requested").exists());
     assert!(!fx.home.join("rotation.json").exists());
-    let backups: Vec<_> = fs::read_dir(fx.home.join("backups")).unwrap().flatten().collect();
-    assert_eq!(backups.len(), 1);
-    assert!(backups[0].path().join("-workspace/handoff.md").is_file());
+    assert!(!log.contains(&format!("compact {first}")), "an idle session is not compacted: {log}");
+    // Two snapshots: before the handoff (no memory directory existed yet, the
+    // transcript did) and after it (the note and the transcript).
+    let snaps = fx.snapshots();
+    assert_eq!(snaps.len(), 2, "{snaps:?}");
+    assert!(name(&snaps[0]).ends_with("-before-handoff"), "{snaps:?}");
+    assert!(snaps[0].join(format!("-workspace/{first}.jsonl")).is_file());
+    assert!(!snaps[0].join("-workspace/memory").exists());
+    assert!(name(&snaps[1]).ends_with("-after-handoff"), "{snaps:?}");
+    assert_eq!(fs::read_to_string(snaps[1].join("-workspace/memory/handoff.md")).unwrap().trim(), format!("handoff of {first}"));
+    assert!(snaps[1].join(format!("-workspace/{first}.jsonl")).is_file());
     // The new session is small: no second rotation.
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert_eq!(starts(&fx.log()).len(), 2);
@@ -198,6 +237,153 @@ async fn marker_with_a_hanging_handoff_retries_once_then_gives_up() {
     fx.until(10, |l| l.contains("could not finish its handoff")).await;
     assert!(!fx.home.join("rotate-requested").exists());
     assert!(!fx.home.join("rotation.json").exists());
+    // The clean snapshot was taken at the request; the retry took none, and no
+    // handoff turn ended, so there is no after-handoff copy.
+    let snaps: Vec<String> = fx.snapshots().iter().map(|p| name(p)).collect();
+    assert_eq!(snaps.len(), 1, "{snaps:?}");
+    assert!(snaps[0].ends_with("-before-handoff"));
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
+async fn a_cut_before_the_handoff_takes_the_clean_snapshot_at_the_retry() {
+    let fx = Fixture::new("cutwaiting");
+    fx.set("fake-context", "10");
+    let cfg = fx.config();
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| l.contains("line Session test started")).await;
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    let first = fx.id();
+    // The rotation is pending at the next start and the start turn hangs: the quiet
+    // cap (3 s) cuts it before any handoff line went out, the session is resumed with
+    // the combined line, and the clean snapshot is taken just before that line. The
+    // handoff then succeeds and the warm session is compacted in place.
+    fx.set("fake-mode", "hangonce");
+    fx.set("rotate-requested", "test");
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    let log = fx.until(30, |l| l.contains("line Context was compacted at")).await;
+    let resumed = format!("start {first} resumed");
+    assert_eq!(starts(&log), vec![format!("start {first} ").as_str(), resumed.as_str(), resumed.as_str()], "{log}");
+    assert!(log.contains("Its last turn was cut by the host"));
+    assert!(log.contains(&format!("handoff {first}")));
+    assert!(log.contains(&format!("compact {first}")));
+    let snaps: Vec<String> = fx.snapshots().iter().map(|p| name(p)).collect();
+    assert_eq!(snaps.len(), 2, "{snaps:?}");
+    assert!(snaps[0].ends_with("-before-handoff"));
+    assert!(snaps[1].ends_with("-after-handoff"));
+    assert_eq!(fx.id(), first);
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
+async fn a_marker_compacts_a_warm_session_in_place() {
+    let fx = Fixture::new("compact");
+    fx.set("fake-context", "10");
+    let cfg = fx.config();
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| l.contains("line Session test started")).await;
+    let first = fx.id();
+    // A note from before, so that the clean snapshot has something to show.
+    let memory = fx.home.join(".claude/projects/-workspace/memory");
+    fs::create_dir_all(&memory).unwrap();
+    fs::write(memory.join("handoff.md"), "nothing pending").unwrap();
+    // The marker right after a turn: the session is warm, so the handoff is followed
+    // by the compaction, the session keeps its id and claude is not restarted.
+    let log = fx.rotate_by_marker_and_compact(&first, 1).await;
+    assert_eq!(starts(&log).len(), 1, "no restart: {log}");
+    assert_eq!(fx.id(), first);
+    assert!(log.contains(&format!("line {}", handoff())));
+    assert!(log.contains(&format!("line {}", compact())));
+    let handoff_at = log.find(&format!("handoff {first}")).unwrap();
+    let compact_at = log.find(&format!("compact {first}")).unwrap();
+    assert!(handoff_at < compact_at);
+    assert!(log.contains("the handoff note is in memory. This line comes from the host"));
+    assert!(!fx.home.join("rotate-requested").exists());
+    assert!(!fx.home.join("rotation.json").exists());
+    // The snapshots: the clean note before, the handoff after; the transcript copied
+    // after the handoff lacks the compact line the live one has.
+    let snaps = fx.snapshots();
+    assert_eq!(snaps.len(), 2, "{snaps:?}");
+    assert!(name(&snaps[0]).ends_with("-before-handoff"));
+    assert_eq!(fs::read_to_string(snaps[0].join("-workspace/memory/handoff.md")).unwrap(), "nothing pending");
+    assert!(name(&snaps[1]).ends_with("-after-handoff"));
+    assert_eq!(fs::read_to_string(snaps[1].join("-workspace/memory/handoff.md")).unwrap().trim(), format!("handoff of {first}"));
+    let copy = fs::read_to_string(snaps[1].join(format!("-workspace/{first}.jsonl"))).unwrap();
+    assert!(copy.contains("Write your handoff now") && !copy.contains("/compact"), "{copy}");
+    assert!(fs::read_to_string(fx.transcript(&first)).unwrap().contains("/compact"));
+    // A second rotation, with a person's turn queued ahead of the command: its result
+    // does not end the compaction, which follows.
+    fx.set("fake-mode", "busycompact");
+    let log = fx.rotate_by_marker_and_compact(&first, 2).await;
+    assert_eq!(log.matches(&format!("compact {first}")).count(), 2);
+    assert_eq!(log.matches("line Context was compacted at").count(), 2);
+    let aside_at = log.find(&format!("aside {first}")).expect("the aside turn ran");
+    assert!(aside_at < log.rfind(&format!("compact {first}")).unwrap());
+    assert_eq!(starts(&log).len(), 1, "no restart: {log}");
+    assert_eq!(fx.snapshots().len(), 4);
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_or_hanging_compaction_starts_a_fresh_session() {
+    let fx = Fixture::new("nocompact");
+    fx.set("fake-context", "10");
+    let cfg = fx.config();
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| l.contains("line Session test started")).await;
+    let first = fx.id();
+    // Claude Code reports the compaction blocked: the handoff is done, so the fresh
+    // session gets the start line that points at the note.
+    fx.set("fake-mode", "nocompact");
+    fx.set("rotate-requested", "test");
+    let log = fx.until(20, |l| starts(l).len() == 2).await;
+    assert!(log.contains(&format!("handoff {first}")));
+    assert!(log.contains(&format!("compact-failed {first}")));
+    let second = fx.id();
+    assert_ne!(second, first);
+    assert_eq!(starts(&log)[1], format!("start {second} "), "fresh, not resumed: {log}");
+    fx.until(10, |l| l.contains("after a rotation: a new conversation, and the previous session's handoff is in memory")).await;
+    assert!(!fx.home.join("rotate-requested").exists());
+    // A compaction that never ends is cut at the handoff cap (3 s) plus the grace
+    // (2 s), with the same fresh start.
+    fx.set("fake-mode", "compacthang");
+    fx.set("rotate-requested", "test");
+    let log = fx.until(30, |l| starts(l).len() == 3).await;
+    assert!(log.contains(&format!("handoff {second}")));
+    assert!(!log.contains(&format!("compact {second}")));
+    let third = fx.id();
+    assert_ne!(third, second);
+    assert_eq!(starts(&log)[2], format!("start {third} "));
+    fx.set("fake-mode", "ok");
+    fx.until(10, |l| l.matches("the previous session's handoff is in memory").count() == 2).await;
+    assert_eq!(fx.snapshots().len(), 4);
     stop.cancel();
     assert_eq!(run.await.unwrap(), 0);
     fs::remove_dir_all(&fx.home).unwrap();
@@ -225,12 +411,20 @@ async fn a_failed_handoff_turn_is_retried_after_the_pause() {
     assert!(fx.home.join("rotate-requested").exists());
     assert_eq!(fs::read_to_string(fx.home.join("rotation.json")).unwrap().trim(), r#"{"next":"postponed","failures":1}"#);
     fx.until(10, |l| l.contains("resumed its history. You are connected")).await;
-    // After the pause the handoff is requested again and succeeds.
+    // After the pause the handoff is requested again and succeeds; the session is
+    // warm, so it is compacted in place. The second request takes no clean snapshot.
     fx.set("fake-mode", "ok");
-    let log = fx.until(20, |l| starts(l).len() == 3).await;
+    let log = fx.until(20, |l| l.contains("line Context was compacted at")).await;
     assert_eq!(log.matches(handoff()).count(), 2);
     assert!(log.contains(&format!("handoff {first}")));
-    assert_ne!(fx.id(), first);
+    assert!(log.contains(&format!("compact {first}")));
+    assert_eq!(starts(&log).len(), 2);
+    assert_eq!(fx.id(), first);
+    assert!(!fx.home.join("rotate-requested").exists());
+    assert!(!fx.home.join("rotation.json").exists());
+    let snaps: Vec<String> = fx.snapshots().iter().map(|p| name(p)).collect();
+    assert_eq!(snaps.len(), 2, "{snaps:?}");
+    assert!(snaps[0].ends_with("-before-handoff") && snaps[1].ends_with("-after-handoff"), "{snaps:?}");
     stop.cancel();
     assert_eq!(run.await.unwrap(), 0);
     fs::remove_dir_all(&fx.home).unwrap();
@@ -295,13 +489,14 @@ async fn the_rotation_waits_for_background_tasks() {
         let stop = stop.clone();
         async move { silta_session::run(&cfg, stop).await }
     });
-    let log = fx.until(20, |l| starts(l).len() == 3).await;
+    let log = fx.until(20, |l| l.contains("line Context was compacted at")).await;
     let done = log.find("background done").expect("the background task reported");
     let handoff = log.find(&format!("line {}", handoff())).expect("the handoff was requested");
     assert!(handoff > done, "the handoff was requested before the background task ended:\n{log}");
     assert!(log.contains(&format!("handoff {first}")));
-    assert_eq!(starts(&log)[1], format!("start {first} resumed"));
-    assert_eq!(starts(&log)[2], format!("start {} ", fx.id()), "fresh, not resumed after a cut: {log}");
+    assert!(log.contains(&format!("compact {first}")));
+    assert_eq!(starts(&log), vec![format!("start {first} ").as_str(), format!("start {first} resumed").as_str()], "compacted, not cut: {log}");
+    assert_eq!(fx.id(), first);
     stop.cancel();
     assert_eq!(run.await.unwrap(), 0);
     fs::remove_dir_all(&fx.home).unwrap();
@@ -332,13 +527,12 @@ async fn the_handoff_turn_is_the_one_that_rewrites_the_note() {
     fs::write(&note, "nothing pending").unwrap();
     fs::File::open(&note).unwrap().set_modified(std::time::SystemTime::now() - Duration::from_secs(60)).unwrap();
     fx.set("fake-mode", "busy");
-    fx.set("rotate-requested", "test");
-    let log = fx.until(25, |l| starts(l).len() == 2).await;
+    let log = fx.rotate_by_marker_and_compact(&first, 1).await;
     let aside = log.find(&format!("aside {first}")).expect("the aside turn ran");
     let handoff = log.find(&format!("handoff {first}")).expect("the handoff was written after the aside turn");
     assert!(aside < handoff);
-    assert_eq!(starts(&log)[1], format!("start {} ", fx.id()), "fresh, not resumed: {log}");
-    fx.until(10, |l| l.contains("the previous session's handoff is in memory")).await;
+    assert_eq!(starts(&log).len(), 1, "compacted, not restarted: {log}");
+    assert_eq!(fx.id(), first);
     assert_eq!(fs::read_to_string(&note).unwrap().trim(), format!("handoff of {first}"));
     stop.cancel();
     assert_eq!(run.await.unwrap(), 0);
@@ -374,9 +568,11 @@ async fn a_unit_stop_during_the_wait_keeps_the_rotation_pending() {
         let stop = stop.clone();
         async move { silta_session::run(&cfg, stop).await }
     });
-    let log = fx.until(15, |l| starts(l).len() == 3).await;
-    assert_eq!(starts(&log)[1], format!("start {first} resumed"));
+    let log = fx.until(15, |l| l.contains("line Context was compacted at")).await;
+    assert_eq!(starts(&log), vec![format!("start {first} ").as_str(), format!("start {first} resumed").as_str()]);
     assert!(log.contains(&format!("handoff {first}")));
+    assert!(log.contains(&format!("compact {first}")));
+    assert_eq!(fx.id(), first);
     stop.cancel();
     assert_eq!(run.await.unwrap(), 0);
     fs::remove_dir_all(&fx.home).unwrap();

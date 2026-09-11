@@ -30,6 +30,9 @@ pub enum Event {
     BackgroundTasks { ids: Vec<String> },
     /// Claude Code compacted the conversation; `auto` when on its own.
     Compacted { auto: bool },
+    /// Claude Code reported that a compaction did not go through (a `status` line
+    /// with a `compact_result` other than `success`, seen when a hook blocks it).
+    CompactionFailed,
     /// Anything else.
     Other,
 }
@@ -76,6 +79,10 @@ fn system_event(map: &Map<String, Value>) -> Event {
         },
         Some("compact_boundary") => Event::Compacted {
             auto: map.get("compact_metadata").and_then(|m| m.get("trigger")).and_then(Value::as_str) == Some("auto"),
+        },
+        Some("status") => match map.get("compact_result").and_then(Value::as_str) {
+            Some(result) if result != "success" => Event::CompactionFailed,
+            _ => Event::Other,
         },
         Some("background_tasks_changed") => Event::BackgroundTasks {
             ids: map
@@ -292,6 +299,17 @@ mod tests {
         let compacted = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":167000},"session_id":"af92"}"#;
         assert_eq!(summarize(compacted), "system compact_boundary: pre_tokens=167000 trigger=auto");
         assert_eq!(read(compacted).1, Event::Compacted { auto: true });
+        let manual = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":19922,"post_tokens":884,"duration_ms":8574,"preserved_segment":{"head_uuid":"e8"}},"session_id":"af92","uuid":"c1"}"#;
+        assert_eq!(summarize(manual), "system compact_boundary: duration_ms=8574 post_tokens=884 pre_tokens=19922 trigger=manual");
+        assert_eq!(read(manual).1, Event::Compacted { auto: false });
+        let compacting = r#"{"type":"system","subtype":"status","status":"compacting","session_id":"af92","uuid":"4b"}"#;
+        assert_eq!(summarize(compacting), "system status: status=compacting");
+        assert_eq!(read(compacting).1, Event::Other);
+        let done = r#"{"type":"system","subtype":"status","status":null,"compact_result":"success","session_id":"af92","uuid":"e1"}"#;
+        assert_eq!(read(done).1, Event::Other);
+        let blocked = r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"skipped: Compaction blocked by PreCompact hook: [x]: y","session_id":"af92","uuid":"e2"}"#;
+        assert_eq!(summarize(blocked), "system status: compact_result=failed");
+        assert_eq!(read(blocked).1, Event::CompactionFailed);
         let changed = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"t1","task_type":"local_agent","description":"look things up"},{"task_id":"m1","task_type":"monitor_ws","description":"watch","ambient":true}],"session_id":"af92"}"#;
         assert_eq!(summarize(changed), "system background_tasks_changed: tasks=2");
         assert_eq!(read(changed).1, Event::BackgroundTasks { ids: vec!["t1".into()] });

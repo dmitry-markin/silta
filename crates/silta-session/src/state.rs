@@ -1,6 +1,6 @@
 //! What the supervisor keeps in the state directory, the session's `HOME`: the saved
-//! session id, the rotation marker and the rotation's next step, the memory backups,
-//! and the pruning of Claude Code's cache.
+//! session id, the rotation marker and the rotation's next step, the snapshots of
+//! memory and transcript, and the pruning of Claude Code's cache.
 
 use std::{
     ffi::OsString,
@@ -19,8 +19,10 @@ pub enum Next {
     /// Resume the saved session, or start one if it cannot be resumed.
     #[default]
     Normal,
-    /// Resume the saved session with the combined cut-and-handoff line.
-    Retry,
+    /// Resume the saved session with the combined cut-and-handoff line; `snapshot`
+    /// says whether the before-handoff snapshot is still due (the cut came before the
+    /// handoff line went out).
+    Retry { snapshot: bool },
     /// Resume the saved session normally; the rotation stays pending after this many
     /// failed handoff turns.
     Postponed { failures: u32 },
@@ -46,6 +48,15 @@ impl HandoffWatch {
     pub fn note_existed(&self) -> bool {
         self.note_existed
     }
+}
+
+/// What a snapshot holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    /// The directory's name under `backups/`.
+    pub name: String,
+    pub memory_files: usize,
+    pub transcript: bool,
 }
 
 pub struct Paths {
@@ -178,28 +189,40 @@ impl Paths {
         })
     }
 
-    /// A dated copy of every project's memory directory under `backups/`, keeping the
-    /// last `keep`. Returns the number of files copied.
-    pub fn backup_memory(&self, keep: usize) -> io::Result<usize> {
-        let sources = self.memory_dirs();
-        if sources.is_empty() {
-            return Ok(0);
+    /// A snapshot named `<time>-<moment>` under `backups/`: the memory directory of
+    /// every project and the session's transcript, laid out as under
+    /// `.claude/projects/` so that a recovery by hand is a copy back over the live
+    /// files. Keeps the last `keep` rotations' worth, two snapshots each. Returns the
+    /// count of memory files copied and whether the transcript was found.
+    pub fn snapshot(&self, moment: &str, id: &str, keep: usize) -> io::Result<Snapshot> {
+        let target = self.backups().join(format!("{}-{moment}", silta::time::rfc3339_utc(unix_millis())));
+        let mut memory_files = 0;
+        for (slug, memory) in self.memory_dirs() {
+            memory_files += copy_dir(&memory, &target.join(&slug).join("memory"))?;
         }
-        let target = self.backups().join(format!("memory-{}", silta::time::rfc3339_utc(unix_millis())));
-        let mut copied = 0;
-        for (slug, memory) in sources {
-            copied += copy_dir(&memory, &target.join(slug))?;
-        }
+        let transcript = match self.transcript(id) {
+            Some(path) => {
+                let slug = path.parent().and_then(Path::file_name).map(OsString::from).unwrap_or_default();
+                let dir = target.join(slug);
+                fs::create_dir_all(&dir)?;
+                fs::copy(&path, dir.join(format!("{id}.jsonl")))?;
+                true
+            }
+            None => {
+                fs::create_dir_all(&target)?;
+                false
+            }
+        };
         let mut old: Vec<PathBuf> = fs::read_dir(self.backups())?
             .flatten()
             .map(|d| d.path())
-            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("memory-")))
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with("-before-handoff") || n.ends_with("-after-handoff")))
             .collect();
         old.sort();
-        for dir in old.iter().rev().skip(keep) {
+        for dir in old.iter().rev().skip(2 * keep) {
             let _ = fs::remove_dir_all(dir);
         }
-        Ok(copied)
+        Ok(Snapshot { name: target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), memory_files, transcript })
     }
 
     /// Claude Code keeps one log file per start of an MCP server and never removes them.
@@ -292,8 +315,9 @@ mod tests {
         paths.write_next(Next::Fresh { handoff: true }).unwrap();
         assert_eq!(fs::read_to_string(dir.join("rotation.json")).unwrap(), "{\"next\":\"fresh\",\"handoff\":true}\n");
         assert_eq!(paths.read_next(), Next::Fresh { handoff: true });
-        paths.write_next(Next::Retry).unwrap();
-        assert_eq!(paths.read_next(), Next::Retry);
+        paths.write_next(Next::Retry { snapshot: true }).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("rotation.json")).unwrap(), "{\"next\":\"retry\",\"snapshot\":true}\n");
+        assert_eq!(paths.read_next(), Next::Retry { snapshot: true });
         paths.write_next(Next::Postponed { failures: 1 }).unwrap();
         assert_eq!(fs::read_to_string(dir.join("rotation.json")).unwrap(), "{\"next\":\"postponed\",\"failures\":1}\n");
         assert_eq!(paths.read_next(), Next::Postponed { failures: 1 });
@@ -358,25 +382,41 @@ mod tests {
     }
 
     #[test]
-    fn memory_backups_copy_every_project_and_keep_the_last_n() {
+    fn snapshots_copy_memory_and_transcript_and_keep_two_per_rotation() {
         let dir = scratch("backup");
         let paths = Paths::new(&dir);
-        assert_eq!(paths.backup_memory(2).unwrap(), 0);
-        let memory = dir.join(".claude/projects/-w/memory");
+        // Nothing to copy yet: an empty snapshot still marks the moment.
+        let empty = paths.snapshot("before-handoff", "s1", 2).unwrap();
+        assert_eq!((empty.memory_files, empty.transcript), (0, false));
+        assert!(empty.name.ends_with("-before-handoff"));
+        assert!(dir.join("backups").join(&empty.name).is_dir());
+        let project = dir.join(".claude/projects/-w");
+        let memory = project.join("memory");
         fs::create_dir_all(memory.join("sub")).unwrap();
         fs::write(memory.join("MEMORY.md"), "index").unwrap();
         fs::write(memory.join("sub/note.md"), "note").unwrap();
-        for stamp in ["2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z"] {
-            fs::create_dir_all(dir.join("backups").join(format!("memory-{stamp}"))).unwrap();
+        fs::write(project.join("s1.jsonl"), "{}\n").unwrap();
+        for name in ["2020-01-01T00:00:00Z-before-handoff", "2020-01-01T00:10:00Z-after-handoff", "2020-01-02T00:00:00Z-before-handoff", "2020-01-02T00:10:00Z-after-handoff", "memory-2020-01-03T00:00:00Z"] {
+            fs::create_dir_all(dir.join("backups").join(name)).unwrap();
         }
-        assert_eq!(paths.backup_memory(2).unwrap(), 2);
+        let snap = paths.snapshot("after-handoff", "s1", 2).unwrap();
+        assert_eq!((snap.memory_files, snap.transcript), (2, true));
         let mut names: Vec<String> = fs::read_dir(dir.join("backups")).unwrap().flatten().map(|d| d.file_name().to_string_lossy().into_owned()).collect();
         names.sort();
-        assert_eq!(names.len(), 2, "{names:?}");
-        assert_eq!(names[0], "memory-2020-01-02T00:00:00Z");
-        let latest = dir.join("backups").join(&names[1]);
-        assert_eq!(fs::read_to_string(latest.join("-w/sub/note.md")).unwrap(), "note");
-        assert_eq!(fs::read_to_string(latest.join("-w/MEMORY.md")).unwrap(), "index");
+        // Two rotations' worth (four) kept, the oldest two gone; a copy from before
+        // the snapshots is not counted and not touched.
+        assert_eq!(names.len(), 5, "{names:?}");
+        assert_eq!(names[0], "2020-01-02T00:00:00Z-before-handoff");
+        assert_eq!(names[1], "2020-01-02T00:10:00Z-after-handoff");
+        // The two of this test share a second and sort by moment.
+        let mut ours = [empty.name.clone(), snap.name.clone()];
+        ours.sort();
+        assert_eq!(&names[2..4], &ours[..]);
+        assert_eq!(names[4], "memory-2020-01-03T00:00:00Z");
+        let latest = dir.join("backups").join(&snap.name);
+        assert_eq!(fs::read_to_string(latest.join("-w/memory/sub/note.md")).unwrap(), "note");
+        assert_eq!(fs::read_to_string(latest.join("-w/memory/MEMORY.md")).unwrap(), "index");
+        assert_eq!(fs::read_to_string(latest.join("-w/s1.jsonl")).unwrap(), "{}\n");
         fs::remove_dir_all(dir).unwrap();
     }
 }
