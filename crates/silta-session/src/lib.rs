@@ -570,7 +570,7 @@ fn intro(session: &str, kind: Kind) -> String {
             "Session {session} started at {now} UTC after a rotation: a new conversation. The previous session could not finish its handoff, so the handoff note in memory may be stale. {channel} This line comes from the host, not from a person. Read the handoff note, then look for dangling work as after a restart: unanswered messages in the room, a promised step, an agent worth rerunning. Say what may have been interrupted, rewrite the handoff note to say that nothing is pending, and stay idle until a message arrives."
         ),
         Kind::Retry => format!(
-            "Session {session} restarted at {now} UTC and resumed its history. Its last turn was cut by the host because it ran too long, and the session is about to be rotated. This line comes from the host, not from a person. Write your handoff now into the memory note `handoff` (the file handoff.md in your memory directory; the host waits for that file to change and takes the turn that rewrites it as your handoff turn): the task in progress and its state, questions waiting on the person, promises made, background agents worth resuming. Do not resume the work; end your turn as soon as the note is written."
+            "Session {session} restarted at {now} UTC and resumed its history. Its last turn was cut by the host because it ran too long, and the session is about to be rotated. This line comes from the host, not from a person. Write your handoff now into the memory note `handoff` (the file handoff.md in your memory directory; the host waits for that file to change and takes the turn that rewrites it as your handoff turn), with what the handoff rule in your instructions asks for. Do not resume the work; end your turn as soon as the note is written."
         ),
     }
 }
@@ -579,7 +579,7 @@ fn intro(session: &str, kind: Kind) -> String {
 /// section 6). It names the note's file and says why: the supervisor takes the turn that
 /// rewrites it as the handoff turn.
 pub fn handoff() -> &'static str {
-    "Write your handoff now: the session is about to be rotated. This line comes from the host, not from a person. Rewrite the memory note `handoff` (the file handoff.md in your memory directory) even if nothing is pending: the host waits for that file to change and takes the turn that rewrites it as your handoff turn. End your turn when it is written."
+    "Write your handoff now: the context is about to be compacted, and the compaction step will follow after this. This line comes from the host, not from a person. Rewrite the memory note `handoff` (the file handoff.md in your memory directory) even if nothing is pending: the host waits for that file to change and takes the turn that rewrites it as your handoff turn. End your turn when it is written."
 }
 
 /// The compaction command sent after the handoff (design section 3a): a `/compact` with the instructions for the summary, written to stdin like a
