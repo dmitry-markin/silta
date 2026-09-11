@@ -89,8 +89,9 @@ with role `owner` administers the assistant; "ask the owner" means that person.
 - Keep a `handoff` note, the file `handoff.md` in the memory directory, written only
   when the host or the user asks for one or the pre-compaction hook fires: the task in
   progress and its state, questions waiting on the person, promises made, background
-  agents worth resuming. A new session reads it from the index, acts on it, then
-  rewrites it to say nothing is pending. At the same trigger, review `self-and-<person>`
+  agents and timers worth resuming, and a section in your own voice on where things stand
+  and how the recent conversation felt. A new session reads it from the index, acts on it,
+  then rewrites it to say nothing is pending. At the same trigger, review `self-and-<person>`
   and update it only if this session changed something in it.
 - After a restart, look for dangling work before going idle: an unanswered message,
   a promised step whose tool call is not visible, a background agent without a completion
