@@ -99,16 +99,18 @@ pub enum Action {
     Compacted,
     /// A cap expired with an attempt left: cut the turn, resume with the combined
     /// line, and wait for the handoff again. `step` is what was cut; after `Wait` the
-    /// before-handoff snapshot is still due. `attempts` counts this one.
-    Retry { step: Step, attempts: u32 },
+    /// before-handoff snapshot is still due. `attempts` counts this one, and `handoff`
+    /// says whether a handoff turn of the rotation has completed (the note written).
+    Retry { step: Step, attempts: u32, handoff: bool },
     /// The handoff turn ended with an error, or the compaction failed, with an attempt
     /// left: stop, resume normally, and try again from the handoff after the pause.
-    /// `attempts` counts this one.
-    Postpone { step: Step, attempts: u32 },
+    /// `attempts` and `handoff` as for `Retry`.
+    Postpone { step: Step, attempts: u32, handoff: bool },
     /// The attempts are spent: stop claude and start a fresh session. `step` is the
-    /// last attempt's and `cut` whether its cap expired (else it failed); the handoff
-    /// is written only when that step was the compaction.
-    GiveUp { step: Step, cut: bool },
+    /// last attempt's and `cut` whether its cap expired (else it failed); `handoff`
+    /// says whether a handoff turn of the rotation completed, so that the fresh
+    /// session is told whether the note in memory is the rotated session's.
+    GiveUp { step: Step, cut: bool, handoff: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +134,8 @@ pub struct Tracker {
     not_before: Option<Instant>,
     /// Cuts and failures of the pending rotation so far.
     attempts: u32,
+    /// A handoff turn of the pending rotation has completed: the note is written.
+    handoff: bool,
     /// The handoff note has been written since it was requested, as the supervisor
     /// found on disk before the turn's `result`.
     note_written: bool,
@@ -151,6 +155,7 @@ impl Tracker {
             pending: false,
             not_before: None,
             attempts: 0,
+            handoff: false,
             note_written: true,
             phase: Phase::Idle,
         }
@@ -158,24 +163,28 @@ impl Tracker {
 
     /// The marker existed at the start: the rotation is pending from the first quiet
     /// moment, once `not_before` (the pause after a failed attempt) has passed;
-    /// `attempts` is the count spent so far.
-    pub fn pending(mut self, now: Instant, not_before: Option<Instant>, attempts: u32) -> Self {
+    /// `attempts` is the count spent so far and `handoff` whether one of them wrote
+    /// the note.
+    pub fn pending(mut self, now: Instant, not_before: Option<Instant>, attempts: u32, handoff: bool) -> Self {
         if !self.limits.enabled {
             return self;
         }
         self.pending = true;
         self.not_before = not_before;
         self.attempts = attempts;
+        self.handoff = handoff;
         let from = not_before.map_or(now, |t| t.max(now));
         self.phase = Phase::Waiting { deadline: from + self.limits.quiet };
         self
     }
 
     /// The session was resumed with the combined cut-and-handoff line: the handoff
-    /// turn is in flight, and `attempts` counts the cut.
-    pub fn retrying(mut self, now: Instant, attempts: u32) -> Self {
+    /// turn is in flight; `attempts` counts the cut, `handoff` whether an earlier
+    /// attempt wrote the note.
+    pub fn retrying(mut self, now: Instant, attempts: u32, handoff: bool) -> Self {
         self.pending = true;
         self.attempts = attempts;
+        self.handoff = handoff;
         self.phase = Phase::Handoff { deadline: now + self.limits.handoff };
         self
     }
@@ -224,6 +233,7 @@ impl Tracker {
         self.pending = false;
         self.not_before = None;
         self.attempts = 0;
+        self.handoff = false;
         self.phase = Phase::Idle;
     }
 
@@ -256,6 +266,7 @@ impl Tracker {
                         if *is_error {
                             return self.failed(Step::Handoff, now);
                         }
+                        self.handoff = true;
                         self.phase = Phase::Compacting { deadline: now + self.limits.handoff, boundary: false, failed: false };
                         return vec![Action::Snapshot(Moment::AfterHandoff), Action::Compact];
                     }
@@ -358,9 +369,9 @@ impl Tracker {
         self.phase = Phase::Idle;
         self.attempts += 1;
         if self.attempts < HANDOFF_ATTEMPTS {
-            vec![Action::Retry { step, attempts: self.attempts }]
+            vec![Action::Retry { step, attempts: self.attempts, handoff: self.handoff }]
         } else {
-            vec![Action::GiveUp { step, cut: true }]
+            vec![Action::GiveUp { step, cut: true, handoff: self.handoff }]
         }
     }
 
@@ -371,9 +382,9 @@ impl Tracker {
         self.attempts += 1;
         if self.attempts < HANDOFF_ATTEMPTS {
             self.not_before = Some(now + self.limits.retry_pause);
-            vec![Action::Postpone { step, attempts: self.attempts }]
+            vec![Action::Postpone { step, attempts: self.attempts, handoff: self.handoff }]
         } else {
-            vec![Action::GiveUp { step, cut: false }]
+            vec![Action::GiveUp { step, cut: false, handoff: self.handoff }]
         }
     }
 }
@@ -523,28 +534,28 @@ mod tests {
         let mut tr = compacting(t0);
         assert!(tr.event(&Event::CompactionFailed, t0 + secs(61)).is_empty());
         tr.event(&assistant(50_000), t0 + secs(62));
-        assert_eq!(tr.event(&OK, t0 + secs(63)), vec![Action::Postpone { step: Step::Compaction, attempts: 1 }]);
+        assert_eq!(tr.event(&OK, t0 + secs(63)), vec![Action::Postpone { step: Step::Compaction, attempts: 1, handoff: true }]);
         assert!(tr.is_pending());
         // The resumed run after the pause: the handoff again, with no clean snapshot,
         // then the compaction again; a second failure ends the rotation with a fresh
         // id and the handoff done.
         let t1 = t0 + secs(1000);
-        let mut tr = Tracker::new(limits(), t1).pending(t1, Some(t1 + secs(900)), 1);
+        let mut tr = Tracker::new(limits(), t1).pending(t1, Some(t1 + secs(900)), 1, true);
         tr.event(&OK, t1 + secs(5));
         assert_eq!(tr.tick(t1 + secs(900)), vec![Action::RequestHandoff]);
         tr.event(&assistant(50_000), t1 + secs(901));
         assert_eq!(tr.event(&OK, t1 + secs(930)), vec![AFTER, Action::Compact]);
-        assert_eq!(tr.event(&ERR, t1 + secs(940)), vec![Action::GiveUp { step: Step::Compaction, cut: false }]);
+        assert_eq!(tr.event(&ERR, t1 + secs(940)), vec![Action::GiveUp { step: Step::Compaction, cut: false, handoff: true }]);
         // An error result during the first compaction is postponed the same way.
         let mut tr = compacting(t0);
-        assert_eq!(tr.event(&ERR, t0 + secs(63)), vec![Action::Postpone { step: Step::Compaction, attempts: 1 }]);
+        assert_eq!(tr.event(&ERR, t0 + secs(63)), vec![Action::Postpone { step: Step::Compaction, attempts: 1, handoff: true }]);
         // A failed handoff turn and a failed compaction share the count: the second
-        // attempt of either kind is the last, and which one it was decides the start
-        // line of the fresh session.
-        let mut tr = Tracker::new(limits(), t1).pending(t1, Some(t1 + secs(900)), 1);
+        // attempt of either kind is the last. The note of the first attempt is this
+        // rotation's, so the fresh session is still pointed at it.
+        let mut tr = Tracker::new(limits(), t1).pending(t1, Some(t1 + secs(900)), 1, true);
         tr.event(&OK, t1 + secs(5));
         tr.tick(t1 + secs(900));
-        assert_eq!(tr.event(&ERR, t1 + secs(930)), vec![Action::GiveUp { step: Step::Handoff, cut: false }]);
+        assert_eq!(tr.event(&ERR, t1 + secs(930)), vec![Action::GiveUp { step: Step::Handoff, cut: false, handoff: true }]);
     }
 
     #[test]
@@ -554,18 +565,18 @@ mod tests {
         // which asks for the handoff again.
         let mut tr = compacting(t0);
         assert!(tr.tick(t0 + secs(60 + 899)).is_empty());
-        assert_eq!(tr.tick(t0 + secs(60 + 900)), vec![Action::Retry { step: Step::Compaction, attempts: 1 }]);
+        assert_eq!(tr.tick(t0 + secs(60 + 900)), vec![Action::Retry { step: Step::Compaction, attempts: 1, handoff: true }]);
         assert!(tr.tick(t0 + secs(60 + 901)).is_empty(), "said once");
         // The resumed run: handoff, compaction, and a second hang ends the rotation
         // with a fresh id and the handoff done, not the give-up line.
         let t1 = t0 + secs(1000);
-        let mut tr = Tracker::new(limits(), t1).retrying(t1, 1);
+        let mut tr = Tracker::new(limits(), t1).retrying(t1, 1, true);
         tr.event(&assistant(50_000), t1 + secs(1));
         assert_eq!(tr.event(&OK, t1 + secs(120)), vec![AFTER, Action::Compact]);
         assert!(tr.tick(t1 + secs(120 + 899)).is_empty());
-        assert_eq!(tr.tick(t1 + secs(120 + 900)), vec![Action::GiveUp { step: Step::Compaction, cut: true }]);
+        assert_eq!(tr.tick(t1 + secs(120 + 900)), vec![Action::GiveUp { step: Step::Compaction, cut: true, handoff: true }]);
         // The retried compaction can also succeed.
-        let mut tr = Tracker::new(limits(), t1).retrying(t1, 1);
+        let mut tr = Tracker::new(limits(), t1).retrying(t1, 1, true);
         tr.event(&OK, t1 + secs(120));
         tr.event(&BOUNDARY, t1 + secs(130));
         assert_eq!(tr.event(&OK, t1 + secs(131)), vec![Action::Compacted]);
@@ -598,13 +609,13 @@ mod tests {
         tr.marker_seen(t0 + secs(2));
         assert!(tr.tick(t0 + secs(2) + secs(1799)).is_empty());
         // Cut before the handoff went out: the clean snapshot is still due.
-        assert_eq!(tr.tick(t0 + secs(2) + secs(1800)), vec![Action::Retry { step: Step::Wait, attempts: 1 }]);
+        assert_eq!(tr.tick(t0 + secs(2) + secs(1800)), vec![Action::Retry { step: Step::Wait, attempts: 1, handoff: false }]);
         // The resumed run: the combined line is the handoff request.
         let t1 = t0 + secs(2000);
-        let mut tr = Tracker::new(limits(), t1).retrying(t1, 1);
+        let mut tr = Tracker::new(limits(), t1).retrying(t1, 1, false);
         tr.event(&assistant(50_000), t1 + secs(1));
         assert!(tr.tick(t1 + secs(899)).is_empty());
-        assert_eq!(tr.tick(t1 + secs(900)), vec![Action::GiveUp { step: Step::Handoff, cut: true }]);
+        assert_eq!(tr.tick(t1 + secs(900)), vec![Action::GiveUp { step: Step::Handoff, cut: true, handoff: false }]);
     }
 
     #[test]
@@ -625,13 +636,13 @@ mod tests {
         // An error result ends the handoff turn whatever the disk says.
         let mut tr = requested(t0);
         tr.set_note_written(false);
-        assert_eq!(tr.event(&ERR, t0 + secs(2)), vec![Action::Postpone { step: Step::Handoff, attempts: 1 }]);
+        assert_eq!(tr.event(&ERR, t0 + secs(2)), vec![Action::Postpone { step: Step::Handoff, attempts: 1, handoff: false }]);
     }
 
     #[test]
     fn the_retry_resume_can_end_normally() {
         let t0 = Instant::now();
-        let mut tr = Tracker::new(limits(), t0).retrying(t0, 1);
+        let mut tr = Tracker::new(limits(), t0).retrying(t0, 1, false);
         tr.event(&assistant(50_000), t0 + secs(1));
         assert_eq!(tr.event(&OK, t0 + secs(120)), vec![AFTER, Action::Compact]);
     }
@@ -641,58 +652,59 @@ mod tests {
         let t0 = Instant::now();
         let mut tr = requested(t0);
         tr.event(&assistant(50_000), t0 + secs(2));
-        assert_eq!(tr.tick(t0 + secs(1) + secs(900)), vec![Action::Retry { step: Step::Handoff, attempts: 1 }]);
+        assert_eq!(tr.tick(t0 + secs(1) + secs(900)), vec![Action::Retry { step: Step::Handoff, attempts: 1, handoff: false }]);
 
         let mut tr = requested(t0);
-        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::Postpone { step: Step::Handoff, attempts: 1 }]);
+        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::Postpone { step: Step::Handoff, attempts: 1, handoff: false }]);
     }
 
     #[test]
     fn the_second_handoff_attempt_takes_no_clean_snapshot_and_a_second_failure_gives_up() {
         let t0 = Instant::now();
         // The resumed run after one failure carries the count.
-        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(t0 + secs(900)), 1);
+        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(t0 + secs(900)), 1, false);
         tr.event(&OK, t0 + secs(5));
         assert_eq!(tr.tick(t0 + secs(900)), vec![Action::RequestHandoff]);
         tr.event(&assistant(50_000), t0 + secs(901));
-        assert_eq!(tr.event(&ERR, t0 + secs(930)), vec![Action::GiveUp { step: Step::Handoff, cut: false }]);
+        assert_eq!(tr.event(&ERR, t0 + secs(930)), vec![Action::GiveUp { step: Step::Handoff, cut: false, handoff: false }]);
     }
 
     #[test]
     fn cuts_and_failures_spend_the_same_attempts_across_restarts() {
         let t0 = Instant::now();
         // A handoff turn failed once (the count came back from disk); the next handoff
-        // turn hangs: the cap does not resume a second time, it ends the rotation.
-        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(t0 + secs(900)), 1);
+        // turn hangs: the cap does not resume a second time, it ends the rotation, and
+        // no attempt wrote the note.
+        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(t0 + secs(900)), 1, false);
         tr.event(&OK, t0 + secs(5));
         assert_eq!(tr.tick(t0 + secs(900)), vec![Action::RequestHandoff]);
         tr.event(&assistant(50_000), t0 + secs(901));
-        assert_eq!(tr.tick(t0 + secs(900 + 900)), vec![Action::GiveUp { step: Step::Handoff, cut: true }]);
+        assert_eq!(tr.tick(t0 + secs(900 + 900)), vec![Action::GiveUp { step: Step::Handoff, cut: true, handoff: false }]);
         // A turn was cut once (the count came back from disk); the handoff turn of the
         // resumed session fails: no pause and third attempt, the rotation ends.
-        let mut tr = Tracker::new(limits(), t0).retrying(t0, 1);
-        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::GiveUp { step: Step::Handoff, cut: false }]);
-        // The same after the compaction was cut and the resumed handoff turn fails: the
-        // note of the first attempt may be stale, so the handoff counts as unfinished.
-        let mut tr = Tracker::new(limits(), t0).retrying(t0, 1);
+        let mut tr = Tracker::new(limits(), t0).retrying(t0, 1, false);
+        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::GiveUp { step: Step::Handoff, cut: false, handoff: false }]);
+        // The same after the compaction was cut: the note of the first attempt is this
+        // rotation's, and the fresh session is pointed at it.
+        let mut tr = Tracker::new(limits(), t0).retrying(t0, 1, true);
         tr.event(&assistant(50_000), t0 + secs(1));
-        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::GiveUp { step: Step::Handoff, cut: false }]);
+        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::GiveUp { step: Step::Handoff, cut: false, handoff: true }]);
     }
 
     #[test]
     fn a_pending_start_honours_the_pause_then_rotates() {
         let t0 = Instant::now();
         let pause_end = t0 + secs(900);
-        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(pause_end), 0);
+        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(pause_end), 0, false);
         // The start turn ends, but the pause is on.
         assert!(tr.event(&OK, t0 + secs(5)).is_empty());
         assert!(tr.tick(t0 + secs(899)).is_empty());
         assert_eq!(tr.tick(pause_end), vec![BEFORE, Action::RequestHandoff]);
         // The quiet cap counted from the end of the pause, not from the start.
-        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(pause_end), 0);
+        let mut tr = Tracker::new(limits(), t0).pending(t0, Some(pause_end), 0, false);
         tr.event(&assistant(1), t0 + secs(5));
         assert!(tr.tick(pause_end + secs(1799)).is_empty());
-        assert_eq!(tr.tick(pause_end + secs(1800)), vec![Action::Retry { step: Step::Wait, attempts: 1 }]);
+        assert_eq!(tr.tick(pause_end + secs(1800)), vec![Action::Retry { step: Step::Wait, attempts: 1, handoff: false }]);
     }
 
     #[test]
@@ -717,7 +729,7 @@ mod tests {
     #[test]
     fn disabled_ignores_markers_and_thresholds() {
         let t0 = Instant::now();
-        let mut tr = Tracker::new(Limits { enabled: false, ..limits() }, t0).pending(t0, None, 0);
+        let mut tr = Tracker::new(Limits { enabled: false, ..limits() }, t0).pending(t0, None, 0, false);
         tr.event(&assistant(900_000), t0);
         tr.event(&OK, t0);
         assert!(tr.marker_seen(t0 + secs(1)).is_empty());

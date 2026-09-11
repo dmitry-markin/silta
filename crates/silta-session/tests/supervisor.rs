@@ -361,7 +361,7 @@ async fn a_failed_or_hanging_compaction_is_retried_from_the_handoff() {
     assert!(log.contains(&format!("compact-failed {first}")));
     assert_eq!(starts(&log)[1], format!("start {first} resumed"));
     assert!(fx.home.join("rotate-requested").exists());
-    assert_eq!(fs::read_to_string(fx.home.join("rotation.json")).unwrap().trim(), r#"{"next":"postponed","attempts":1}"#);
+    assert_eq!(fs::read_to_string(fx.home.join("rotation.json")).unwrap().trim(), r#"{"next":"postponed","attempts":1,"handoff":true}"#);
     fx.until(10, |l| l.contains("resumed its history. You are connected")).await;
     // After the pause: the handoff again (no second clean snapshot), then the
     // compaction, which succeeds this time; the session keeps its id.
@@ -456,7 +456,7 @@ async fn a_failed_handoff_turn_is_retried_after_the_pause() {
     let log = fx.until(15, |l| starts(l).len() == 2).await;
     assert_eq!(starts(&log)[1], format!("start {first} resumed"));
     assert!(fx.home.join("rotate-requested").exists());
-    assert_eq!(fs::read_to_string(fx.home.join("rotation.json")).unwrap().trim(), r#"{"next":"postponed","attempts":1}"#);
+    assert_eq!(fs::read_to_string(fx.home.join("rotation.json")).unwrap().trim(), r#"{"next":"postponed","attempts":1,"handoff":false}"#);
     fx.until(10, |l| l.contains("resumed its history. You are connected")).await;
     // After the pause the handoff is requested again and succeeds, and the session is
     // compacted in place. The second request takes no clean snapshot.

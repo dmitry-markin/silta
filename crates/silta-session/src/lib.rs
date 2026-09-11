@@ -78,6 +78,8 @@ struct Start {
     kind: Kind,
     /// Attempts (cuts and failures) the pending rotation has spent so far.
     attempts: u32,
+    /// One of them completed a handoff turn: the note in memory is this rotation's.
+    handoff: bool,
     /// A retry whose before-handoff snapshot is still due.
     snapshot: bool,
 }
@@ -133,7 +135,7 @@ fn plan_start(cfg: &Config, paths: &Paths) -> std::io::Result<Start> {
     let fresh = |paths: &Paths, kind: Kind| -> std::io::Result<Start> {
         let id = state::new_id()?;
         paths.write_id(&id)?;
-        Ok(Start { id, resume: false, kind, attempts: 0, snapshot: false })
+        Ok(Start { id, resume: false, kind, attempts: 0, handoff: false, snapshot: false })
     };
     let rotated = |paths: &Paths, handoff: bool| -> std::io::Result<Start> {
         let start = fresh(paths, Kind::AfterRotation { handoff })?;
@@ -149,28 +151,28 @@ fn plan_start(cfg: &Config, paths: &Paths) -> std::io::Result<Start> {
     let next = paths.read_next();
     match next {
         Next::Fresh { handoff } => rotated(paths, handoff),
-        Next::Retry { snapshot, attempts } => match resumable {
+        Next::Retry { snapshot, attempts, handoff } => match resumable {
             Some(id) => {
                 eprintln!("resuming session {id} for the handoff");
-                Ok(Start { id, resume: true, kind: Kind::Retry, attempts, snapshot })
+                Ok(Start { id, resume: true, kind: Kind::Retry, attempts, handoff, snapshot })
             }
             None => {
                 eprintln!("rotation: the session cannot be resumed for its handoff");
-                rotated(paths, false)
+                rotated(paths, handoff)
             }
         },
         Next::Normal | Next::Postponed { .. } => match resumable {
             Some(id) => {
                 eprintln!("resuming session {id}");
-                let attempts = match next {
-                    Next::Postponed { attempts } if paths.marker_exists() => attempts,
+                let (attempts, handoff) = match next {
+                    Next::Postponed { attempts, handoff } if paths.marker_exists() => (attempts, handoff),
                     _ => {
                         // A postponed rotation whose marker is gone was cancelled by hand.
                         let _ = paths.write_next(Next::Normal);
-                        0
+                        (0, false)
                     }
                 };
-                Ok(Start { id, resume: true, kind: Kind::Resumed, attempts, snapshot: false })
+                Ok(Start { id, resume: true, kind: Kind::Resumed, attempts, handoff, snapshot: false })
             }
             None => {
                 if let Some(id) = &saved {
@@ -258,9 +260,9 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
     }
     run.send(&intro(&cfg.session, start.kind)).await;
     match start.kind {
-        Kind::Retry => run.tracker = run.tracker.retrying(now, start.attempts),
+        Kind::Retry => run.tracker = run.tracker.retrying(now, start.attempts, start.handoff),
         _ if cfg.limits.enabled && paths.marker_exists() => {
-            run.tracker = run.tracker.pending(now, not_before, start.attempts);
+            run.tracker = run.tracker.pending(now, not_before, start.attempts, start.handoff);
             let pause = not_before.map(|t| t.saturating_duration_since(now).as_secs()).unwrap_or(0);
             eprintln!(
                 "rotation: pending from the start; rotating at the next quiet moment{}{}",
@@ -467,9 +469,7 @@ impl Run<'_> {
                     self.paths.clear_rotation();
                     self.send(&compacted(&self.cfg.session)).await;
                 }
-                Action::GiveUp { step, cut } => {
-                    // The handoff is written only when the last step was the compaction.
-                    let handoff = step == Step::Compaction;
+                Action::GiveUp { step, cut, handoff } => {
                     eprintln!(
                         "rotation: {} {} ({HANDOFF_ATTEMPTS} of {HANDOFF_ATTEMPTS} attempts); {}stopping the session for a fresh start",
                         step.what(),
@@ -478,27 +478,27 @@ impl Run<'_> {
                     );
                     self.finish(handoff);
                 }
-                Action::Retry { step, attempts } => {
+                Action::Retry { step, attempts, handoff } => {
                     let agents = self.tracker.agents();
                     let outstanding = if agents.is_empty() { String::new() } else { format!(" (agents outstanding: {})", agents.iter().cloned().collect::<Vec<_>>().join(", ")) };
                     eprintln!(
                         "rotation: {} did not end within the cap{outstanding} ({attempts} of {HANDOFF_ATTEMPTS} attempts); cutting it and resuming the session for the handoff",
                         step.what()
                     );
-                    if let Err(err) = self.paths.write_next(Next::Retry { snapshot: step == Step::Wait, attempts }) {
+                    if let Err(err) = self.paths.write_next(Next::Retry { snapshot: step == Step::Wait, attempts, handoff }) {
                         eprintln!("rotation: cannot record the next step: {err}");
                     }
                     self.after = Some(Outcome::Again { not_before: None });
                     self.begin_stop();
                 }
-                Action::Postpone { step, attempts } => {
+                Action::Postpone { step, attempts, handoff } => {
                     let pause = self.cfg.limits.retry_pause;
                     eprintln!(
                         "rotation: {} failed ({attempts} of {HANDOFF_ATTEMPTS} attempts); resuming the session and retrying from the handoff in {} s",
                         step.what(),
                         pause.as_secs()
                     );
-                    if let Err(err) = self.paths.write_next(Next::Postponed { attempts }) {
+                    if let Err(err) = self.paths.write_next(Next::Postponed { attempts, handoff }) {
                         eprintln!("rotation: cannot record the next step: {err}");
                     }
                     self.after = Some(Outcome::Again { not_before: Some(Instant::now() + pause) });
@@ -508,7 +508,8 @@ impl Run<'_> {
         }
     }
 
-    /// The old session is done: record the fresh start and stop claude.
+    /// The old session is done: record the fresh start, and whether a handoff turn of
+    /// the rotation wrote the note, and stop claude.
     fn finish(&mut self, handoff: bool) {
         if let Err(err) = self.paths.write_next(Next::Fresh { handoff }) {
             eprintln!("rotation: cannot record the next step: {err}");
@@ -560,10 +561,10 @@ fn intro(session: &str, kind: Kind) -> String {
             "Session {session} restarted at {now} UTC and resumed its history. {channel} This line comes from the host at every start, not from a person. If there is no work to do from before the session restart, end this turn and stay idle until a message arrives."
         ),
         Kind::AfterRotation { handoff: true } => format!(
-            "Session {session} started at {now} UTC after a rotation: a new conversation, and the previous session's handoff is in memory. {channel} This line comes from the host, not from a person. Read the memory note `handoff` first and act on what it says is pending, then rewrite it to say that nothing is pending. Then end the turn and stay idle until a message arrives."
+            "Session {session} started at {now} UTC after a rotation: a new conversation, and the previous session's handoff is in memory. {channel} This line comes from the host, not from a person. The new session id means a new process: the previous session's timers and background agents are gone. Reconcile your timers as after any restart, read the memory note `handoff` and act on what it says is pending, and look for dangling work as after a restart: an unanswered message in the room, a promised step, an agent worth rerunning. Then rewrite the note to say that nothing is pending, end the turn and stay idle until a message arrives."
         ),
         Kind::AfterRotation { handoff: false } => format!(
-            "Session {session} started at {now} UTC after a rotation: a new conversation. The previous session could not finish its handoff, so the handoff note in memory may be stale. {channel} This line comes from the host, not from a person. Read the handoff note, then look for dangling work as after a restart: unanswered messages in the room, a promised step, an agent worth rerunning. Say what may have been interrupted, rewrite the handoff note to say that nothing is pending, and stay idle until a message arrives."
+            "Session {session} started at {now} UTC after a rotation: a new conversation. The previous session could not finish its handoff, so the handoff note in memory, if there is one, predates its last work and must not be taken as its state. {channel} This line comes from the host, not from a person. The new session id means a new process: the previous session's timers and background agents are gone. Reconcile your timers as after any restart, then look for dangling work as after a restart: unanswered messages in the room, a promised step, an agent worth rerunning. Say what may have been interrupted, write the handoff note to say that nothing is pending, and stay idle until a message arrives."
         ),
         Kind::Retry => format!(
             "Session {session} restarted at {now} UTC and resumed its history. Its last turn was cut by the host because it ran too long, and the session is about to be rotated. This line comes from the host, not from a person. The restart ended your background agents and harness jobs: reconcile your timers as after any restart. Write your handoff now into the memory note `handoff` (the file handoff.md in your memory directory; the host waits for that file to change and takes the turn that rewrites it as your handoff turn), with what the handoff rule in your instructions asks for. Do not resume other work; end your turn as soon as the note is written."
