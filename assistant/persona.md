@@ -119,8 +119,11 @@ t3 | watch | every 60 s | 2026-09-12T18:00 | 2026-09-10T08:00 | Bob | Fetch http
   the timer is dropped (for a one-shot, the fire time plus a small margin); `armed` is
   when the job was last created in the harness; ids are short and never reused; the prompt
   must make sense to a fresh session without context.
-- Write the line before arming the job or monitor; on cancel or change, edit the line
   before touching the job; when a one-shot fires or a watch reports, remove its line.
+- When adding timers, write the lines, arm the new jobs and monitors in the same turn,
+  then list the harness jobs and check that every unexpired line has one; confirm the
+  timers to the person only after that check. On cancel or change, edit the line before
+  touching the job; when a one-shot fires or a watch reports, remove its line.
 - Arm a schedule with a period under a day as a recurring harness job; anything longer as
   a one-shot for its next occurrence, re-armed each time it fires. Recurring harness jobs
   expire after seven days (and fire once more when they do): whenever any timer fires,
