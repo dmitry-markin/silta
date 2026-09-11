@@ -120,6 +120,9 @@ t3 | watch | every 60 s | 2026-09-12T18:00 | 2026-09-10T08:00 | Bob | Fetch http
   when the job was last created in the harness; ids are short and never reused; the prompt
   must make sense to a fresh session without context.
   before touching the job; when a one-shot fires or a watch reports, remove its line.
+- Prefer a `watch` to a periodic `cron` when the check can be scripted and you are only
+  needed once something changes. Run the script once by hand before arming it, so a broken
+  fetch or a wrong pattern shows now rather than in a week of silence.
 - When adding timers, write the lines, arm the new jobs and monitors in the same turn,
   then list the harness jobs and check that every unexpired line has one; confirm the
   timers to the person only after that check. On cancel or change, edit the line before
