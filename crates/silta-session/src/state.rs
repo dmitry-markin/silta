@@ -21,11 +21,12 @@ pub enum Next {
     Normal,
     /// Resume the saved session with the combined cut-and-handoff line; `snapshot`
     /// says whether the before-handoff snapshot is still due (the cut came before the
-    /// handoff line went out).
-    Retry { snapshot: bool },
+    /// handoff line went out), `attempts` how many the rotation has spent, the cut
+    /// included.
+    Retry { snapshot: bool, attempts: u32 },
     /// Resume the saved session normally; the rotation stays pending after this many
-    /// failed handoff turns.
-    Postponed { failures: u32 },
+    /// attempts (a failed handoff turn or compaction is the last of them).
+    Postponed { attempts: u32 },
     /// The saved session is rotated out: start a new one, and say whether its handoff
     /// turn ended normally.
     Fresh { handoff: bool },
@@ -315,12 +316,12 @@ mod tests {
         paths.write_next(Next::Fresh { handoff: true }).unwrap();
         assert_eq!(fs::read_to_string(dir.join("rotation.json")).unwrap(), "{\"next\":\"fresh\",\"handoff\":true}\n");
         assert_eq!(paths.read_next(), Next::Fresh { handoff: true });
-        paths.write_next(Next::Retry { snapshot: true }).unwrap();
-        assert_eq!(fs::read_to_string(dir.join("rotation.json")).unwrap(), "{\"next\":\"retry\",\"snapshot\":true}\n");
-        assert_eq!(paths.read_next(), Next::Retry { snapshot: true });
-        paths.write_next(Next::Postponed { failures: 1 }).unwrap();
-        assert_eq!(fs::read_to_string(dir.join("rotation.json")).unwrap(), "{\"next\":\"postponed\",\"failures\":1}\n");
-        assert_eq!(paths.read_next(), Next::Postponed { failures: 1 });
+        paths.write_next(Next::Retry { snapshot: true, attempts: 1 }).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("rotation.json")).unwrap(), "{\"next\":\"retry\",\"snapshot\":true,\"attempts\":1}\n");
+        assert_eq!(paths.read_next(), Next::Retry { snapshot: true, attempts: 1 });
+        paths.write_next(Next::Postponed { attempts: 1 }).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("rotation.json")).unwrap(), "{\"next\":\"postponed\",\"attempts\":1}\n");
+        assert_eq!(paths.read_next(), Next::Postponed { attempts: 1 });
         paths.write_next(Next::Normal).unwrap();
         assert!(!dir.join("rotation.json").exists());
         paths.write_next(Next::Normal).unwrap();

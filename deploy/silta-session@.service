@@ -30,7 +30,7 @@ Environment=SILTA_STOP_GRACE=120
 # Session rotation (docs/session-rotation-design.md): a session whose context has
 # reached ROTATE_CONTEXT_TOKENS and that has been idle for ROTATE_IDLE_SECONDS, or whose
 # Claude Code wanted to compact, is asked for a handoff and then compacted in place
-# (replaced by a fresh session only after two failed attempts). The two caps bound the
+# (replaced by a fresh session only after two failed or cut attempts). The two caps bound the
 # wait for a quiet moment and the handoff turn (the compaction too);
 # RETRY is the pause after a handoff turn that failed. SILTA_ROTATE=0 switches it off
 # for one mind.

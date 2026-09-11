@@ -32,7 +32,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use contract::Contract;
-use rotation::{Action, Fresh, Limits, Moment, Reason, Step, Tracker, HANDOFF_ATTEMPTS};
+use rotation::{Action, Limits, Moment, Step, Tracker, HANDOFF_ATTEMPTS};
 use state::{HandoffWatch, Next, Paths, HANDOFF_NOTE};
 
 /// The channel plugin, last on the command line because `--channels` is variadic.
@@ -76,8 +76,8 @@ struct Start {
     id: String,
     resume: bool,
     kind: Kind,
-    /// Failed handoff turns of the pending rotation so far.
-    failures: u32,
+    /// Attempts (cuts and failures) the pending rotation has spent so far.
+    attempts: u32,
     /// A retry whose before-handoff snapshot is still due.
     snapshot: bool,
 }
@@ -133,7 +133,7 @@ fn plan_start(cfg: &Config, paths: &Paths) -> std::io::Result<Start> {
     let fresh = |paths: &Paths, kind: Kind| -> std::io::Result<Start> {
         let id = state::new_id()?;
         paths.write_id(&id)?;
-        Ok(Start { id, resume: false, kind, failures: 0, snapshot: false })
+        Ok(Start { id, resume: false, kind, attempts: 0, snapshot: false })
     };
     let rotated = |paths: &Paths, handoff: bool| -> std::io::Result<Start> {
         let start = fresh(paths, Kind::AfterRotation { handoff })?;
@@ -149,10 +149,10 @@ fn plan_start(cfg: &Config, paths: &Paths) -> std::io::Result<Start> {
     let next = paths.read_next();
     match next {
         Next::Fresh { handoff } => rotated(paths, handoff),
-        Next::Retry { snapshot } => match resumable {
+        Next::Retry { snapshot, attempts } => match resumable {
             Some(id) => {
                 eprintln!("resuming session {id} for the handoff");
-                Ok(Start { id, resume: true, kind: Kind::Retry, failures: 0, snapshot })
+                Ok(Start { id, resume: true, kind: Kind::Retry, attempts, snapshot })
             }
             None => {
                 eprintln!("rotation: the session cannot be resumed for its handoff");
@@ -162,15 +162,15 @@ fn plan_start(cfg: &Config, paths: &Paths) -> std::io::Result<Start> {
         Next::Normal | Next::Postponed { .. } => match resumable {
             Some(id) => {
                 eprintln!("resuming session {id}");
-                let failures = match next {
-                    Next::Postponed { failures } if paths.marker_exists() => failures,
+                let attempts = match next {
+                    Next::Postponed { attempts } if paths.marker_exists() => attempts,
                     _ => {
                         // A postponed rotation whose marker is gone was cancelled by hand.
                         let _ = paths.write_next(Next::Normal);
                         0
                     }
                 };
-                Ok(Start { id, resume: true, kind: Kind::Resumed, failures, snapshot: false })
+                Ok(Start { id, resume: true, kind: Kind::Resumed, attempts, snapshot: false })
             }
             None => {
                 if let Some(id) = &saved {
@@ -258,14 +258,14 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
     }
     run.send(&intro(&cfg.session, start.kind)).await;
     match start.kind {
-        Kind::Retry => run.tracker = run.tracker.retrying(now),
+        Kind::Retry => run.tracker = run.tracker.retrying(now, start.attempts),
         _ if cfg.limits.enabled && paths.marker_exists() => {
-            run.tracker = run.tracker.pending(now, not_before, start.failures);
+            run.tracker = run.tracker.pending(now, not_before, start.attempts);
             let pause = not_before.map(|t| t.saturating_duration_since(now).as_secs()).unwrap_or(0);
             eprintln!(
                 "rotation: pending from the start; rotating at the next quiet moment{}{}",
                 if pause > 0 { format!(" after {pause} s") } else { String::new() },
-                if start.failures > 0 { format!(" ({} of {HANDOFF_ATTEMPTS} attempts failed)", start.failures) } else { String::new() }
+                if start.attempts > 0 { format!(" ({} of {HANDOFF_ATTEMPTS} attempts spent)", start.attempts) } else { String::new() }
             );
         }
         _ => {}
@@ -467,42 +467,38 @@ impl Run<'_> {
                     self.paths.clear_rotation();
                     self.send(&compacted(&self.cfg.session)).await;
                 }
-                Action::Rotate { reason } => {
-                    let why = match reason {
-                        Fresh::CompactionFailed => format!("the compaction failed ({HANDOFF_ATTEMPTS} of {HANDOFF_ATTEMPTS} attempts)"),
-                        Fresh::CompactionCut => format!("the compaction did not end within {} s again", self.cfg.limits.handoff.as_secs()),
-                    };
-                    eprintln!("rotation: {why}; the handoff is written, stopping the session for a fresh start");
-                    self.finish(true);
+                Action::GiveUp { step, cut } => {
+                    // The handoff is written only when the last step was the compaction.
+                    let handoff = step == Step::Compaction;
+                    eprintln!(
+                        "rotation: {} {} ({HANDOFF_ATTEMPTS} of {HANDOFF_ATTEMPTS} attempts); {}stopping the session for a fresh start",
+                        step.what(),
+                        if cut { "did not end within the cap" } else { "failed" },
+                        if handoff { "the handoff is written, " } else { "giving the handoff up and " }
+                    );
+                    self.finish(handoff);
                 }
-                Action::GiveUp { reason } => {
-                    let why = match reason {
-                        Reason::CutTwice => "the turn did not end within the cap again".to_owned(),
-                        Reason::Failures => format!("{HANDOFF_ATTEMPTS} attempts failed, the last a handoff turn"),
-                    };
-                    eprintln!("rotation: {why}; giving the handoff up and stopping the session for a fresh start");
-                    self.finish(false);
-                }
-                Action::Retry { step } => {
+                Action::Retry { step, attempts } => {
                     let agents = self.tracker.agents();
                     let outstanding = if agents.is_empty() { String::new() } else { format!(" (agents outstanding: {})", agents.iter().cloned().collect::<Vec<_>>().join(", ")) };
-                    let what = match step {
-                        Step::Wait => "the turn",
-                        Step::Handoff => "the handoff turn",
-                        Step::Compaction => "the compaction",
-                    };
-                    eprintln!("rotation: {what} did not end within the cap{outstanding}; cutting it and resuming once for the handoff");
-                    if let Err(err) = self.paths.write_next(Next::Retry { snapshot: step == Step::Wait }) {
+                    eprintln!(
+                        "rotation: {} did not end within the cap{outstanding} ({attempts} of {HANDOFF_ATTEMPTS} attempts); cutting it and resuming the session for the handoff",
+                        step.what()
+                    );
+                    if let Err(err) = self.paths.write_next(Next::Retry { snapshot: step == Step::Wait, attempts }) {
                         eprintln!("rotation: cannot record the next step: {err}");
                     }
                     self.after = Some(Outcome::Again { not_before: None });
                     self.begin_stop();
                 }
-                Action::Postpone { failures, step } => {
+                Action::Postpone { step, attempts } => {
                     let pause = self.cfg.limits.retry_pause;
-                    let what = if step == Step::Compaction { "the compaction" } else { "the handoff turn" };
-                    eprintln!("rotation: {what} failed ({failures} of {HANDOFF_ATTEMPTS} attempts); resuming the session and retrying from the handoff in {} s", pause.as_secs());
-                    if let Err(err) = self.paths.write_next(Next::Postponed { failures }) {
+                    eprintln!(
+                        "rotation: {} failed ({attempts} of {HANDOFF_ATTEMPTS} attempts); resuming the session and retrying from the handoff in {} s",
+                        step.what(),
+                        pause.as_secs()
+                    );
+                    if let Err(err) = self.paths.write_next(Next::Postponed { attempts }) {
                         eprintln!("rotation: cannot record the next step: {err}");
                     }
                     self.after = Some(Outcome::Again { not_before: Some(Instant::now() + pause) });
@@ -570,7 +566,7 @@ fn intro(session: &str, kind: Kind) -> String {
             "Session {session} started at {now} UTC after a rotation: a new conversation. The previous session could not finish its handoff, so the handoff note in memory may be stale. {channel} This line comes from the host, not from a person. Read the handoff note, then look for dangling work as after a restart: unanswered messages in the room, a promised step, an agent worth rerunning. Say what may have been interrupted, rewrite the handoff note to say that nothing is pending, and stay idle until a message arrives."
         ),
         Kind::Retry => format!(
-            "Session {session} restarted at {now} UTC and resumed its history. Its last turn was cut by the host because it ran too long, and the session is about to be rotated. This line comes from the host, not from a person. Write your handoff now into the memory note `handoff` (the file handoff.md in your memory directory; the host waits for that file to change and takes the turn that rewrites it as your handoff turn), with what the handoff rule in your instructions asks for. Do not resume the work; end your turn as soon as the note is written."
+            "Session {session} restarted at {now} UTC and resumed its history. Its last turn was cut by the host because it ran too long, and the session is about to be rotated. This line comes from the host, not from a person. The restart ended your background agents and harness jobs: reconcile your timers as after any restart. Write your handoff now into the memory note `handoff` (the file handoff.md in your memory directory; the host waits for that file to change and takes the turn that rewrites it as your handoff turn), with what the handoff rule in your instructions asks for. Do not resume other work; end your turn as soon as the note is written."
         ),
     }
 }
