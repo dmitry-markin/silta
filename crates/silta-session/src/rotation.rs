@@ -28,7 +28,7 @@ pub struct Limits {
     pub enabled: bool,
     /// Context size at or above which an idle session is rotated.
     pub context_tokens: u64,
-    /// The idle gap, from the last turn end, that the threshold trigger requires.
+    /// The gap without a message from a person that the threshold trigger requires.
     pub idle: Duration,
     /// Cap on the wait for a quiet moment after the trigger.
     pub quiet: Duration,
@@ -129,7 +129,10 @@ pub struct Tracker {
     turn: bool,
     agents: BTreeSet<String>,
     context: u64,
-    last_result: Instant,
+    /// The last message from a person (a channel delivery), or the start: the idle gap
+    /// is measured from it, so that timer wakeups and the mind's own work never pass
+    /// for the person's presence.
+    last_person: Instant,
     pending: bool,
     not_before: Option<Instant>,
     /// Cuts and failures of the pending rotation so far.
@@ -151,7 +154,7 @@ impl Tracker {
             turn: true,
             agents: BTreeSet::new(),
             context: 0,
-            last_result: now,
+            last_person: now,
             pending: false,
             not_before: None,
             attempts: 0,
@@ -254,10 +257,14 @@ impl Tracker {
                     self.context = *n;
                 }
             }
-            Event::User => self.turn = true,
+            Event::User { person } => {
+                self.turn = true;
+                if *person {
+                    self.last_person = now;
+                }
+            }
             Event::Result { is_error } => {
                 self.turn = false;
-                self.last_result = now;
                 match self.phase {
                     Phase::Handoff { .. } => {
                         if !*is_error && !self.note_written {
@@ -311,7 +318,7 @@ impl Tracker {
             && self.phase == Phase::Idle
             && !self.turn
             && self.context >= self.limits.context_tokens
-            && now.duration_since(self.last_result) >= self.limits.idle
+            && now.duration_since(self.last_person) >= self.limits.idle
         {
             self.set_pending(now);
             actions.push(Action::MarkPending);
@@ -414,6 +421,8 @@ mod tests {
 
     const OK: Event = Event::Result { is_error: false };
     const ERR: Event = Event::Result { is_error: true };
+    const PERSON: Event = Event::User { person: true };
+    const TIMER: Event = Event::User { person: false };
     const BOUNDARY: Event = Event::Compacted { auto: false };
     const BEFORE: Action = Action::Snapshot(Moment::BeforeHandoff);
     const AFTER: Action = Action::Snapshot(Moment::AfterHandoff);
@@ -440,22 +449,44 @@ mod tests {
     }
 
     #[test]
-    fn threshold_needs_both_a_large_context_and_the_idle_gap() {
+    fn threshold_needs_both_a_large_context_and_four_hours_without_a_person() {
         let t0 = Instant::now();
         let mut tr = Tracker::new(limits(), t0);
-        assert!(tr.event(&assistant(310_000), t0 + secs(1)).is_empty());
-        assert!(tr.event(&OK, t0 + secs(2)).is_empty());
-        // Big context, not idle for long enough.
+        // A person writes and the mind answers with a large context.
+        assert!(tr.event(&PERSON, t0 + secs(1)).is_empty());
+        assert!(tr.event(&assistant(310_000), t0 + secs(2)).is_empty());
+        assert!(tr.event(&OK, t0 + secs(3)).is_empty());
+        // Big context, the person not away for long enough.
         assert!(tr.tick(t0 + secs(3600)).is_empty());
-        // Idle long enough: the marker, and the handoff at once since it is quiet.
+        // A timer wakeup two hours later is a turn but not the person: the gap goes on.
+        tr.event(&TIMER, t0 + secs(2 * 3600));
+        tr.event(&assistant(310_050), t0 + secs(2 * 3600 + 1));
+        tr.event(&OK, t0 + secs(2 * 3600 + 2));
+        assert!(tr.tick(t0 + secs(4 * 3600)).is_empty());
+        // Four hours after the person's message: the marker, and the handoff at once
+        // since it is quiet.
         assert_eq!(
-            tr.tick(t0 + secs(2 + 4 * 3600)),
+            tr.tick(t0 + secs(1 + 4 * 3600)),
             vec![Action::MarkPending, BEFORE, Action::RequestHandoff]
         );
         // The handoff turn runs and ends: the compaction follows, as after any trigger.
-        let t = t0 + secs(3 + 4 * 3600);
+        let t = t0 + secs(2 + 4 * 3600);
         assert!(tr.event(&assistant(310_100), t).is_empty());
         assert_eq!(tr.event(&OK, t + secs(60)), vec![AFTER, Action::Compact]);
+    }
+
+    #[test]
+    fn a_persons_message_resets_the_gap() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(limits(), t0);
+        tr.event(&assistant(310_000), t0 + secs(1));
+        tr.event(&OK, t0 + secs(2));
+        // Three hours in, the person writes: another four hours from there.
+        tr.event(&PERSON, t0 + secs(3 * 3600));
+        tr.event(&assistant(310_100), t0 + secs(3 * 3600 + 1));
+        tr.event(&OK, t0 + secs(3 * 3600 + 2));
+        assert!(tr.tick(t0 + secs(7 * 3600 - 1)).is_empty());
+        assert_eq!(tr.tick(t0 + secs(7 * 3600))[0], Action::MarkPending);
     }
 
     #[test]
@@ -512,7 +543,7 @@ mod tests {
         let mut tr = compacting(t0);
         // The compaction's own lines, then its result: the rotation is over, the
         // context is unknown until the next assistant line.
-        assert!(tr.event(&Event::User, t0 + secs(61)).is_empty());
+        assert!(tr.event(&TIMER, t0 + secs(61)).is_empty());
         assert!(tr.event(&BOUNDARY, t0 + secs(70)).is_empty());
         assert_eq!(tr.context(), 0);
         assert_eq!(tr.event(&OK, t0 + secs(71)), vec![Action::Compacted]);

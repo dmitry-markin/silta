@@ -28,7 +28,8 @@ Environment=SILTA_CLAUDE_BIN=/usr/bin/silta-claude
 # is the one that ends the session.
 Environment=SILTA_STOP_GRACE=120
 # Session rotation (docs/session-rotation-design.md): a session whose context has
-# reached ROTATE_CONTEXT_TOKENS and that has been idle for ROTATE_IDLE_SECONDS, or whose
+# reached ROTATE_CONTEXT_TOKENS and to which no person has written for
+# ROTATE_IDLE_SECONDS (timer wakeups and the mind's own work do not count), or whose
 # Claude Code wanted to compact, is asked for a handoff and then compacted in place
 # (replaced by a fresh session only after two failed or cut attempts). The two caps bound the
 # wait for a quiet moment and the handoff turn (the compaction too);
@@ -43,6 +44,12 @@ Environment=SILTA_ROTATE_RETRY_SECONDS=900
 # Rotations whose snapshots (memory and transcript, before and after the handoff) are
 # kept under backups/.
 Environment=SILTA_BACKUPS_KEEP=10
+# The window Claude Code uses to decide an automatic compaction (accepted: 100000 to
+# 1000000; the model's own window, one million, otherwise). The backstop for a session
+# no person leaves alone for ROTATE_IDLE_SECONDS: the hook fires at about 467000
+# tokens (the window minus a 20000-token output reserve minus 13000), and the rotation
+# follows at the next quiet moment.
+Environment=CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000
 # Claude Code: the install owned by the claude user, read-only here, never updating
 # itself. CLAUDE_BIN may name /opt/claude/.local/share/claude/versions/<n> to pin one.
 Environment=CLAUDE_BIN=/opt/claude/.local/bin/claude

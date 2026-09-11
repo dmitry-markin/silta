@@ -59,7 +59,8 @@ struct Args {
     #[arg(long, env = "SILTA_ROTATE_CONTEXT_TOKENS", default_value_t = 300_000)]
     rotate_context_tokens: u64,
 
-    /// Seconds without a turn end before a large session counts as idle.
+    /// Seconds without a message from a person (a channel delivery; timer wakeups and
+    /// the mind's own work do not count) before a large session counts as idle.
     #[arg(long, env = "SILTA_ROTATE_IDLE_SECONDS", default_value_t = 14_400)]
     rotate_idle_seconds: u64,
 

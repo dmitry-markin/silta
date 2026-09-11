@@ -438,7 +438,7 @@ impl Run<'_> {
             match action {
                 Action::Snapshot(moment) => self.snapshot(moment),
                 Action::MarkPending => {
-                    let why = format!("threshold: context {} tokens, idle {} s", self.tracker.context(), self.cfg.limits.idle.as_secs());
+                    let why = format!("threshold: context {} tokens, no message from a person for {} s", self.tracker.context(), self.cfg.limits.idle.as_secs());
                     if let Err(err) = self.paths.write_marker(&why) {
                         eprintln!("rotation: cannot write the marker: {err}");
                     }

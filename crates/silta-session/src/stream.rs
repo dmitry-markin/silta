@@ -20,8 +20,11 @@ pub enum Event {
     /// that produced it (input plus cache read plus cache creation); `None` on a
     /// main-line message means the usage is missing, which the contract check reports.
     Assistant { subagent: bool, context_tokens: Option<u64> },
-    /// A user message: a tool result or a delivered message; a turn is in progress.
-    User,
+    /// A user message: a tool result, a timer wakeup, the compaction's own lines or a
+    /// delivered message; a turn is in progress. `person` marks a delivery through the
+    /// channel (the text starts with the `<channel` tag), the one kind that counts as
+    /// a person's presence for the threshold's idle gap.
+    User { person: bool },
     /// The end of a turn.
     Result { is_error: bool },
     /// Every live background task after a change, replacing what was known before
@@ -46,7 +49,7 @@ pub fn read(line: &str) -> (String, Event) {
     match kind {
         "system" => (system(&map), system_event(&map)),
         "assistant" => (message("assistant", &map), Event::Assistant { subagent: subagent(&map), context_tokens: context_of(&map) }),
-        "user" => (message("user", &map), Event::User),
+        "user" => (message("user", &map), Event::User { person: person_of(&map) }),
         "result" => {
             let is_error = map.get("is_error").and_then(Value::as_bool).unwrap_or(false);
             (result(&map), Event::Result { is_error })
@@ -99,6 +102,18 @@ fn system_event(map: &Map<String, Value>) -> Event {
         },
         _ => Event::Other,
     }
+}
+
+/// A message delivered through the channel: its text starts with the `<channel` tag
+/// Claude Code wraps a channel notification in (`docs/design.md`). A timer wakeup, a
+/// tool result and the compaction's own lines do not.
+fn person_of(map: &Map<String, Value>) -> bool {
+    let text = match map.get("message").and_then(|m| m.get("content")) {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(Value::Array(blocks)) => blocks.iter().find_map(|b| b.get("text").and_then(Value::as_str)),
+        _ => None,
+    };
+    text.is_some_and(|t| t.trim_start().starts_with("<channel"))
 }
 
 /// A line of a subagent's conversation rather than the main one.
@@ -217,6 +232,9 @@ fn message(role: &str, map: &Map<String, Value>) -> String {
             parts.push(format!("context {context}"));
         }
     }
+    if role == "user" && person_of(map) {
+        parts.insert(0, "channel".to_owned());
+    }
     format!("{role}: {}", parts.join(", "))
 }
 
@@ -332,11 +350,18 @@ mod tests {
         assert_eq!(read(no_usage).1, Event::Assistant { subagent: false, context_tokens: None });
         let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"sent","is_error":false},{"type":"tool_result","tool_use_id":"y","content":[{"type":"text","text":"boom"}],"is_error":true}]}}"#;
         assert_eq!(summarize(user), "user: 2 tool_result (8 bytes, 1 failed)");
-        assert_eq!(read(user).1, Event::User);
+        assert_eq!(read(user).1, Event::User { person: false });
         let channel = r#"{"type":"user","message":{"role":"user","content":"<channel person=\"Alice\">hello</channel>"}}"#;
         let s = summarize(channel);
-        assert_eq!(s, "user: 1 text (39 bytes)");
+        assert_eq!(s, "user: channel, 1 text (39 bytes)");
         assert!(!s.contains("hello"));
+        assert_eq!(read(channel).1, Event::User { person: true });
+        let blocks = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<channel person=\"Bob\">hi</channel>"}]}}"#;
+        assert_eq!(read(blocks).1, Event::User { person: true });
+        // A timer wakeup and the compaction's summary are user lines, not a person.
+        let timer = r#"{"type":"user","message":{"role":"user","content":"Keep-warm: send nothing, answer ack."}}"#;
+        assert_eq!(summarize(timer), "user: 1 text (36 bytes)");
+        assert_eq!(read(timer).1, Event::User { person: false });
     }
 
     #[test]
