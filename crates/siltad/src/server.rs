@@ -337,7 +337,7 @@ mod tests {
     use crate::{daemon::Daemon, spool::Spool};
     use silta::{
         config::{Config, Routing},
-        protocol::{Ack, Attachment, EventKind, Role, SendFile, Typing},
+        protocol::{Ack, Attachment, EventKind, Role, RoomKind, SendFile, Typing},
         transfer::CHUNK_BYTES,
     };
     use std::sync::Arc;
@@ -395,6 +395,7 @@ user = "whoever"
             role: Role::Family,
             sender: "@alice:silta.test".into(),
             room_id: "!r:silta.test".into(),
+            room: RoomKind::Dm,
             event_id: "$ev".into(),
             ts: "t".into(),
             in_reply_to: None,

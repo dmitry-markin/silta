@@ -21,7 +21,7 @@ use matrix_sdk::{
 };
 use silta::{
     config::{DropReason, Inbound, PersonConfig},
-    protocol::{Attachment, Event, EventKind},
+    protocol::{Attachment, Event, EventKind, RoomKind},
     replay::{verdict, Verdict},
     time::rfc3339_utc,
     transfer::{human_size, safe_id},
@@ -88,9 +88,9 @@ async fn on_invite(event: StrippedRoomMemberEvent, room: Room, client: Client, C
 /// The routing and replay decisions shared by messages and reactions: the registered
 /// sender, the owning session (a group room goes to the hub, a DM to the person's
 /// mind: the members, the DM flag and the name decide, see `silta::config::is_group`),
-/// and whether an earlier run delivered the event already. `None` means drop, already
-/// logged.
-async fn admit<'a>(daemon: &'a Daemon, room: &Room, sender: &str, event_id: &str, ts: u64, what: &str) -> Option<(&'a str, &'a PersonConfig)> {
+/// whether the room is a DM or a group by the same rule, and whether an earlier run
+/// delivered the event already. `None` means drop, already logged.
+async fn admit<'a>(daemon: &'a Daemon, room: &Room, sender: &str, event_id: &str, ts: u64, what: &str) -> Option<(&'a str, &'a PersonConfig, RoomKind)> {
     let room_id = room.room_id().as_str();
     // Without the members a group room cannot be told from a DM, and a group room must
     // never reach a personal mind, so the message goes no further. It is gone: the SDK
@@ -106,7 +106,7 @@ async fn admit<'a>(daemon: &'a Daemon, room: &Room, sender: &str, event_id: &str
     };
     let shape = room_shape(room).await;
     debug!(room = room_id, direct = shape.direct, named = shape.named, members = members.len(), "room shape");
-    let (session, person) = match daemon.routing.inbound(sender, room_id, members.iter().map(String::as_str), shape) {
+    let (session, person, kind) = match daemon.routing.inbound(sender, room_id, members.iter().map(String::as_str), shape) {
         // Our own event coming back through sync is not traffic for anyone; the other
         // two reasons are a deliberate refusal, not a loss.
         Inbound::Drop(DropReason::OwnMessage) => {
@@ -117,7 +117,7 @@ async fn admit<'a>(daemon: &'a Daemon, room: &Room, sender: &str, event_id: &str
             info!(dir = "in", room = room_id, sender, "{what} not routed to a session: {reason}");
             return None;
         }
-        Inbound::Deliver { session, person } => (session, person),
+        Inbound::Deliver { session, person, room: kind } => (session, person, kind),
     };
     match verdict(ts, event_id, daemon.watermark(room_id).as_ref(), daemon.started_at_ms, daemon.replay_window_ms) {
         Verdict::AlreadyDelivered => {
@@ -128,10 +128,10 @@ async fn admit<'a>(daemon: &'a Daemon, room: &Room, sender: &str, event_id: &str
             debug!(dir = "in", room = room_id, event_id, "not delivering a {what} older than the replay window");
             None
         }
-        Verdict::Deliver { behind_start_ms: 0 } => Some((session, person)),
+        Verdict::Deliver { behind_start_ms: 0 } => Some((session, person, kind)),
         Verdict::Deliver { behind_start_ms } => {
             info!(dir = "in", room = room_id, person = %person.name, "received a {what} from {} s before the daemon started, within the replay window", behind_start_ms / 1000);
-            Some((session, person))
+            Some((session, person, kind))
         }
     }
 }
@@ -160,7 +160,7 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, Ctx(daemon)
         }
         Body::Text(_) | Body::Media(_) => {}
     }
-    let Some((session, person)) = admit(&daemon, &room, sender, event_id, ts, "message").await else {
+    let Some((session, person, kind)) = admit(&daemon, &room, sender, event_id, ts, "message").await else {
         return;
     };
 
@@ -170,6 +170,7 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, Ctx(daemon)
         role: person.role,
         sender: sender.to_owned(),
         room_id: room_id.to_owned(),
+        room: kind,
         event_id: event_id.to_owned(),
         ts: rfc3339_utc(ts),
         in_reply_to: parsed.in_reply_to,
@@ -257,7 +258,7 @@ async fn on_reaction(event: OriginalSyncReactionEvent, room: Room, Ctx(daemon): 
     let target = event.content.relates_to.event_id.clone();
     let key = event.content.relates_to.key.clone();
 
-    let Some((session, person)) = admit(&daemon, &room, sender, event_id, ts, "reaction").await else {
+    let Some((session, person, kind)) = admit(&daemon, &room, sender, event_id, ts, "reaction").await else {
         return;
     };
     match room.load_or_fetch_event(&target, None).await {
@@ -280,6 +281,7 @@ async fn on_reaction(event: OriginalSyncReactionEvent, room: Room, Ctx(daemon): 
         role: person.role,
         sender: sender.to_owned(),
         room_id: room_id.to_owned(),
+        room: kind,
         event_id: event_id.to_owned(),
         ts: rfc3339_utc(ts),
         in_reply_to: None,

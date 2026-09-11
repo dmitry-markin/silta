@@ -13,7 +13,7 @@ use serde::{
 };
 use thiserror::Error;
 
-use crate::protocol::{Person, Role};
+use crate::protocol::{Person, Role, RoomKind};
 
 /// The daemon configuration file (`siltad.toml`).
 #[derive(Debug, Clone, Deserialize)]
@@ -403,7 +403,7 @@ impl fmt::Display for DropReason {
 /// The routing decision for one inbound message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inbound<'a> {
-    Deliver { session: &'a str, person: &'a PersonConfig },
+    Deliver { session: &'a str, person: &'a PersonConfig, room: RoomKind },
     Drop(DropReason),
 }
 
@@ -561,7 +561,8 @@ impl Routing {
     /// Decide who gets an inbound message. `members` are the user ids in the room. The
     /// session listing the room wins; otherwise a group room (see [`is_group`]) goes
     /// to the `groups` session and a DM to the person's session; the `all` session
-    /// takes what is left, and without one the message is dropped.
+    /// takes what is left, and without one the message is dropped. The same rule names
+    /// the room a DM or a group for the session, a listed room included.
     pub fn inbound<'m>(
         &self,
         sender: &str,
@@ -575,16 +576,18 @@ impl Routing {
         let Some(person) = self.person_for(sender) else {
             return Inbound::Drop(DropReason::UnknownSender);
         };
+        let (people, _) = self.people_in(members);
+        let group = is_group(people.len(), shape);
         let owner = match self.by_room.get(room_id) {
             Some(&i) => Some(i),
             None => {
-                let (people, _) = self.people_in(members);
-                let specific = if is_group(people.len(), shape) { self.groups } else { self.by_person.get(&person.name).copied() };
+                let specific = if group { self.groups } else { self.by_person.get(&person.name).copied() };
                 specific.or(self.all)
             }
         };
+        let room = if group { RoomKind::Group } else { RoomKind::Dm };
         match owner {
-            Some(i) => Inbound::Deliver { session: &self.sessions[i].name, person },
+            Some(i) => Inbound::Deliver { session: &self.sessions[i].name, person, room },
             None => Inbound::Drop(DropReason::NoSession),
         }
     }
@@ -935,19 +938,20 @@ user = "u"
         let r = Routing::new(&config(SPLIT));
         let bot = "@silta:silta.test";
         let dm = ["@alice:silta.test", bot];
-        // Room beats person: Alice in the family room goes to the hub.
+        // Room beats person: Alice in the family room goes to the hub. The kind still
+        // follows the members, here one person in an unnamed room.
         assert_eq!(
             r.inbound("@alice:silta.test", "!family:silta.test", dm, PLAIN),
-            Inbound::Deliver { session: "hub", person: &r.people[1] }
+            Inbound::Deliver { session: "hub", person: &r.people[1], room: RoomKind::Dm }
         );
         // Person otherwise, through any of their addresses.
         assert_eq!(
             r.inbound("@alice2:silta.test", "!dm:silta.test", ["@alice2:silta.test", bot], PLAIN),
-            Inbound::Deliver { session: "alice", person: &r.people[1] }
+            Inbound::Deliver { session: "alice", person: &r.people[1], room: RoomKind::Dm }
         );
         assert_eq!(
             r.inbound("@bob:silta.test", "!dm2:silta.test", ["@bob:silta.test", bot], PLAIN),
-            Inbound::Deliver { session: "hub", person: &r.people[0] }
+            Inbound::Deliver { session: "hub", person: &r.people[0], room: RoomKind::Dm }
         );
         assert_eq!(r.inbound("@mallory:silta.test", "!dm:silta.test", dm, PLAIN), Inbound::Drop(DropReason::UnknownSender));
         assert_eq!(r.inbound("@silta:silta.test", "!dm:silta.test", dm, PLAIN), Inbound::Drop(DropReason::OwnMessage));
@@ -977,8 +981,8 @@ user = "u"
         let family = ["@alice:silta.test", "@bob:silta.test", bot];
         let alice_dm = ["@alice:silta.test", bot];
         // Alice's message in the family room reaches the hub, in her DM her mind.
-        assert!(matches!(r.inbound("@alice:silta.test", "!family:silta.test", family, PLAIN), Inbound::Deliver { session: "hub", .. }));
-        assert!(matches!(r.inbound("@alice:silta.test", "!dm:silta.test", alice_dm, PLAIN), Inbound::Deliver { session: "alice", .. }));
+        assert!(matches!(r.inbound("@alice:silta.test", "!family:silta.test", family, PLAIN), Inbound::Deliver { session: "hub", room: RoomKind::Group, .. }));
+        assert!(matches!(r.inbound("@alice:silta.test", "!dm:silta.test", alice_dm, PLAIN), Inbound::Deliver { session: "alice", room: RoomKind::Dm, .. }));
         // Two addresses of one person are still a DM.
         assert!(matches!(
             r.inbound("@alice:silta.test", "!dm:silta.test", ["@alice:silta.test", "@alice2:silta.test", bot], PLAIN),
@@ -1017,7 +1021,7 @@ user = "u"
         let family = ["@alice:silta.test", "@bob:silta.test", bot];
         let bob = "@bob:silta.test";
         // A two-person room created as a room (named, no DM flag) is a group: the hub's.
-        assert!(matches!(r.inbound(bob, "!pair:silta.test", bob_and_bot, RoomShape::NAMED), Inbound::Deliver { session: "hub", .. }));
+        assert!(matches!(r.inbound(bob, "!pair:silta.test", bob_and_bot, RoomShape::NAMED), Inbound::Deliver { session: "hub", room: RoomKind::Group, .. }));
         assert_eq!(r.may_send("hub", "!pair:silta.test", bob_and_bot, RoomShape::NAMED), Ok(()));
         assert_eq!(r.may_read("hub", "!pair:silta.test", bob_and_bot, RoomShape::NAMED), Ok(()));
         assert_eq!(r.may_send("bob", "!pair:silta.test", bob_and_bot, RoomShape::NAMED), Err(SendDenied::NotAllowed));

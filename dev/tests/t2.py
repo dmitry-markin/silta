@@ -65,7 +65,7 @@ def reader():
         elif "event" in o: events.put(o); send({"ack": {"event_id": o["event"]["event_id"]}})  # as the plugin does once the notification is out
         else: results.put(o)
 threading.Thread(target=reader, daemon=True).start()
-send({"hello": {"protocol": 3, "session": "test", "client": "t2/0"}})
+send({"hello": {"protocol": 4, "session": "test", "client": "t2/0"}})
 print("welcome:", json.dumps(results.get(timeout=5))[:120])
 n = 0
 def cmd(kind, **args):

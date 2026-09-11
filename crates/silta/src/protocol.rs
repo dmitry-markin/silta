@@ -1,4 +1,4 @@
-//! Socket protocol v3 between `siltad` (server) and a session plugin (client).
+//! Socket protocol v4 between `siltad` (server) and a session plugin (client).
 //!
 //! JSON lines over a Unix stream socket, one object per line, UTF-8, `\n` terminated,
 //! at most [`MAX_LINE_BYTES`] per line. The wire format is pinned by the tests at the
@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
 /// Protocol revision carried in `hello` and `welcome`.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Hard cap on one line, a guard against a runaway peer rather than a buffer size.
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -157,6 +157,8 @@ pub struct Event {
     pub role: Role,
     pub sender: String,
     pub room_id: String,
+    /// One person's DM or a group room, by the rule the routing decides with (protocol 4).
+    pub room: RoomKind,
     pub event_id: String,
     /// RFC 3339 UTC, from `origin_server_ts`.
     pub ts: String,
@@ -190,6 +192,23 @@ impl EventKind {
         match self {
             EventKind::Message => "message",
             EventKind::Reaction => "reaction",
+        }
+    }
+}
+
+/// The kind of room an event came from, see `config::is_group`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomKind {
+    Dm,
+    Group,
+}
+
+impl RoomKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RoomKind::Dm => "dm",
+            RoomKind::Group => "group",
         }
     }
 }
@@ -547,11 +566,11 @@ mod tests {
 
     #[test]
     fn hello() {
-        let msg = roundtrip_client(r#"{"hello":{"protocol":3,"session":"hub","client":"silta-claude/0.1.0"}}"#);
+        let msg = roundtrip_client(r#"{"hello":{"protocol":4,"session":"hub","client":"silta-claude/0.1.0"}}"#);
         assert_eq!(
             msg,
             ClientMessage::Hello(Hello {
-                protocol: 3,
+                protocol: 4,
                 session: "hub".into(),
                 client: "silta-claude/0.1.0".into()
             })
@@ -561,7 +580,7 @@ mod tests {
     #[test]
     fn welcome() {
         let msg = roundtrip_daemon(
-            r#"{"welcome":{"protocol":3,"session":"hub","user_id":"@silta:silta.test","people":[{"name":"Bob","role":"owner"},{"name":"Alice","role":"family"}],"inbox_max_age_days":30}}"#,
+            r#"{"welcome":{"protocol":4,"session":"hub","user_id":"@silta:silta.test","people":[{"name":"Bob","role":"owner"},{"name":"Alice","role":"family"}],"inbox_max_age_days":30}}"#,
         );
         let DaemonMessage::Welcome(w) = msg else { panic!("not welcome") };
         assert_eq!(w.people[0].role, Role::Owner);
@@ -582,7 +601,7 @@ mod tests {
     #[test]
     fn event() {
         let msg = roundtrip_daemon(
-            r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","event_id":"$xyz","ts":"2026-09-05T18:02:11Z","text":"hello","transcribed":false,"attachments":[]}}"#,
+            r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","room":"dm","event_id":"$xyz","ts":"2026-09-05T18:02:11Z","text":"hello","transcribed":false,"attachments":[]}}"#,
         );
         let DaemonMessage::Event(e) = msg else { panic!("not event") };
         assert_eq!(e.kind, EventKind::Message);
@@ -591,8 +610,19 @@ mod tests {
     }
 
     #[test]
+    fn event_room_kind_is_mandatory() {
+        let group = r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","room":"group","event_id":"$xyz","ts":"2026-09-05T18:02:11Z","text":"hello","transcribed":false,"attachments":[]}}"#;
+        let DaemonMessage::Event(e) = roundtrip_daemon(group) else { panic!("not event") };
+        assert_eq!(e.room, RoomKind::Group);
+        assert_eq!(e.room.as_str(), "group");
+        // A protocol 3 event without the kind does not parse.
+        let v3 = group.replace(r#""room":"group","#, "");
+        assert!(parse_daemon_line(&v3).is_err());
+    }
+
+    #[test]
     fn event_with_in_reply_to() {
-        let json = r#"{"event":{"kind":"message","person":"Bob","role":"owner","sender":"@bob:silta.test","room_id":"!abc:silta.test","event_id":"$q","ts":"2026-09-06T03:00:00Z","in_reply_to":"$xyz","text":"yes, that one","transcribed":false,"attachments":[]}}"#;
+        let json = r#"{"event":{"kind":"message","person":"Bob","role":"owner","sender":"@bob:silta.test","room_id":"!abc:silta.test","room":"dm","event_id":"$q","ts":"2026-09-06T03:00:00Z","in_reply_to":"$xyz","text":"yes, that one","transcribed":false,"attachments":[]}}"#;
         let msg = roundtrip_daemon(json);
         let DaemonMessage::Event(e) = msg else { panic!("not event") };
         assert_eq!(e.in_reply_to.as_deref(), Some("$xyz"));
@@ -600,7 +630,7 @@ mod tests {
 
     #[test]
     fn event_with_attachments() {
-        let json = r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","event_id":"$xyz","ts":"2026-09-05T18:02:11Z","text":"","transcribed":true,"attachments":[{"transfer":"xyz-1","name":"a.ogg","mime":"audio/ogg","size":12}]}}"#;
+        let json = r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","room":"dm","event_id":"$xyz","ts":"2026-09-05T18:02:11Z","text":"","transcribed":true,"attachments":[{"transfer":"xyz-1","name":"a.ogg","mime":"audio/ogg","size":12}]}}"#;
         let msg = roundtrip_daemon(json);
         let DaemonMessage::Event(e) = msg else { panic!("not event") };
         assert_eq!(e.attachments[0].size, 12);
@@ -609,12 +639,12 @@ mod tests {
 
     #[test]
     fn thread_and_reaction_events() {
-        let json = r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","event_id":"$t2","ts":"2026-09-06T10:00:00Z","thread":"$root","text":"in the thread","transcribed":false,"attachments":[]}}"#;
+        let json = r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","room":"dm","event_id":"$t2","ts":"2026-09-06T10:00:00Z","thread":"$root","text":"in the thread","transcribed":false,"attachments":[]}}"#;
         let DaemonMessage::Event(e) = roundtrip_daemon(json) else { panic!("not event") };
         assert_eq!(e.thread.as_deref(), Some("$root"));
         assert_eq!(e.in_reply_to, None);
 
-        let json = r#"{"event":{"kind":"reaction","person":"Bob","role":"owner","sender":"@bob:silta.test","room_id":"!abc:silta.test","event_id":"$r","ts":"2026-09-06T10:00:01Z","reacts_to":"$bot","text":"👍","transcribed":false,"attachments":[]}}"#;
+        let json = r#"{"event":{"kind":"reaction","person":"Bob","role":"owner","sender":"@bob:silta.test","room_id":"!abc:silta.test","room":"dm","event_id":"$r","ts":"2026-09-06T10:00:01Z","reacts_to":"$bot","text":"👍","transcribed":false,"attachments":[]}}"#;
         let DaemonMessage::Event(e) = roundtrip_daemon(json) else { panic!("not event") };
         assert_eq!(e.kind, EventKind::Reaction);
         assert_eq!(e.kind.as_str(), "reaction");
@@ -765,7 +795,7 @@ mod tests {
 
     #[test]
     fn classify_client_lines() {
-        let good = parse_client_line(r#"{"hello":{"protocol":3,"session":"hub","client":"x"}}"#).unwrap();
+        let good = parse_client_line(r#"{"hello":{"protocol":4,"session":"hub","client":"x"}}"#).unwrap();
         assert!(matches!(good, Incoming::Message(ClientMessage::Hello(_))));
 
         // A reserved command with an id: bad_request.
@@ -817,10 +847,10 @@ mod tests {
     fn extra_fields_are_tolerated() {
         // A newer plugin may add fields; the daemon must not disconnect over them.
         let msg: ClientMessage =
-            serde_json::from_str(r#"{"hello":{"protocol":3,"session":"hub","client":"x","features":["a"]}}"#).unwrap();
+            serde_json::from_str(r#"{"hello":{"protocol":4,"session":"hub","client":"x","features":["a"]}}"#).unwrap();
         assert!(matches!(msg, ClientMessage::Hello(_)));
         let msg: DaemonMessage = serde_json::from_str(
-            r#"{"event":{"kind":"message","person":"A","role":"owner","sender":"@a:x","room_id":"!r","event_id":"$e","ts":"t","text":"x","transcribed":false,"attachments":[],"thread":"$t"}}"#,
+            r#"{"event":{"kind":"message","person":"A","role":"owner","sender":"@a:x","room_id":"!r","room":"group","event_id":"$e","ts":"t","text":"x","transcribed":false,"attachments":[],"thread":"$t"}}"#,
         )
         .unwrap();
         assert!(matches!(msg, DaemonMessage::Event(_)));
