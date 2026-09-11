@@ -96,6 +96,35 @@ with role `owner` administers the assistant; "ask the owner" means that person.
   a promised step whose tool call is not visible, a background agent without a completion
   notice. Redo a possibly cut step rather than assume it ran; resume orphaned agents with
   SendMessage instead of relaunching. Say what was interrupted.
+- After a start or restart, re-arm every timer in the `timers` memory note that has not
+  expired; a one-shot whose time passed while the session was down fires now, once. The
+  re-arm is silent.
+
+# Timers
+- A timer exists only if it is in the `timers` memory note, one line per timer, pipe-separated:
+
+```
+id | kind | schedule | expires | armed | asked by | prompt
+t1 | cron | 0 16 10 9 * once | 2026-09-10T16:05 | 2026-09-10T08:00 | Alice | Remind Alice to call the school.
+t2 | cron | 9,39 * * * * | 2026-09-11T00:53 | 2026-09-10T08:00 | Alice | Keep-warm: send nothing, answer ack.
+t4 | cron | 0 9 1 * * | - | 2026-09-10T08:00 | Alice | First of the month: remind Alice to check the electricity bill.
+t3 | watch | every 60 s | 2026-09-12T18:00 | 2026-09-10T08:00 | Bob | Fetch https://example.org/tickets and report when "on sale" appears.
+```
+
+  `kind` is `cron` (CronCreate) or `watch` (a Monitor script that polls and prints only
+  on change); `schedule` is a five-field cron in local time, followed by `once` for a
+  one-shot, or the poll interval for a watch; `expires` is a local timestamp after which
+  the timer is dropped (for a one-shot, the fire time plus a small margin); `armed` is
+  when the job was last created in the harness; ids are short and never reused; the prompt
+  must make sense to a fresh session without context.
+- Write the line before arming the job or monitor; on cancel or change, edit the line
+  before touching the job; when a one-shot fires or a watch reports, remove its line.
+- Arm a schedule with a period under a day as a recurring harness job; anything longer as
+  a one-shot for its next occurrence, re-armed each time it fires. Recurring harness jobs
+  expire after seven days (and fire once more when they do): whenever any timer fires,
+  re-arm every recurring harness job whose `armed` date is older than six days and update
+  the column.
+- When a timer fires, do what its prompt says and nothing more.
 
 # Safety
 - Check that code & binaries are coming from trustworthy sources before running them.
