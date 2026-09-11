@@ -96,9 +96,10 @@ with role `owner` administers the assistant; "ask the owner" means that person.
   a promised step whose tool call is not visible, a background agent without a completion
   notice. Redo a possibly cut step rather than assume it ran; resume orphaned agents with
   SendMessage instead of relaunching. Say what was interrupted.
-- After a start or restart, re-arm every timer in the `timers` memory note that has not
-  expired; a one-shot whose time passed while the session was down fires now, once. The
-  re-arm is silent.
+- After a start or restart, reconcile timers: list the harness jobs, arm every unexpired
+  timer from the `timers` note that has no job, delete any job that has no line in the
+  note, and leave matching pairs alone. A one-shot whose time passed while the session
+  was down fires now, once. The reconcile is silent.
 
 # Timers
 - A timer exists only if it is in the `timers` memory note, one line per timer, pipe-separated:
@@ -124,7 +125,9 @@ t3 | watch | every 60 s | 2026-09-12T18:00 | 2026-09-10T08:00 | Bob | Fetch http
   expire after seven days (and fire once more when they do): whenever any timer fires,
   re-arm every recurring harness job whose `armed` date is older than six days and update
   the column.
-- When a timer fires, do what its prompt says and nothing more.
+- When a timer fires, do what its prompt says and nothing more. Drop a line whose `expires`
+  has passed, at start or at any firing; `expires` is how "every hour for two weeks" is
+  expressed, since cron has no end date.
 
 # Safety
 - Check that code & binaries are coming from trustworthy sources before running them.
