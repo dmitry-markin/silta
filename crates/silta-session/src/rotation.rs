@@ -5,15 +5,15 @@
 //! or by the supervisor's own threshold). It proceeds at the first quiet moment, no
 //! turn in progress and no background task (an agent, a command) outstanding, with a
 //! handoff request, and the handoff turn is the turn that wrote the handoff note (a
-//! turn a person's message started can end first, and does not count). What follows
-//! depends on the cache: a session whose last turn ended an idle gap ago (`Limits::idle`)
-//! is cold and is replaced by a fresh id; a warm one is compacted in place with
-//! `/compact` and keeps its id, timers and agents. Two caps bound the two waits; the
-//! first expiry cuts the turn and resumes once for the handoff, the second gives up on
-//! it. A handoff turn that fails is retried after a pause, at most `HANDOFF_ATTEMPTS`
-//! times in all. A compaction that fails, or runs past the handoff cap, falls back to
-//! the fresh id. The supervisor snapshots memory and transcript at two moments the
-//! machine names: before the handoff is first requested, and after the handoff turn.
+//! turn a person's message started can end first, and does not count). The session is
+//! then compacted in place with `/compact` and keeps its id, timers and agents. Two
+//! caps bound the waits; the first expiry (of the quiet wait, the handoff turn or the
+//! compaction) cuts the turn and resumes once for the handoff, the second gives up.
+//! A handoff turn or a compaction that fails is retried after a pause, from the
+//! handoff again; `HANDOFF_ATTEMPTS` failures of either kind in all end the rotation
+//! with a fresh session id, the last resort. The supervisor snapshots memory and
+//! transcript at two moments the machine names: before the handoff is first
+//! requested, and after each handoff turn.
 
 use std::{
     collections::BTreeSet,
@@ -38,7 +38,7 @@ pub struct Limits {
     pub retry_pause: Duration,
 }
 
-/// Handoff turns attempted before the rotation gives up on the note.
+/// Attempts (handoff turns or compactions that fail) before the rotation gives up.
 pub const HANDOFF_ATTEMPTS: u32 = 2;
 
 /// The two moments at which memory and transcript are copied: both are idle moments,
@@ -59,16 +59,23 @@ impl Moment {
     }
 }
 
-/// Why the handoff is followed by a fresh session id rather than a compaction.
+/// Why the compaction is given up for a fresh session id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fresh {
-    /// The session was idle for the idle gap when the handoff was requested: the cache
-    /// is cold and there is no thread to keep.
-    IdleGap,
-    /// Claude Code reported the compaction failed, or the turn ended in an error.
+    /// `HANDOFF_ATTEMPTS` attempts failed, the last a compaction (Claude Code
+    /// reported the failure, or the turn ended in an error).
     CompactionFailed,
-    /// The compaction did not end within the handoff cap.
+    /// The compaction did not end within the handoff cap, after the one cut-and-resume.
     CompactionCut,
+}
+
+/// The step of the rotation that was cut or that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// The wait for a quiet moment: no handoff line has gone out yet.
+    Wait,
+    Handoff,
+    Compaction,
 }
 
 /// What the supervisor should do now.
@@ -82,21 +89,23 @@ pub enum Action {
     RequestHandoff,
     /// A turn ended without the handoff note written: keep waiting for the handoff.
     AwaitHandoff,
-    /// The handoff turn ended normally and the cache is warm: send `/compact`.
+    /// The handoff turn ended normally: send `/compact`.
     Compact,
     /// A turn ended with neither a compaction boundary nor a failure: keep waiting.
     AwaitCompaction,
     /// The compaction went through: the rotation is complete, the session goes on.
     Compacted,
-    /// Stop claude and start a fresh session with the handoff done.
+    /// The compaction did not go through and the attempts are spent: stop claude and
+    /// start a fresh session with the handoff done.
     Rotate { reason: Fresh },
     /// A cap expired with the retry unused: cut the turn, resume once with the combined
-    /// line, and wait for the handoff again. `handoff_requested` says whether the
-    /// handoff line had gone out (and the before-handoff snapshot with it).
-    Retry { handoff_requested: bool },
-    /// The handoff turn ended with an error: stop, resume normally, and try again after
-    /// the pause; `failures` counts the failed handoff turns so far.
-    Postpone { failures: u32 },
+    /// line, and wait for the handoff again. `step` is what was cut; after `Wait` the
+    /// before-handoff snapshot is still due.
+    Retry { step: Step },
+    /// The handoff turn ended with an error, or the compaction failed: stop, resume
+    /// normally, and try again from the handoff after the pause; `failures` counts the
+    /// failed attempts so far.
+    Postpone { failures: u32, step: Step },
     /// Stop claude and start a fresh session without a finished handoff.
     GiveUp { reason: Reason },
 }
@@ -106,7 +115,7 @@ pub enum Action {
 pub enum Reason {
     /// A cap expired again after the one cut-and-resume.
     CutTwice,
-    /// `HANDOFF_ATTEMPTS` handoff turns failed.
+    /// `HANDOFF_ATTEMPTS` attempts failed, the last a handoff turn.
     Failures,
 }
 
@@ -131,9 +140,6 @@ pub struct Tracker {
     not_before: Option<Instant>,
     retry_used: bool,
     failures: u32,
-    /// The session had been idle for the idle gap when the handoff was requested: a
-    /// fresh id follows the handoff instead of a compaction.
-    cold: bool,
     /// The handoff note has been written since it was requested, as the supervisor
     /// found on disk before the turn's `result`.
     note_written: bool,
@@ -154,15 +160,14 @@ impl Tracker {
             not_before: None,
             retry_used: false,
             failures: 0,
-            cold: false,
             note_written: true,
             phase: Phase::Idle,
         }
     }
 
     /// The marker existed at the start: the rotation is pending from the first quiet
-    /// moment, once `not_before` (the pause after a failed handoff turn) has passed;
-    /// `failures` is the count of failed handoff turns so far.
+    /// moment, once `not_before` (the pause after a failed attempt) has passed;
+    /// `failures` is the count of failed attempts so far.
     pub fn pending(mut self, now: Instant, not_before: Option<Instant>, failures: u32) -> Self {
         if !self.limits.enabled {
             return self;
@@ -176,8 +181,7 @@ impl Tracker {
     }
 
     /// The session was resumed with the combined cut-and-handoff line: the retry is
-    /// spent and the handoff turn is in flight. The cache is warm again by the time
-    /// the handoff ends, so the compaction follows.
+    /// spent and the handoff turn is in flight.
     pub fn retrying(mut self, now: Instant) -> Self {
         self.pending = true;
         self.retry_used = true;
@@ -230,7 +234,6 @@ impl Tracker {
         self.not_before = None;
         self.failures = 0;
         self.retry_used = false;
-        self.cold = false;
         self.phase = Phase::Idle;
     }
 
@@ -261,22 +264,10 @@ impl Tracker {
                             return vec![Action::AwaitHandoff];
                         }
                         if *is_error {
-                            self.phase = Phase::Idle;
-                            self.failures += 1;
-                            return if self.failures >= HANDOFF_ATTEMPTS {
-                                vec![Action::GiveUp { reason: Reason::Failures }]
-                            } else {
-                                self.not_before = Some(now + self.limits.retry_pause);
-                                vec![Action::Postpone { failures: self.failures }]
-                            };
+                            return self.failed(Step::Handoff, now);
                         }
-                        return if self.cold {
-                            self.phase = Phase::Idle;
-                            vec![Action::Snapshot(Moment::AfterHandoff), Action::Rotate { reason: Fresh::IdleGap }]
-                        } else {
-                            self.phase = Phase::Compacting { deadline: now + self.limits.handoff, boundary: false, failed: false };
-                            vec![Action::Snapshot(Moment::AfterHandoff), Action::Compact]
-                        };
+                        self.phase = Phase::Compacting { deadline: now + self.limits.handoff, boundary: false, failed: false };
+                        return vec![Action::Snapshot(Moment::AfterHandoff), Action::Compact];
                     }
                     Phase::Compacting { boundary, failed, .. } => {
                         if boundary {
@@ -284,8 +275,7 @@ impl Tracker {
                             return vec![Action::Compacted];
                         }
                         if failed || *is_error {
-                            self.phase = Phase::Idle;
-                            return vec![Action::Rotate { reason: Fresh::CompactionFailed }];
+                            return self.failed(Step::Compaction, now);
                         }
                         // A person's turn that was queued before the command ended first.
                         return vec![Action::AwaitCompaction];
@@ -343,7 +333,6 @@ impl Tracker {
                 if self.not_before.is_some_and(|t| now < t) {
                     Vec::new()
                 } else if self.quiet() {
-                    self.cold = now.duration_since(self.last_result) >= self.limits.idle;
                     self.phase = Phase::Handoff { deadline: now + self.limits.handoff };
                     // A retried handoff keeps the clean copy of the first attempt.
                     if self.failures == 0 {
@@ -352,22 +341,21 @@ impl Tracker {
                         vec![Action::RequestHandoff]
                     }
                 } else if now >= deadline {
-                    self.cut(false)
+                    self.cut(Step::Wait)
                 } else {
                     Vec::new()
                 }
             }
             Phase::Handoff { deadline } => {
                 if now >= deadline {
-                    self.cut(true)
+                    self.cut(Step::Handoff)
                 } else {
                     Vec::new()
                 }
             }
             Phase::Compacting { deadline, .. } => {
                 if now >= deadline {
-                    self.phase = Phase::Idle;
-                    vec![Action::Rotate { reason: Fresh::CompactionCut }]
+                    self.cut(Step::Compaction)
                 } else {
                     Vec::new()
                 }
@@ -375,13 +363,34 @@ impl Tracker {
         }
     }
 
-    fn cut(&mut self, handoff_requested: bool) -> Vec<Action> {
+    /// A cap expired: the one cut-and-resume, or the end of the rotation. A second
+    /// cut of the compaction still has the handoff written; a second cut before that
+    /// does not.
+    fn cut(&mut self, step: Step) -> Vec<Action> {
         self.phase = Phase::Idle;
-        if self.retry_used {
-            vec![Action::GiveUp { reason: Reason::CutTwice }]
-        } else {
+        if !self.retry_used {
             self.retry_used = true;
-            vec![Action::Retry { handoff_requested }]
+            vec![Action::Retry { step }]
+        } else if step == Step::Compaction {
+            vec![Action::Rotate { reason: Fresh::CompactionCut }]
+        } else {
+            vec![Action::GiveUp { reason: Reason::CutTwice }]
+        }
+    }
+
+    /// A handoff turn or a compaction failed: another attempt after the pause, or the
+    /// end of the rotation. A failed compaction still has the handoff written; a
+    /// failed handoff turn does not.
+    fn failed(&mut self, step: Step, now: Instant) -> Vec<Action> {
+        self.phase = Phase::Idle;
+        self.failures += 1;
+        if self.failures < HANDOFF_ATTEMPTS {
+            self.not_before = Some(now + self.limits.retry_pause);
+            vec![Action::Postpone { failures: self.failures, step }]
+        } else if step == Step::Compaction {
+            vec![Action::Rotate { reason: Fresh::CompactionFailed }]
+        } else {
+            vec![Action::GiveUp { reason: Reason::Failures }]
         }
     }
 }
@@ -419,7 +428,7 @@ mod tests {
         Duration::from_secs(n)
     }
 
-    /// A warm session with the marker seen at a quiet moment: the handoff is requested.
+    /// The marker seen at a quiet moment: the handoff is requested.
     fn requested(t0: Instant) -> Tracker {
         let mut tr = Tracker::new(limits(), t0);
         tr.event(&OK, t0);
@@ -437,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn threshold_needs_both_a_large_context_and_the_idle_gap_and_ends_in_a_fresh_id() {
+    fn threshold_needs_both_a_large_context_and_the_idle_gap() {
         let t0 = Instant::now();
         let mut tr = Tracker::new(limits(), t0);
         assert!(tr.event(&assistant(310_000), t0 + secs(1)).is_empty());
@@ -449,10 +458,10 @@ mod tests {
             tr.tick(t0 + secs(2 + 4 * 3600)),
             vec![Action::MarkPending, BEFORE, Action::RequestHandoff]
         );
-        // The handoff turn runs and ends: the cache is cold, so a fresh id follows.
+        // The handoff turn runs and ends: the compaction follows, as after any trigger.
         let t = t0 + secs(3 + 4 * 3600);
         assert!(tr.event(&assistant(310_100), t).is_empty());
-        assert_eq!(tr.event(&OK, t + secs(60)), vec![AFTER, Action::Rotate { reason: Fresh::IdleGap }]);
+        assert_eq!(tr.event(&OK, t + secs(60)), vec![AFTER, Action::Compact]);
     }
 
     #[test]
@@ -504,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn a_warm_session_is_compacted_in_place() {
+    fn the_session_is_compacted_in_place() {
         let t0 = Instant::now();
         let mut tr = compacting(t0);
         // The compaction's own lines, then its result: the rotation is over, the
@@ -524,22 +533,60 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_compaction_falls_back_to_a_fresh_id() {
+    fn a_failed_compaction_is_retried_from_the_handoff_then_gives_way_to_a_fresh_id() {
         let t0 = Instant::now();
-        // Claude Code reports the failure (a blocked compaction), then ends the turn
-        // without an error result.
+        // Claude Code reports the failure (an API error, a blocked compaction), then
+        // ends the turn without an error result: postponed like a failed handoff turn.
         let mut tr = compacting(t0);
         assert!(tr.event(&Event::CompactionFailed, t0 + secs(61)).is_empty());
         tr.event(&assistant(50_000), t0 + secs(62));
-        assert_eq!(tr.event(&OK, t0 + secs(63)), vec![Action::Rotate { reason: Fresh::CompactionFailed }]);
-        // An error result during the compaction is the same fall-back.
+        assert_eq!(tr.event(&OK, t0 + secs(63)), vec![Action::Postpone { failures: 1, step: Step::Compaction }]);
+        assert!(tr.is_pending());
+        // The resumed run after the pause: the handoff again, with no clean snapshot,
+        // then the compaction again; a second failure ends the rotation with a fresh
+        // id and the handoff done.
+        let t1 = t0 + secs(1000);
+        let mut tr = Tracker::new(limits(), t1).pending(t1, Some(t1 + secs(900)), 1);
+        tr.event(&OK, t1 + secs(5));
+        assert_eq!(tr.tick(t1 + secs(900)), vec![Action::RequestHandoff]);
+        tr.event(&assistant(50_000), t1 + secs(901));
+        assert_eq!(tr.event(&OK, t1 + secs(930)), vec![AFTER, Action::Compact]);
+        assert_eq!(tr.event(&ERR, t1 + secs(940)), vec![Action::Rotate { reason: Fresh::CompactionFailed }]);
+        // An error result during the first compaction is postponed the same way.
         let mut tr = compacting(t0);
-        assert_eq!(tr.event(&ERR, t0 + secs(63)), vec![Action::Rotate { reason: Fresh::CompactionFailed }]);
-        // A compaction that does not end within the handoff cap is cut.
+        assert_eq!(tr.event(&ERR, t0 + secs(63)), vec![Action::Postpone { failures: 1, step: Step::Compaction }]);
+        // A failed handoff turn and a failed compaction share the count: the second
+        // failure of either kind is the last, and which one it was decides the start
+        // line of the fresh session.
+        let mut tr = Tracker::new(limits(), t1).pending(t1, Some(t1 + secs(900)), 1);
+        tr.event(&OK, t1 + secs(5));
+        tr.tick(t1 + secs(900));
+        assert_eq!(tr.event(&ERR, t1 + secs(930)), vec![Action::GiveUp { reason: Reason::Failures }]);
+    }
+
+    #[test]
+    fn a_hanging_compaction_is_cut_and_resumed_once() {
+        let t0 = Instant::now();
+        // The compaction does not end within the handoff cap: the one cut-and-resume,
+        // which asks for the handoff again.
         let mut tr = compacting(t0);
         assert!(tr.tick(t0 + secs(60 + 899)).is_empty());
-        assert_eq!(tr.tick(t0 + secs(60 + 900)), vec![Action::Rotate { reason: Fresh::CompactionCut }]);
+        assert_eq!(tr.tick(t0 + secs(60 + 900)), vec![Action::Retry { step: Step::Compaction }]);
         assert!(tr.tick(t0 + secs(60 + 901)).is_empty(), "said once");
+        // The resumed run: handoff, compaction, and a second hang ends the rotation
+        // with a fresh id and the handoff done, not the give-up line.
+        let t1 = t0 + secs(1000);
+        let mut tr = Tracker::new(limits(), t1).retrying(t1);
+        tr.event(&assistant(50_000), t1 + secs(1));
+        assert_eq!(tr.event(&OK, t1 + secs(120)), vec![AFTER, Action::Compact]);
+        assert!(tr.tick(t1 + secs(120 + 899)).is_empty());
+        assert_eq!(tr.tick(t1 + secs(120 + 900)), vec![Action::Rotate { reason: Fresh::CompactionCut }]);
+        // The retried compaction can also succeed.
+        let mut tr = Tracker::new(limits(), t1).retrying(t1);
+        tr.event(&OK, t1 + secs(120));
+        tr.event(&BOUNDARY, t1 + secs(130));
+        assert_eq!(tr.event(&OK, t1 + secs(131)), vec![Action::Compacted]);
+        assert!(!tr.is_pending());
     }
 
     #[test]
@@ -568,7 +615,7 @@ mod tests {
         tr.marker_seen(t0 + secs(2));
         assert!(tr.tick(t0 + secs(2) + secs(1799)).is_empty());
         // Cut before the handoff went out: the clean snapshot is still due.
-        assert_eq!(tr.tick(t0 + secs(2) + secs(1800)), vec![Action::Retry { handoff_requested: false }]);
+        assert_eq!(tr.tick(t0 + secs(2) + secs(1800)), vec![Action::Retry { step: Step::Wait }]);
         // The resumed run: the combined line is the handoff request.
         let t1 = t0 + secs(2000);
         let mut tr = Tracker::new(limits(), t1).retrying(t1);
@@ -595,7 +642,7 @@ mod tests {
         // An error result ends the handoff turn whatever the disk says.
         let mut tr = requested(t0);
         tr.set_note_written(false);
-        assert_eq!(tr.event(&ERR, t0 + secs(2)), vec![Action::Postpone { failures: 1 }]);
+        assert_eq!(tr.event(&ERR, t0 + secs(2)), vec![Action::Postpone { failures: 1, step: Step::Handoff }]);
     }
 
     #[test]
@@ -611,10 +658,10 @@ mod tests {
         let t0 = Instant::now();
         let mut tr = requested(t0);
         tr.event(&assistant(50_000), t0 + secs(2));
-        assert_eq!(tr.tick(t0 + secs(1) + secs(900)), vec![Action::Retry { handoff_requested: true }]);
+        assert_eq!(tr.tick(t0 + secs(1) + secs(900)), vec![Action::Retry { step: Step::Handoff }]);
 
         let mut tr = requested(t0);
-        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::Postpone { failures: 1 }]);
+        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::Postpone { failures: 1, step: Step::Handoff }]);
     }
 
     #[test]
@@ -641,7 +688,7 @@ mod tests {
         let mut tr = Tracker::new(limits(), t0).pending(t0, Some(pause_end), 0);
         tr.event(&assistant(1), t0 + secs(5));
         assert!(tr.tick(pause_end + secs(1799)).is_empty());
-        assert_eq!(tr.tick(pause_end + secs(1800)), vec![Action::Retry { handoff_requested: false }]);
+        assert_eq!(tr.tick(pause_end + secs(1800)), vec![Action::Retry { step: Step::Wait }]);
     }
 
     #[test]

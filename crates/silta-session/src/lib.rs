@@ -7,9 +7,9 @@
 //! id across restarts as long as its transcript exists, and rotates the session when
 //! its context has grown and it is idle, or when Claude Code wanted to compact on its
 //! own (`docs/session-rotation-design.md`): a handoff note first, then a `/compact`
-//! in place for a warm session or a fresh id for a cold one, with memory and
-//! transcript copied to `backups/` before and after the handoff. Closing stdin is the
-//! graceful stop; a session that does not exit within the grace is killed.
+//! in place (a fresh id only when the compaction fails), with memory and transcript
+//! copied to `backups/` before and after the handoff. Closing stdin is the graceful
+//! stop; a session that does not exit within the grace is killed.
 
 pub mod contract;
 pub mod rotation;
@@ -32,7 +32,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use contract::Contract;
-use rotation::{Action, Fresh, Limits, Moment, Reason, Tracker, HANDOFF_ATTEMPTS};
+use rotation::{Action, Fresh, Limits, Moment, Reason, Step, Tracker, HANDOFF_ATTEMPTS};
 use state::{HandoffWatch, Next, Paths, HANDOFF_NOTE};
 
 /// The channel plugin, last on the command line because `--channels` is variadic.
@@ -265,7 +265,7 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
             eprintln!(
                 "rotation: pending from the start; rotating at the next quiet moment{}{}",
                 if pause > 0 { format!(" after {pause} s") } else { String::new() },
-                if start.failures > 0 { format!(" ({} of {HANDOFF_ATTEMPTS} handoff turns failed)", start.failures) } else { String::new() }
+                if start.failures > 0 { format!(" ({} of {HANDOFF_ATTEMPTS} attempts failed)", start.failures) } else { String::new() }
             );
         }
         _ => {}
@@ -469,34 +469,39 @@ impl Run<'_> {
                 }
                 Action::Rotate { reason } => {
                     let why = match reason {
-                        Fresh::IdleGap => format!("handoff written; the session was idle for {} s, so the cache is cold", self.cfg.limits.idle.as_secs()),
-                        Fresh::CompactionFailed => "the compaction failed".to_owned(),
-                        Fresh::CompactionCut => format!("the compaction did not end within {} s", self.cfg.limits.handoff.as_secs()),
+                        Fresh::CompactionFailed => format!("the compaction failed ({HANDOFF_ATTEMPTS} of {HANDOFF_ATTEMPTS} attempts)"),
+                        Fresh::CompactionCut => format!("the compaction did not end within {} s again", self.cfg.limits.handoff.as_secs()),
                     };
-                    eprintln!("rotation: {why}; stopping the session for a fresh start");
+                    eprintln!("rotation: {why}; the handoff is written, stopping the session for a fresh start");
                     self.finish(true);
                 }
                 Action::GiveUp { reason } => {
                     let why = match reason {
                         Reason::CutTwice => "the turn did not end within the cap again".to_owned(),
-                        Reason::Failures => format!("{HANDOFF_ATTEMPTS} handoff turns failed"),
+                        Reason::Failures => format!("{HANDOFF_ATTEMPTS} attempts failed, the last a handoff turn"),
                     };
                     eprintln!("rotation: {why}; giving the handoff up and stopping the session for a fresh start");
                     self.finish(false);
                 }
-                Action::Retry { handoff_requested } => {
+                Action::Retry { step } => {
                     let agents = self.tracker.agents();
                     let outstanding = if agents.is_empty() { String::new() } else { format!(" (agents outstanding: {})", agents.iter().cloned().collect::<Vec<_>>().join(", ")) };
-                    eprintln!("rotation: the turn did not end within the cap{outstanding}; cutting it and resuming once for the handoff");
-                    if let Err(err) = self.paths.write_next(Next::Retry { snapshot: !handoff_requested }) {
+                    let what = match step {
+                        Step::Wait => "the turn",
+                        Step::Handoff => "the handoff turn",
+                        Step::Compaction => "the compaction",
+                    };
+                    eprintln!("rotation: {what} did not end within the cap{outstanding}; cutting it and resuming once for the handoff");
+                    if let Err(err) = self.paths.write_next(Next::Retry { snapshot: step == Step::Wait }) {
                         eprintln!("rotation: cannot record the next step: {err}");
                     }
                     self.after = Some(Outcome::Again { not_before: None });
                     self.begin_stop();
                 }
-                Action::Postpone { failures } => {
+                Action::Postpone { failures, step } => {
                     let pause = self.cfg.limits.retry_pause;
-                    eprintln!("rotation: the handoff turn failed ({failures} of {HANDOFF_ATTEMPTS}); resuming the session and retrying in {} s", pause.as_secs());
+                    let what = if step == Step::Compaction { "the compaction" } else { "the handoff turn" };
+                    eprintln!("rotation: {what} failed ({failures} of {HANDOFF_ATTEMPTS} attempts); resuming the session and retrying from the handoff in {} s", pause.as_secs());
                     if let Err(err) = self.paths.write_next(Next::Postponed { failures }) {
                         eprintln!("rotation: cannot record the next step: {err}");
                     }
@@ -577,8 +582,7 @@ pub fn handoff() -> &'static str {
     "Write your handoff now: the session is about to be rotated. This line comes from the host, not from a person. Rewrite the memory note `handoff` (the file handoff.md in your memory directory) even if nothing is pending: the host waits for that file to change and takes the turn that rewrites it as your handoff turn. End your turn when it is written."
 }
 
-/// The compaction command sent after the handoff of a warm session (design section
-/// 3a): a `/compact` with the instructions for the summary, written to stdin like a
+/// The compaction command sent after the handoff (design section 3a): a `/compact` with the instructions for the summary, written to stdin like a
 /// host line. Claude Code answers with a `compact_boundary` and a `result`.
 pub fn compact() -> &'static str {
     "/compact Keep, in this order: the person's name and how we work together, in the voice of the conversation; decisions made in this session; open tasks and promises with their state; the ids of background agents and timers; then the most recent messages between the person and the assistant in the chat, the last ten from each side or so, as close to verbatim as space allows, as plain lines of the form `name, time: text`, one per message, where the name is the person's name as it appears in the chat or your own name, without the channel tags or tool-call wrappers, keeping the room id and the event ids of the last two incoming messages; timer wakeups, host lines and tool results are not messages. Drop tool output, research contents and anything already in memory."

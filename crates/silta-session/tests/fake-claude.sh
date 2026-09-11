@@ -8,9 +8,11 @@
 # seconds after the turn), busy (a turn that writes another memory note ends first, as
 # if a person's message had come with the line, and the handoff follows four seconds
 # later), noresume (a --resume is refused), nocompact (a /compact is reported blocked),
-# compacthang (a /compact never ends) or busycompact (an unrelated turn ends before the
-# compaction, as if a person's message had been queued ahead of the command).
-# HOME/fake-context is the context size reported in every assistant line.
+# compacthang (a /compact never ends), compacthangonce (the same, once: the mode is
+# reset to ok first) or busycompact (an unrelated turn ends before the compaction, as
+# if a person's message had been queued ahead of the command).
+# HOME/fake-context is the context size reported in every assistant line; a compaction
+# sets it to 100, as the real one shrinks the context.
 set -u
 id=""; resume=""
 while [ $# -gt 0 ]; do
@@ -44,6 +46,7 @@ while IFS= read -r line; do
     # boundary, the summary as a user line, and a result of its own.
     case "$(mode)" in
       compacthang) sleep 30; exit 0 ;;
+      compacthangonce) echo ok > "$HOME/fake-mode"; sleep 30; exit 0 ;;
       busycompact)
         assistant ok; result
         echo "aside $id" >> "$HOME/fake.log"
@@ -60,7 +63,8 @@ while IFS= read -r line; do
     fi
     echo '{"type":"system","subtype":"status","status":null,"compact_result":"success"}'
     init
-    echo "{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compact_metadata\":{\"trigger\":\"manual\",\"pre_tokens\":$context,\"post_tokens\":900}}"
+    echo "{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compact_metadata\":{\"trigger\":\"manual\",\"pre_tokens\":$context,\"post_tokens\":100}}"
+    echo 100 > "$HOME/fake-context"
     echo '{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."}}'
     echo '{"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"}}'
     echo "compact $id" >> "$HOME/fake.log"
