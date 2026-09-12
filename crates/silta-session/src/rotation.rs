@@ -6,9 +6,10 @@
 //! turn in progress and no background task (an agent, a command) outstanding, with a
 //! handoff request, and the handoff turn is the turn that wrote the handoff note (a
 //! turn a person's message started can end first, and does not count). The session is
-//! then compacted in place with `/compact` and keeps its id, timers and agents. Two
-//! caps bound the waits; a cap that expires cuts the turn and resumes the session for
-//! the handoff, and a handoff turn or a compaction that fails is retried after a
+//! then compacted in place with `/compact` and keeps its id, timers and agents. Three
+//! caps bound the waits (for the quiet moment, the handoff turn and the compaction); a
+//! cap that expires cuts the turn and resumes the session for the handoff, and a
+//! handoff turn or a compaction that fails is retried after a
 //! pause, from the handoff again. One count of attempts covers cuts and failures
 //! alike and survives the restarts they cause: `HANDOFF_ATTEMPTS` of them in all end
 //! the rotation with a fresh session id, the last resort. The supervisor snapshots
@@ -34,6 +35,8 @@ pub struct Limits {
     pub quiet: Duration,
     /// Cap on the handoff turn.
     pub handoff: Duration,
+    /// Cap on the compaction after the handoff turn, counted from the `/compact` line.
+    pub compact: Duration,
     /// Pause before the next attempt after a handoff turn that failed.
     pub retry_pause: Duration,
 }
@@ -274,7 +277,7 @@ impl Tracker {
                             return self.failed(Step::Handoff, now);
                         }
                         self.handoff = true;
-                        self.phase = Phase::Compacting { deadline: now + self.limits.handoff, boundary: false, failed: false };
+                        self.phase = Phase::Compacting { deadline: now + self.limits.compact, boundary: false, failed: false };
                         return vec![Action::Snapshot(Moment::AfterHandoff), Action::Compact];
                     }
                     Phase::Compacting { boundary, failed, .. } => {
@@ -407,6 +410,7 @@ mod tests {
             idle: Duration::from_secs(4 * 3600),
             quiet: Duration::from_secs(1800),
             handoff: Duration::from_secs(900),
+            compact: Duration::from_secs(2700),
             retry_pause: Duration::from_secs(900),
         }
     }
@@ -592,20 +596,21 @@ mod tests {
     #[test]
     fn a_hanging_compaction_is_cut_and_resumed_once() {
         let t0 = Instant::now();
-        // The compaction does not end within the handoff cap: the one cut-and-resume,
-        // which asks for the handoff again.
+        // The compaction runs under its own cap, not the handoff's; past it, the one
+        // cut-and-resume, which asks for the handoff again.
         let mut tr = compacting(t0);
-        assert!(tr.tick(t0 + secs(60 + 899)).is_empty());
-        assert_eq!(tr.tick(t0 + secs(60 + 900)), vec![Action::Retry { step: Step::Compaction, attempts: 1, handoff: true }]);
-        assert!(tr.tick(t0 + secs(60 + 901)).is_empty(), "said once");
+        assert!(tr.tick(t0 + secs(60 + 900)).is_empty(), "the handoff cap does not bound the compaction");
+        assert!(tr.tick(t0 + secs(60 + 2699)).is_empty());
+        assert_eq!(tr.tick(t0 + secs(60 + 2700)), vec![Action::Retry { step: Step::Compaction, attempts: 1, handoff: true }]);
+        assert!(tr.tick(t0 + secs(60 + 2701)).is_empty(), "said once");
         // The resumed run: handoff, compaction, and a second hang ends the rotation
         // with a fresh id and the handoff done, not the give-up line.
         let t1 = t0 + secs(1000);
         let mut tr = Tracker::new(limits(), t1).retrying(t1, 1, true);
         tr.event(&assistant(50_000), t1 + secs(1));
         assert_eq!(tr.event(&OK, t1 + secs(120)), vec![AFTER, Action::Compact]);
-        assert!(tr.tick(t1 + secs(120 + 899)).is_empty());
-        assert_eq!(tr.tick(t1 + secs(120 + 900)), vec![Action::GiveUp { step: Step::Compaction, cut: true, handoff: true }]);
+        assert!(tr.tick(t1 + secs(120 + 2699)).is_empty());
+        assert_eq!(tr.tick(t1 + secs(120 + 2700)), vec![Action::GiveUp { step: Step::Compaction, cut: true, handoff: true }]);
         // The retried compaction can also succeed.
         let mut tr = Tracker::new(limits(), t1).retrying(t1, 1, true);
         tr.event(&OK, t1 + secs(120));

@@ -43,6 +43,7 @@ impl Fixture {
                 idle: Duration::from_secs(2),
                 quiet: Duration::from_secs(3),
                 handoff: Duration::from_secs(3),
+                compact: Duration::from_secs(3),
                 retry_pause: Duration::from_secs(3),
             },
             backups_keep: 3,
@@ -376,7 +377,7 @@ async fn a_failed_or_hanging_compaction_is_retried_from_the_handoff() {
     let snaps: Vec<String> = fx.snapshots().iter().map(|p| name(p)).collect();
     assert_eq!(snaps.len(), 3, "{snaps:?}");
     assert!(snaps[0].ends_with("-before-handoff") && snaps[1].ends_with("-after-handoff") && snaps[2].ends_with("-after-handoff"), "{snaps:?}");
-    // A compaction that never ends is cut at the handoff cap (3 s) plus the grace
+    // A compaction that never ends is cut at the compaction cap (3 s) plus the grace
     // (2 s) and the session resumed once with the combined line, whose handoff is
     // followed by the compaction again.
     fx.set("fake-mode", "compacthangonce");

@@ -72,6 +72,10 @@ struct Args {
     #[arg(long, env = "SILTA_ROTATE_HANDOFF_SECONDS", default_value_t = 900)]
     rotate_handoff_seconds: u64,
 
+    /// Cap in seconds on the compaction that follows the handoff turn.
+    #[arg(long, env = "SILTA_ROTATE_COMPACT_SECONDS", default_value_t = 2_700)]
+    rotate_compact_seconds: u64,
+
     /// Seconds before the next attempt after a handoff turn that failed.
     #[arg(long, env = "SILTA_ROTATE_RETRY_SECONDS", default_value_t = 900)]
     rotate_retry_seconds: u64,
@@ -124,6 +128,7 @@ fn main() -> ExitCode {
             idle: Duration::from_secs(args.rotate_idle_seconds),
             quiet: Duration::from_secs(args.rotate_quiet_seconds),
             handoff: Duration::from_secs(args.rotate_handoff_seconds),
+            compact: Duration::from_secs(args.rotate_compact_seconds),
             retry_pause: Duration::from_secs(args.rotate_retry_seconds),
         },
         backups_keep: args.backups_keep,

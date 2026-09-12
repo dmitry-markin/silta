@@ -31,8 +31,8 @@ Environment=SILTA_STOP_GRACE=120
 # reached ROTATE_CONTEXT_TOKENS and to which no person has written for
 # ROTATE_IDLE_SECONDS (timer wakeups and the mind's own work do not count), or whose
 # Claude Code wanted to compact, is asked for a handoff and then compacted in place
-# (replaced by a fresh session only after two failed or cut attempts). The two caps bound the
-# wait for a quiet moment and the handoff turn (the compaction too);
+# (replaced by a fresh session only after two failed or cut attempts). The three caps
+# bound the wait for a quiet moment, the handoff turn and the compaction;
 # RETRY is the pause after a handoff turn that failed. SILTA_ROTATE=0 switches it off
 # for one mind.
 Environment=SILTA_ROTATE=1
@@ -40,6 +40,7 @@ Environment=SILTA_ROTATE_CONTEXT_TOKENS=300000
 Environment=SILTA_ROTATE_IDLE_SECONDS=14400
 Environment=SILTA_ROTATE_QUIET_SECONDS=1800
 Environment=SILTA_ROTATE_HANDOFF_SECONDS=900
+Environment=SILTA_ROTATE_COMPACT_SECONDS=2700
 Environment=SILTA_ROTATE_RETRY_SECONDS=900
 # Rotations whose snapshots (memory and transcript, before and after the handoff) are
 # kept under backups/.
