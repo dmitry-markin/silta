@@ -10,6 +10,7 @@ arguments and reads its configuration from the session's environment:
 | `SILTA_SOCKET` | no | Daemon socket, default `/run/siltad/siltad.sock` |
 | `SILTA_CLAUDE_BIN` | no | Path of the binary; default `silta-claude` on `PATH` (`/usr/bin/silta-claude` from the package) |
 | `SILTA_INBOX` | no | Where received files land; default `inbox` under the working directory |
+| `SILTA_READY_FILE` | no | A file whose existence says Claude Code has registered the channel; the plugin connects to the daemon only once it exists. `silta-session` and `dev/run-session.sh` set it and write it at the first `system init` line. Unset, the plugin connects right after the MCP handshake, which in `-p` mode is before Claude Code listens (`docs/design.md`, section 3) |
 | `RUST_LOG` | no | Log filter, default `info`; the log goes to stderr, which Claude Code keeps under `~/.cache/claude-cli-nodejs/<cwd-slug>/mcp-logs-plugin-silta-claude-silta/` |
 
 Install from the local marketplace (this directory in the repository, or

@@ -62,14 +62,17 @@ pid=$!
 exec 3> "$fifo"
 printf '%s\n' "$initial" >&3
 
-id=""
+# The first turn's init line: Claude Code prints it after installing the channel's
+# handler, and it carries the id of a new session. Hook lines carry a session id too.
+init=""
 for _ in $(seq 1 60); do
-  id=$(grep -o '"session_id":"[^"]*"' "$state/$SILTA_SESSION.log" 2>/dev/null | head -1 | cut -d'"' -f4 || true)
-  [ -n "$id" ] && break
+  init=$(grep -m1 '"subtype":"init"' "$state/$SILTA_SESSION.log" 2>/dev/null || true)
+  [ -n "$init" ] && break
   kill -0 "$pid" 2>/dev/null || break
   sleep 1
 done
 touch "$SILTA_READY_FILE"
+id=${1:-$(printf '%s' "$init" | grep -o '"session_id":"[^"]*"' | head -1 | cut -d'"' -f4 || true)}
 if [ -n "$id" ]; then
   echo "session id: $id"
   echo "$id" > "$state/$SILTA_SESSION.session-id"
