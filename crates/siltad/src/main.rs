@@ -113,6 +113,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         replay_window_secs: config.replay_window_secs,
         inbox_max_age_days: config.inbox_max_age_days,
         alert_grace_secs: config.alert_grace_secs,
+        event_hold: server::EVENT_HOLD,
     };
     let daemon = Arc::new(Daemon::new(client, routing, &config.state_dir, spool, users, settings, silence_tx));
     matrix::register_handlers(&daemon);

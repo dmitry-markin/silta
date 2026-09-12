@@ -34,6 +34,12 @@ use crate::{
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Band-aid (2026-09-12): a restarted session's plugin accepted a message delivered
+/// straight after the session started, and the model never answered it. Every event to
+/// a fresh connection, queued or live, waits this long; command results do not. Remove
+/// once the cause is found and fixed.
+pub const EVENT_HOLD: Duration = Duration::from_secs(15);
+
 /// Bind the socket and accept connections until cancelled; removes the socket file
 /// on the way out.
 pub async fn run(daemon: Shared, path: PathBuf, cancel: CancellationToken) -> Result<()> {
@@ -130,27 +136,19 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
         tokio::spawn(async move { crate::alert::send(&daemon, alert).await });
     }
 
-    // Messages that arrived while the session was away, oldest first.
+    // Messages that arrived while the session was away, oldest first. They are in flight
+    // from here, and the writer hands them over when the hold is past.
     let (queued, evicted) = daemon.registry.take_backlog(&session, now_ms());
     if evicted > 0 {
         warn!(dir = "in", session, evicted, "permanently lost incoming messages queued longer than the replay window");
     }
-    let count = queued.len();
-    for (_, event) in queued {
-        if let Err(err) = write_event(&daemon, &mut writer, &session, &event).await {
-            warn!(dir = "in", session, "could not deliver the queued messages, they wait for the session's next connection: {err}");
-            return;
-        }
-    }
-    if count > 0 {
-        info!(dir = "in", session, count, "delivered the messages queued while the session was away");
-    }
+    let queued = queued.into_iter().map(|(_, event)| event).collect();
 
     // From here on one task writes the socket and this one reads it, so a file streaming
     // out never stops the reading side. Were both done in turn, a file crossing each way
     // at the same moment would fill both socket buffers with neither side reading, and
     // the connection would hang for good.
-    let mut writer_task = tokio::spawn(write_loop(daemon.clone(), writer, session.clone(), outbound));
+    let mut writer_task = tokio::spawn(write_loop(daemon.clone(), writer, session.clone(), outbound, queued));
 
     // Files the session streams for `send_file`, spooled until the command names them.
     let mut receiver = Receiver::new(daemon.spool.outbox.clone(), format!("{session}-"), daemon.spool.max_bytes);
@@ -258,13 +256,48 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
     info!(session, "session disconnected");
 }
 
-/// The writing side of a connection: events with their attachments and command
-/// results, in queue order, until the queue closes or a write fails.
-async fn write_loop(daemon: Shared, mut writer: OwnedWriteHalf, session: String, mut outbound: mpsc::Receiver<DaemonMessage>) {
-    while let Some(message) = outbound.recv().await {
-        let written = match &message {
-            DaemonMessage::Event(event) => write_event(&daemon, &mut writer, &session, event).await,
-            other => write_line(&mut writer, other).await,
+/// The writing side of a connection: command results as they come, events with their
+/// attachments in order, until the queue closes or a write fails. For the connection's
+/// first `event_hold` the events wait behind the queued ones the connection started
+/// with, then all go in order.
+async fn write_loop(
+    daemon: Shared,
+    mut writer: OwnedWriteHalf,
+    session: String,
+    mut outbound: mpsc::Receiver<DaemonMessage>,
+    queued: Vec<Event>,
+) {
+    let count = queued.len();
+    let mut held = Some(queued);
+    let hold = sleep(daemon.event_hold);
+    tokio::pin!(hold);
+    loop {
+        let written = tokio::select! {
+            biased;
+            () = &mut hold, if held.is_some() => {
+                let mut written = Ok(());
+                for event in held.take().unwrap_or_default() {
+                    written = write_event(&daemon, &mut writer, &session, &event).await;
+                    if written.is_err() {
+                        break;
+                    }
+                }
+                if written.is_ok() && count > 0 {
+                    info!(dir = "in", session, count, "delivered the messages queued while the session was away");
+                }
+                written
+            }
+            message = outbound.recv() => match message {
+                None => return,
+                Some(DaemonMessage::Event(event)) => match &mut held {
+                    Some(held) => {
+                        held.push(event);
+                        Ok(())
+                    }
+                    None => write_event(&daemon, &mut writer, &session, &event).await,
+                },
+                Some(other) => write_line(&mut writer, &other).await,
+            },
         };
         if let Err(err) = written {
             warn!(session, "write failed: {err}");
@@ -352,8 +385,8 @@ mod tests {
     }
 
     /// A daemon with one session, `alice`, run by this process's user, and a client
-    /// that has no homeserver to talk to.
-    async fn test_daemon(tag: &str) -> (Shared, PathBuf) {
+    /// that has no homeserver to talk to. Events to a fresh connection wait `hold`.
+    async fn test_daemon(tag: &str, hold: Duration) -> (Shared, PathBuf) {
         let dir = std::env::temp_dir().join(format!("siltad-server-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -383,7 +416,8 @@ user = "whoever"
         spool.prepare().unwrap();
         let users = HashMap::from([("alice".to_owned(), nix::unistd::getuid().as_raw())]);
         let (silence, _) = tokio::sync::mpsc::unbounded_channel();
-        let settings = crate::daemon::Settings { replay_window_secs: 300, inbox_max_age_days: 30, alert_grace_secs: 600 };
+        let settings =
+            crate::daemon::Settings { replay_window_secs: 300, inbox_max_age_days: 30, alert_grace_secs: 600, event_hold: hold };
         (Arc::new(Daemon::new(client, Routing::new(&config), &dir, spool, users, settings, silence)), dir)
     }
 
@@ -453,7 +487,7 @@ user = "whoever"
     /// daemon's writing and reading, both socket buffers filled and nothing moved.
     #[tokio::test]
     async fn files_crossing_both_ways_do_not_deadlock() {
-        let (daemon, dir) = test_daemon("crossing").await;
+        let (daemon, dir) = test_daemon("crossing", Duration::ZERO).await;
         // Three chunks each way: an attachment waiting in the spool, a file to send.
         let content: Vec<u8> = (0..3 * CHUNK_BYTES).map(|i| (i % 253) as u8).collect();
         std::fs::write(daemon.spool.inbox_path("ev-1"), &content).unwrap();
@@ -489,7 +523,7 @@ user = "whoever"
     /// connection, and the watermark moves only on the ack.
     #[tokio::test]
     async fn unacknowledged_events_come_back_on_the_next_connection() {
-        let (daemon, dir) = test_daemon("ack").await;
+        let (daemon, dir) = test_daemon("ack", Duration::ZERO).await;
         let content = vec![7u8; 10];
         std::fs::write(daemon.spool.inbox_path("ev-1"), &content).unwrap();
         let cancel = CancellationToken::new();
@@ -526,6 +560,34 @@ user = "whoever"
         // Acknowledged: a third connection gets nothing.
         let (task, mut reader, _writer) = connect(&daemon, &cancel).await;
         assert!(timeout(Duration::from_millis(300), reader.next_line()).await.is_err(), "nothing should be queued");
+        cancel.cancel();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The band-aid hold: a fresh connection gets no event before it is past, then the
+    /// queued ones and those delivered meanwhile, in order; a command's result does not
+    /// wait for it.
+    #[tokio::test]
+    async fn events_to_a_fresh_connection_wait_for_the_hold() {
+        let hold = Duration::from_secs(1);
+        let (daemon, dir) = test_daemon("hold", hold).await;
+        let cancel = CancellationToken::new();
+        let without_file = |event_id: &str| Event { event_id: event_id.into(), attachments: Vec::new(), ..event(0) };
+        daemon.registry.enqueue("alice", now_ms(), without_file("$queued"), now_ms());
+
+        // Timed from before the connection, so the hold cannot have started earlier.
+        let start = std::time::Instant::now();
+        let (task, mut reader, mut writer) = connect(&daemon, &cancel).await;
+        daemon.registry.deliver("alice", without_file("$live"), now_ms()).unwrap();
+        let typing = ClientMessage::Cmd(Cmd { id: 1, kind: CmdKind::Typing(Typing { room_id: "!r:silta.test".into() }) });
+        write_line(&mut writer, &typing).await.unwrap();
+        assert_eq!(read_result(&mut reader).await.id, 1);
+        assert!(start.elapsed() < hold, "the command's result waited for the hold");
+        let (_, first) = read_event(&mut reader).await;
+        assert!(start.elapsed() >= hold, "an event came before the hold was past");
+        let (_, second) = read_event(&mut reader).await;
+        assert_eq!((first.event_id.as_str(), second.event_id.as_str()), ("$queued", "$live"));
         cancel.cancel();
         let _ = task.await;
         let _ = std::fs::remove_dir_all(&dir);
