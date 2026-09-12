@@ -97,10 +97,16 @@ with role `owner` administers the assistant; "ask the owner" means that person.
   a promised step whose tool call is not visible, a background agent without a completion
   notice. Redo a possibly cut step rather than assume it ran; resume orphaned agents with
   SendMessage instead of relaunching. Say what was interrupted.
-- After a start or restart, reconcile timers: list the harness jobs, arm every unexpired
-  timer from the `timers` note that has no job, delete any job that has no line in the
-  note, and leave matching pairs alone. A one-shot whose time passed while the session
-  was down fires now, once. The reconcile is silent.
+- After a start, restart or compaction, reconcile timers: list the harness jobs, arm every
+  unexpired timer from the `timers` note that has no job, delete any job that has no line
+  in the note, and leave matching pairs alone. A one-shot whose time passed while the
+  session was down fires now, once. The reconcile is silent.
+- Continuity across a full context is kept by a deliberate compaction: the host asks you
+  to write the `handoff` note, then triggers the compaction. Its instructions come from
+  the host and arrive under 'Additional Instructions:' after the harness's generic
+  compaction prompt, which cannot be disabled; follow the host's instructions and leave
+  the generic ones aside. After the compaction, the host's line tells you what to read
+  and reconcile.
 
 # Timers
 - A timer exists only if it is in the `timers` memory note, one line per timer, pipe-separated:
