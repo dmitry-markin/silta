@@ -38,6 +38,12 @@ struct Args {
     /// working directory.
     #[arg(long, env = "SILTA_INBOX", default_value = "inbox")]
     inbox: PathBuf,
+
+    /// A file the supervisor creates once Claude Code has registered the channel; when
+    /// set, the plugin connects to the daemon only after it exists. Unset, it connects
+    /// right after the MCP handshake.
+    #[arg(long, env = "SILTA_READY_FILE")]
+    ready_file: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -121,7 +127,7 @@ async fn run(args: Args, parent: libc::pid_t) -> i32 {
     info!(session = %args.session, socket = %args.socket.display(), inbox = %inbox.display(), "silta-claude {} starting", env!("CARGO_PKG_VERSION"));
     let (events_tx, events_rx) = mpsc::channel(256);
     let (ready_tx, ready_rx) = oneshot::channel();
-    let daemon = daemon::DaemonClient::start(args.socket, args.session, inbox, events_tx, ready_rx, cancel.clone());
+    let daemon = daemon::DaemonClient::start(args.socket, args.session, inbox, args.ready_file, events_tx, ready_rx, cancel.clone());
     let handler = mcp::SiltaChannel::new(daemon, events_rx, ready_tx);
 
     // The handshake waits for the client's initialize request; a shutdown signal must

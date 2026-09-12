@@ -1,6 +1,6 @@
 //! What the supervisor keeps in the state directory, the session's `HOME`: the saved
-//! session id, the rotation marker and the rotation's next step, the snapshots of
-//! memory and transcript, and the pruning of Claude Code's cache.
+//! session id, the channel's ready file, the rotation marker and the rotation's next
+//! step, the snapshots of memory and transcript, and the pruning of Claude Code's cache.
 
 use std::{
     ffi::OsString,
@@ -113,6 +113,20 @@ impl Paths {
 
     pub fn drop_id(&self) {
         let _ = fs::remove_file(self.id_file());
+    }
+
+    /// Written once Claude Code has registered the channel, removed before each start;
+    /// the plugin connects to the daemon only once it exists (`SILTA_READY_FILE`).
+    pub fn channel_ready(&self) -> PathBuf {
+        self.state.join("channel-ready")
+    }
+
+    pub fn clear_channel_ready(&self) {
+        let _ = fs::remove_file(self.channel_ready());
+    }
+
+    pub fn write_channel_ready(&self, id: &str) -> io::Result<()> {
+        write_atomic(&self.channel_ready(), format!("{id}\n").as_bytes())
     }
 
     pub fn marker_exists(&self) -> bool {

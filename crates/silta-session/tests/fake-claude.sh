@@ -34,7 +34,14 @@ if [ -n "$resume" ]; then
 fi
 echo "start $id ${resume:+resumed}" >> "$HOME/fake.log"
 context=$(cat "$HOME/fake-context" 2>/dev/null || echo 1000)
+# What the plugin relies on: SILTA_READY_FILE is gone at the start and appears once the
+# supervisor has read the init line.
+[ -e "${SILTA_READY_FILE:-}" ] && echo "ready before init" >> "$HOME/fake.log"
 init
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -e "${SILTA_READY_FILE:-}" ] && { echo "ready after init" >> "$HOME/fake.log"; break; }
+  sleep 0.2
+done
 touch "$proj/$id.jsonl"
 while IFS= read -r line; do
   text=$(printf '%s' "$line" | sed 's/.*"content":"//; s/"}}$//')

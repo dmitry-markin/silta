@@ -43,6 +43,8 @@ const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const SWEEP_EVERY: Duration = Duration::from_secs(24 * 3600);
+/// How often the ready file is looked for.
+const READY_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -86,18 +88,23 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     /// Spawn the connection task. It connects once `ready` fires (the MCP client has
-    /// sent `initialized`); events from the daemon then go to `events`, attachments
-    /// are written under `inbox`.
+    /// sent `initialized`) and `ready_file`, if given, exists; events from the daemon
+    /// then go to `events`, attachments are written under `inbox`.
     pub fn start(
         socket: PathBuf,
         session: String,
         inbox: PathBuf,
+        ready_file: Option<PathBuf>,
         events: mpsc::Sender<Inbound>,
         ready: oneshot::Receiver<()>,
         cancel: CancellationToken,
     ) -> DaemonClient {
         let (tx, rx) = mpsc::channel(32);
-        tokio::spawn(run(socket, session, inbox, events, rx, ready, cancel));
+        tokio::spawn(async move {
+            if wait_until_ready(ready, ready_file.as_deref(), &cancel).await {
+                run(socket, session, inbox, events, rx, cancel).await;
+            }
+        });
         DaemonClient { tx }
     }
 
@@ -153,25 +160,46 @@ impl DaemonClient {
     }
 }
 
+/// Wait until the plugin may take events: the MCP client has sent `initialized` and,
+/// when a ready file is given, it exists. False if the process shuts down first.
+///
+/// The daemon counts an event as delivered once this process has handed its
+/// notification to Claude Code, and Claude Code drops a notification it has no handler
+/// for without a word. Waiting for `initialized` keeps the messages in the daemon while
+/// a session's handshake never completes (one started while its predecessor was still
+/// shutting down). In `-p` mode Claude Code installs the channel's handler later still,
+/// when its command loop starts the first turn, and the daemon sends its backlog at
+/// once: the supervisor creates the ready file when that turn's `init` line appears.
+async fn wait_until_ready(ready: oneshot::Receiver<()>, ready_file: Option<&Path>, cancel: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => return false,
+        ready = ready => if ready.is_err() {
+            return false;
+        },
+    }
+    let Some(path) = ready_file else {
+        return true;
+    };
+    info!("waiting for {} before connecting to the daemon", path.display());
+    let started = time::Instant::now();
+    while !path.exists() {
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            _ = time::sleep(READY_POLL) => {}
+        }
+    }
+    info!(waited_ms = started.elapsed().as_millis() as u64, "Claude Code has registered the channel, connecting to the daemon");
+    true
+}
+
 async fn run(
     socket: PathBuf,
     session: String,
     inbox: PathBuf,
     events: mpsc::Sender<Inbound>,
     mut rx: mpsc::Receiver<Outgoing>,
-    ready: oneshot::Receiver<()>,
     cancel: CancellationToken,
 ) {
-    // The daemon counts an event as delivered once this process has taken it, and Claude
-    // Code registers the channel only after the MCP handshake. A session whose handshake
-    // never completes (one started while its predecessor was still shutting down) would
-    // swallow the queued messages; so the daemon keeps them until `initialized`.
-    tokio::select! {
-        _ = cancel.cancelled() => return,
-        ready = ready => if ready.is_err() {
-            return;
-        },
-    }
     let mut backoff = Backoff::new();
     let mut sweeper: Option<JoinHandle<()>> = None;
     loop {
@@ -429,5 +457,41 @@ impl Backoff {
         let r = RandomState::new().build_hasher().finish() % 1000;
         let factor = 0.75 + (r as f64 / 1000.0) * 0.5;
         base.mul_f64(factor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn initialized() -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        tx.send(()).unwrap();
+        rx
+    }
+
+    /// Past `initialized`, the connection waits for the ready file; a shutdown ends the
+    /// wait.
+    #[tokio::test]
+    async fn the_connection_waits_for_the_ready_file() {
+        let path = std::env::temp_dir().join(format!("silta-claude-ready-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cancel = CancellationToken::new();
+        let wait = tokio::spawn({
+            let (path, cancel) = (path.clone(), cancel.clone());
+            async move { wait_until_ready(initialized(), Some(&path), &cancel).await }
+        });
+        time::sleep(Duration::from_millis(300)).await;
+        assert!(!wait.is_finished(), "went on without the ready file");
+        std::fs::write(&path, "").unwrap();
+        assert!(time::timeout(Duration::from_secs(2), wait).await.unwrap().unwrap());
+        std::fs::remove_file(&path).unwrap();
+
+        let wait = tokio::spawn({
+            let (path, cancel) = (path.clone(), cancel.clone());
+            async move { wait_until_ready(initialized(), Some(&path), &cancel).await }
+        });
+        cancel.cancel();
+        assert!(!time::timeout(Duration::from_secs(2), wait).await.unwrap().unwrap());
     }
 }

@@ -59,8 +59,6 @@ pub struct Daemon {
     pub alerts: Mutex<Watch>,
     /// Named in the alerts, so the owner knows which machine to look at.
     pub hostname: String,
-    /// How long the events to a fresh connection wait ([`crate::server::EVENT_HOLD`]).
-    pub event_hold: Duration,
     marks: Marks,
     typing: Arc<Mutex<HashMap<OwnedRoomId, TypingTask>>>,
     typing_generation: Mutex<u64>,
@@ -76,7 +74,6 @@ pub struct Settings {
     pub replay_window_secs: u64,
     pub inbox_max_age_days: u64,
     pub alert_grace_secs: u64,
-    pub event_hold: Duration,
 }
 
 /// What happened to an inbound message.
@@ -116,7 +113,6 @@ impl Daemon {
             users,
             alerts: Mutex::new(alerts),
             hostname,
-            event_hold: settings.event_hold,
             marks: Marks::load(state_dir.join(MARKS_FILE)),
             typing: Arc::new(Mutex::new(HashMap::new())),
             typing_generation: Mutex::new(0),

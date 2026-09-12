@@ -37,6 +37,10 @@ fi
 # One persona for every session, in the system prompt; no CLAUDE.md in the workspace.
 # Attachments land in the workspace's inbox, written by the plugin.
 export SILTA_INBOX="${SILTA_INBOX:-$repo/dev/workspace/inbox}"
+# The plugin connects to the daemon only once this file exists: Claude Code drops
+# channel notifications until its first turn starts, whose init line is the sign.
+export SILTA_READY_FILE=$state/$SILTA_SESSION.channel-ready
+rm -f "$SILTA_READY_FILE"
 args+=(--append-system-prompt-file "$repo/assistant/persona.md")
 args+=(--channels plugin:silta-claude@silta-local)
 
@@ -59,14 +63,13 @@ exec 3> "$fifo"
 printf '%s\n' "$initial" >&3
 
 id=""
-[ $# -ge 1 ] && id=$1   # a resumed session prints no init line
 for _ in $(seq 1 60); do
-  [ -n "$id" ] && break
   id=$(grep -o '"session_id":"[^"]*"' "$state/$SILTA_SESSION.log" 2>/dev/null | head -1 | cut -d'"' -f4 || true)
   [ -n "$id" ] && break
   kill -0 "$pid" 2>/dev/null || break
   sleep 1
 done
+touch "$SILTA_READY_FILE"
 if [ -n "$id" ]; then
   echo "session id: $id"
   echo "$id" > "$state/$SILTA_SESSION.session-id"

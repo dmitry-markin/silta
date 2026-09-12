@@ -112,6 +112,8 @@ fn name(path: &Path) -> String {
 async fn fresh_start_resume_and_graceful_stop() {
     let fx = Fixture::new("resume");
     let cfg = fx.config();
+    // A ready file left by an earlier run must not let the plugin in early.
+    fx.set("channel-ready", "stale");
     let stop = CancellationToken::new();
     let run = tokio::spawn({
         let cfg = cfg.clone();
@@ -119,6 +121,7 @@ async fn fresh_start_resume_and_graceful_stop() {
         async move { silta_session::run(&cfg, stop).await }
     });
     let log = fx.until(10, |l| l.contains("line Session test started")).await;
+    assert!(log.contains("ready after init") && !log.contains("ready before init"), "the ready file is cleared at the start and written at the init line:\n{log}");
     let id = fx.id();
     assert_eq!(starts(&log), vec![format!("start {id} ").as_str()]);
     assert!(log.contains("a new conversation, no history"));
@@ -135,8 +138,9 @@ async fn fresh_start_resume_and_graceful_stop() {
         let stop = stop.clone();
         async move { silta_session::run(&cfg, stop).await }
     });
-    fx.until(10, |l| l.contains("restarted at") && l.contains("resumed its history")).await;
-    assert_eq!(starts(&fx.log())[1], format!("start {id} resumed"));
+    let log = fx.until(10, |l| l.contains("restarted at") && l.contains("resumed its history")).await;
+    assert_eq!(starts(&log)[1], format!("start {id} resumed"));
+    assert!(log.matches("ready after init").count() == 2 && !log.contains("ready before init"), "{log}");
     stop.cancel();
     assert_eq!(handle.await.unwrap(), 0);
 

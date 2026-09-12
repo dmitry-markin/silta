@@ -272,6 +272,7 @@ async fn run_once(
         .env("SILTA_CLAUDE_BIN", &cfg.plugin_bin)
         .env("SILTA_SOCKET", &cfg.socket)
         .env("SILTA_INBOX", workspace.join("inbox"))
+        .env("SILTA_READY_FILE", paths.channel_ready())
         .env("DISABLE_AUTOUPDATER", "1");
     if let Some(token) = &cfg.oauth_token {
         cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token);
@@ -280,6 +281,10 @@ async fn run_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // The plugin takes messages from the daemon only once this file exists: Claude Code
+    // drops channel notifications until its first turn starts, and that turn's `init`
+    // line is the sign (below).
+    paths.clear_channel_ready();
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -343,6 +348,7 @@ async fn run_once(
 
     let mut readers_open = true;
     let mut no_conversation = false;
+    let mut channel_ready = false;
     let mut ticks: u64 = 0;
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -358,6 +364,15 @@ async fn run_once(
                 Some(Msg::Out(line)) => {
                     let (summary, event) = stream::read(&line);
                     println!("{summary}");
+                    // Claude Code prints `init` at the start of every turn, after it has
+                    // installed the channel's handler for that turn.
+                    if matches!(event, stream::Event::Init { .. }) && !channel_ready {
+                        channel_ready = true;
+                        match paths.write_channel_ready(&start.id) {
+                            Ok(()) => eprintln!("channel: registered by Claude Code; the plugin takes messages from now on"),
+                            Err(err) => eprintln!("channel: cannot write {}: {err}; the plugin will not connect", paths.channel_ready().display()),
+                        }
+                    }
                     if let Some(line) = run.contract.event(&event, cfg.limits.enabled, Instant::now()) {
                         eprintln!("contract: {line}");
                     }
