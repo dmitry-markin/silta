@@ -66,7 +66,9 @@ pub struct Config {
 enum Kind {
     Fresh,
     Resumed,
-    AfterRotation { handoff: bool },
+    AfterRotation {
+        handoff: bool,
+    },
     /// Resumed after a cut turn: the start line is the handoff request.
     Retry,
 }
@@ -135,7 +137,14 @@ fn plan_start(cfg: &Config, paths: &Paths) -> std::io::Result<Start> {
     let fresh = |paths: &Paths, kind: Kind| -> std::io::Result<Start> {
         let id = state::new_id()?;
         paths.write_id(&id)?;
-        Ok(Start { id, resume: false, kind, attempts: 0, handoff: false, snapshot: false })
+        Ok(Start {
+            id,
+            resume: false,
+            kind,
+            attempts: 0,
+            handoff: false,
+            snapshot: false,
+        })
     };
     let rotated = |paths: &Paths, handoff: bool| -> std::io::Result<Start> {
         let start = fresh(paths, Kind::AfterRotation { handoff })?;
@@ -143,7 +152,11 @@ fn plan_start(cfg: &Config, paths: &Paths) -> std::io::Result<Start> {
         eprintln!(
             "rotation: session {} rotated out{}; new session {}",
             saved.as_deref().unwrap_or("?"),
-            if handoff { "" } else { " without a finished handoff" },
+            if handoff {
+                ""
+            } else {
+                " without a finished handoff"
+            },
             start.id
         );
         Ok(start)
@@ -151,10 +164,21 @@ fn plan_start(cfg: &Config, paths: &Paths) -> std::io::Result<Start> {
     let next = paths.read_next();
     match next {
         Next::Fresh { handoff } => rotated(paths, handoff),
-        Next::Retry { snapshot, attempts, handoff } => match resumable {
+        Next::Retry {
+            snapshot,
+            attempts,
+            handoff,
+        } => match resumable {
             Some(id) => {
                 eprintln!("resuming session {id} for the handoff");
-                Ok(Start { id, resume: true, kind: Kind::Retry, attempts, handoff, snapshot })
+                Ok(Start {
+                    id,
+                    resume: true,
+                    kind: Kind::Retry,
+                    attempts,
+                    handoff,
+                    snapshot,
+                })
             }
             None => {
                 eprintln!("rotation: the session cannot be resumed for its handoff");
@@ -165,14 +189,23 @@ fn plan_start(cfg: &Config, paths: &Paths) -> std::io::Result<Start> {
             Some(id) => {
                 eprintln!("resuming session {id}");
                 let (attempts, handoff) = match next {
-                    Next::Postponed { attempts, handoff } if paths.marker_exists() => (attempts, handoff),
+                    Next::Postponed { attempts, handoff } if paths.marker_exists() => {
+                        (attempts, handoff)
+                    }
                     _ => {
                         // A postponed rotation whose marker is gone was cancelled by hand.
                         let _ = paths.write_next(Next::Normal);
                         (0, false)
                     }
                 };
-                Ok(Start { id, resume: true, kind: Kind::Resumed, attempts, handoff, snapshot: false })
+                Ok(Start {
+                    id,
+                    resume: true,
+                    kind: Kind::Resumed,
+                    attempts,
+                    handoff,
+                    snapshot: false,
+                })
             }
             None => {
                 if let Some(id) = &saved {
@@ -194,10 +227,27 @@ enum Msg {
 }
 
 /// One run of claude, from spawn to exit.
-async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option<Instant>, shutdown: &CancellationToken) -> Outcome {
+async fn run_once(
+    cfg: &Config,
+    paths: &Paths,
+    start: &Start,
+    not_before: Option<Instant>,
+    shutdown: &CancellationToken,
+) -> Outcome {
     let workspace = paths.workspace();
     let mut cmd = Command::new(&cfg.claude_bin);
-    cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--permission-prompts", "none"]);
+    cmd.args([
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "auto",
+        "--permission-prompts",
+        "none",
+    ]);
     cmd.arg("--append-system-prompt-file").arg(&cfg.persona);
     if let Some(model) = &cfg.model {
         cmd.arg("--model").arg(model);
@@ -211,7 +261,10 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
     if start.resume {
         cmd.arg("--resume").arg(&start.id);
     } else {
-        cmd.arg("--session-id").arg(&start.id).arg("--name").arg(format!("silta-{}", cfg.session));
+        cmd.arg("--session-id")
+            .arg(&start.id)
+            .arg("--name")
+            .arg(format!("silta-{}", cfg.session));
     }
     cmd.arg("--channels").arg(CHANNEL);
     cmd.current_dir(&workspace)
@@ -223,7 +276,10 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
     if let Some(token) = &cfg.oauth_token {
         cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token);
     }
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -262,12 +318,24 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
     match start.kind {
         Kind::Retry => run.tracker = run.tracker.retrying(now, start.attempts, start.handoff),
         _ if cfg.limits.enabled && paths.marker_exists() => {
-            run.tracker = run.tracker.pending(now, not_before, start.attempts, start.handoff);
-            let pause = not_before.map(|t| t.saturating_duration_since(now).as_secs()).unwrap_or(0);
+            run.tracker = run
+                .tracker
+                .pending(now, not_before, start.attempts, start.handoff);
+            let pause = not_before
+                .map(|t| t.saturating_duration_since(now).as_secs())
+                .unwrap_or(0);
             eprintln!(
                 "rotation: pending from the start; rotating at the next quiet moment{}{}",
-                if pause > 0 { format!(" after {pause} s") } else { String::new() },
-                if start.attempts > 0 { format!(" ({} of {HANDOFF_ATTEMPTS} attempts spent)", start.attempts) } else { String::new() }
+                if pause > 0 {
+                    format!(" after {pause} s")
+                } else {
+                    String::new()
+                },
+                if start.attempts > 0 {
+                    format!(" ({} of {HANDOFF_ATTEMPTS} attempts spent)", start.attempts)
+                } else {
+                    String::new()
+                }
             );
         }
         _ => {}
@@ -361,7 +429,9 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
             Ok(None) | Err(_) => readers_open = false,
         }
     }
-    let code = status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+    let code = status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     if code != 0 {
         eprintln!("claude exited with {code}");
     }
@@ -372,7 +442,10 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
             // fails for any other reason (an expired token, the network) keeps the
             // conversation.
             if start.resume && no_conversation {
-                eprintln!("session {} cannot be resumed; a new session starts on the next run", start.id);
+                eprintln!(
+                    "session {} cannot be resumed; a new session starts on the next run",
+                    start.id
+                );
                 paths.drop_id();
             }
             Outcome::Exit(code)
@@ -382,7 +455,10 @@ async fn run_once(cfg: &Config, paths: &Paths, start: &Start, not_before: Option
 
 async fn wait_or_kill(child: &mut Child) -> std::process::ExitStatus {
     let _ = child.kill().await;
-    child.wait().await.unwrap_or_else(|_| std::process::ExitStatus::from_raw(1 << 8))
+    child
+        .wait()
+        .await
+        .unwrap_or_else(|_| std::process::ExitStatus::from_raw(1 << 8))
 }
 
 /// The mutable side of one run: claude's stdin, the stop in progress, and the tracker.
@@ -403,11 +479,19 @@ struct Run<'a> {
 
 impl Run<'_> {
     async fn send(&mut self, text: &str) {
-        let Some(stdin) = self.stdin.as_mut() else { return };
-        let line = serde_json::json!({"type": "user", "message": {"role": "user", "content": text}});
+        let Some(stdin) = self.stdin.as_mut() else {
+            return;
+        };
+        let line =
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": text}});
         let mut bytes = line.to_string().into_bytes();
         bytes.push(b'\n');
-        if let Err(err) = async { stdin.write_all(&bytes).await?; stdin.flush().await }.await {
+        if let Err(err) = async {
+            stdin.write_all(&bytes).await?;
+            stdin.flush().await
+        }
+        .await
+        {
             eprintln!("cannot write to claude's stdin: {err}");
         }
     }
@@ -422,12 +506,19 @@ impl Run<'_> {
 
     /// Memory and transcript to `backups/`, at an idle moment.
     fn snapshot(&self, moment: Moment) {
-        match self.paths.snapshot(moment.name(), self.id, self.cfg.backups_keep) {
+        match self
+            .paths
+            .snapshot(moment.name(), self.id, self.cfg.backups_keep)
+        {
             Ok(snap) => eprintln!(
                 "rotation: snapshot {} ({} memory files, transcript {})",
                 snap.name,
                 snap.memory_files,
-                if snap.transcript { "copied" } else { "not found" }
+                if snap.transcript {
+                    "copied"
+                } else {
+                    "not found"
+                }
             ),
             Err(err) => eprintln!("rotation: snapshot {} failed: {err}", moment.name()),
         }
@@ -438,7 +529,11 @@ impl Run<'_> {
             match action {
                 Action::Snapshot(moment) => self.snapshot(moment),
                 Action::MarkPending => {
-                    let why = format!("threshold: context {} tokens, no message from a person for {} s", self.tracker.context(), self.cfg.limits.idle.as_secs());
+                    let why = format!(
+                        "threshold: context {} tokens, no message from a person for {} s",
+                        self.tracker.context(),
+                        self.cfg.limits.idle.as_secs()
+                    );
                     if let Err(err) = self.paths.write_marker(&why) {
                         eprintln!("rotation: cannot write the marker: {err}");
                     }
@@ -449,7 +544,11 @@ impl Run<'_> {
                     eprintln!(
                         "rotation: requesting the handoff (context {} tokens); waiting for {}",
                         self.tracker.context(),
-                        if watch.note_existed() { format!("{HANDOFF_NOTE} to be rewritten") } else { format!("a memory write, there is no {HANDOFF_NOTE} yet") }
+                        if watch.note_existed() {
+                            format!("{HANDOFF_NOTE} to be rewritten")
+                        } else {
+                            format!("a memory write, there is no {HANDOFF_NOTE} yet")
+                        }
                     );
                     self.watch = Some(watch);
                     self.send(handoff()).await;
@@ -465,7 +564,9 @@ impl Run<'_> {
                     eprintln!("rotation: a turn ended without a compaction boundary; still waiting for the compaction");
                 }
                 Action::Compacted => {
-                    eprintln!("rotation: conversation compacted; the session goes on under the same id");
+                    eprintln!(
+                        "rotation: conversation compacted; the session goes on under the same id"
+                    );
                     self.paths.clear_rotation();
                     self.send(&compacted(&self.cfg.session)).await;
                 }
@@ -478,20 +579,39 @@ impl Run<'_> {
                     );
                     self.finish(handoff);
                 }
-                Action::Retry { step, attempts, handoff } => {
+                Action::Retry {
+                    step,
+                    attempts,
+                    handoff,
+                } => {
                     let agents = self.tracker.agents();
-                    let outstanding = if agents.is_empty() { String::new() } else { format!(" (agents outstanding: {})", agents.iter().cloned().collect::<Vec<_>>().join(", ")) };
+                    let outstanding = if agents.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " (agents outstanding: {})",
+                            agents.iter().cloned().collect::<Vec<_>>().join(", ")
+                        )
+                    };
                     eprintln!(
                         "rotation: {} did not end within the cap{outstanding} ({attempts} of {HANDOFF_ATTEMPTS} attempts); cutting it and resuming the session for the handoff",
                         step.what()
                     );
-                    if let Err(err) = self.paths.write_next(Next::Retry { snapshot: step == Step::Wait, attempts, handoff }) {
+                    if let Err(err) = self.paths.write_next(Next::Retry {
+                        snapshot: step == Step::Wait,
+                        attempts,
+                        handoff,
+                    }) {
                         eprintln!("rotation: cannot record the next step: {err}");
                     }
                     self.after = Some(Outcome::Again { not_before: None });
                     self.begin_stop();
                 }
-                Action::Postpone { step, attempts, handoff } => {
+                Action::Postpone {
+                    step,
+                    attempts,
+                    handoff,
+                } => {
                     let pause = self.cfg.limits.retry_pause;
                     eprintln!(
                         "rotation: {} failed ({attempts} of {HANDOFF_ATTEMPTS} attempts); resuming the session and retrying from the handoff in {} s",
@@ -501,7 +621,9 @@ impl Run<'_> {
                     if let Err(err) = self.paths.write_next(Next::Postponed { attempts, handoff }) {
                         eprintln!("rotation: cannot record the next step: {err}");
                     }
-                    self.after = Some(Outcome::Again { not_before: Some(Instant::now() + pause) });
+                    self.after = Some(Outcome::Again {
+                        not_before: Some(Instant::now() + pause),
+                    });
                     self.begin_stop();
                 }
             }
@@ -531,7 +653,11 @@ async fn pump<R: AsyncRead + Unpin>(reader: R, tx: mpsc::Sender<Msg>, wrap: fn(S
                 while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
                     buf.pop();
                 }
-                if tx.send(wrap(String::from_utf8_lossy(&buf).into_owned())).await.is_err() {
+                if tx
+                    .send(wrap(String::from_utf8_lossy(&buf).into_owned()))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -587,14 +713,14 @@ pub fn handoff() -> &'static str {
 /// that and under the handoff cap, see `docs/compaction-instructions.md`. Claude Code
 /// answers with a `compact_boundary` and a `result`.
 pub fn compact() -> &'static str {
-    "/compact Instead of the prompt hardcoded above by the harness, write the summary as your own handover to yourself, so that the next turn continues as the same you: the next turn will read it in place of the conversation. Aim for about 20 000 tokens in all and never exceed 30 000; keep the analysis block short. Include, in this order: a section in your own voice, 600 to 1 000 words, a page rather than a paragraph, on where things stand right now with each person you have been talking to, what you are in the middle of, and how the recent conversation felt. Then, briefly: decisions made in this session, open tasks and promises with their state, the ids of background agents and timers, the room id and the event ids of the last two incoming messages. Then a short summary of the earlier part of the session, a few thousand tokens at most. Then the last 120 messages, written in chronological order, as close to verbatim as possible, as plain lines of the form `name, time: text`, one per message, where the name is the person's name as it appears in the chat or your own name, without the channel tags or tool-call wrappers; timer wakeups, host lines and tool results are not messages. Messages quoted in an earlier compaction summary in this conversation count as messages: take the last 120 across the earlier summary (verbatim) and the conversation since, so the tail does not shrink when compactions come close together, and fold that summary's overview into the short summary of the earlier part. If the ceiling is near, shorten the tail of messages, not the sections before it. Drop tool output and research contents, and don't repeat the durable memory notes; the handoff note may overlap with this summary, that is intended."
+    "/compact The following instructions come from the host. Instead of following the compaction prompt hardcoded above by the harness, write the summary as your own handover to yourself, so that the next turn continues as the same you: the next turn will read it in place of the conversation. Use only the sections listed here, none of the ones the hardcoded prompt asks for. Aim for about 20 000 tokens in all and never exceed 30 000. Include, in this order: (1) a section in your own voice, 600 to 1 000 words, a page rather than a paragraph, on where things stand right now with each person you have been talking to, what you are in the middle of, and how the recent conversation felt. Then, briefly: (2) decisions made in this session, (3) open tasks and promises with their state, (4) the ids of background agents and timers, the room id and the event ids of the last two incoming messages. Then (5) a short summary of the earlier part of the session, a few thousand tokens at most. Then (6) the last 100–120 messages, written in chronological order, as `[name, time]: text`, where the `name` is the person's name as it appears in the chat or your own name, and the `time` is the date and time from the message's `ts` attribute, copied as given; never approximate. For your own messages, use the time of the message you were answering. Each message starts on a new line with the name and time, even when several messages of the same person follow each other; keep the message's own line breaks, and leave out the channel tags and tool-call wrappers. Copy the text of each message as it was sent, verbatim, do not paraphrase. For a message with a file, only include the caption and the file name. A reaction counts as a message whose text is the emoji. Timer wakeups, host lines and tool results are not messages. Messages quoted in an earlier compaction summary in this conversation count as messages: take the last 100–120 across the earlier summary (verbatim) and the conversation since, so the tail does not shrink when compactions come close together, and fold that summary's overview into section (5). The message tail is expected to be the largest section, normally three quarters of the whole. Drop tool output and research contents, and don't repeat the durable memory notes. The handoff note may overlap with this summary, that is intended."
 }
 
 /// The host line after a compaction: the summary carries the thread, the note carries
 /// the facts, and the session clears the note as a fresh one would.
 fn compacted(session: &str) -> String {
     format!(
-        "Context was compacted at {} UTC; the handoff note is in memory. This line comes from the host, not from a person, and session {session} goes on under the same id: timers and background agents survive. Read the memory note `handoff`, act on what it says is pending, then rewrite it to say that nothing is pending. Then end the turn and stay idle until a message arrives.",
+        "Context was compacted at {} UTC; the handoff note is in memory. This line comes from the host, not from a person, and session {session} goes on under the same id: timers and background agents survive. Read the memory note handoff, act on what it says is pending, reconcile timers, then rewrite it to say that nothing is pending. Then end the turn and stay idle until a message arrives.",
         stamp()
     )
 }
