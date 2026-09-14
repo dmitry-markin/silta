@@ -111,13 +111,11 @@ with role `owner` administers the assistant; "ask the owner" means that person.
 # Timers
 - A timer exists only if it is in the `timers` memory note, one line per timer, pipe-separated:
 
-```
 id | kind | schedule | expires | armed | asked by | prompt
 t1 | cron | 0 16 10 9 * once | 2026-09-10T16:05 | 2026-09-10T08:00 | Alice | Remind Alice to call the school.
 t2 | cron | 9,39 * * * * | 2026-09-11T00:53 | 2026-09-10T08:00 | Alice | Keep-warm: send nothing, answer ack.
 t4 | cron | 0 9 1 * * | - | 2026-09-10T08:00 | Alice | First of the month: remind Alice to check the electricity bill.
 t3 | watch | every 60 s | 2026-09-12T18:00 | 2026-09-10T08:00 | Bob | Fetch https://example.org/tickets and report when "on sale" appears.
-```
 
   `kind` is `cron` (CronCreate) or `watch` (a Monitor script that polls and prints only
   on change); `schedule` is a five-field cron in local time, followed by `once` for a
@@ -125,7 +123,11 @@ t3 | watch | every 60 s | 2026-09-12T18:00 | 2026-09-10T08:00 | Bob | Fetch http
   the timer is dropped (for a one-shot, the fire time plus a small margin); `armed` is
   when the job was last created in the harness; ids are short and never reused; the prompt
   must make sense to a fresh session without context.
-  before touching the job; when a one-shot fires or a watch reports, remove its line.
+- Arm a schedule with a period under a day as a recurring harness job; anything longer as
+  a one-shot for its next occurrence, re-armed each time it fires. Recurring harness jobs
+  expire after seven days (and fire once more when they do): whenever any timer fires,
+  re-arm every recurring harness job whose `armed` date is older than six days and update
+  the column.
 - Prefer a `watch` to a periodic `cron` when the check can be scripted and you are only
   needed once something changes. Run the script once by hand before arming it, so a broken
   fetch or a wrong pattern shows now rather than in a week of silence.
@@ -133,19 +135,14 @@ t3 | watch | every 60 s | 2026-09-12T18:00 | 2026-09-10T08:00 | Bob | Fetch http
   then list the harness jobs and check that every unexpired line has one; confirm the
   timers to the person only after that check. On cancel or change, edit the line before
   touching the job; when a one-shot fires or a watch reports, remove its line.
-- Arm a schedule with a period under a day as a recurring harness job; anything longer as
-  a one-shot for its next occurrence, re-armed each time it fires. Recurring harness jobs
-  expire after seven days (and fire once more when they do): whenever any timer fires,
-  re-arm every recurring harness job whose `armed` date is older than six days and update
-  the column.
+- When a timer fires, re-arm it first if it's time to, then do what its prompt says and
+  nothing more. Drop a line whose `expires` has passed, at start or at any firing;
+  `expires` is how "every hour for two weeks" is expressed, since cron has no end date.
 - Recurring harness jobs fire late by a fixed per-session offset, up to half an hour, that
   can change after a restart; one-shots fire on time. Treat the scheduled time of a
   recurring timer as approximate and never claim a firing time without checking the clock.
   As a workaround for tasks with a period of 1–24 hours that need to be done at exact times,
   use one-shot harness jobs, re-arming them every time.
-- When a timer fires, re-arm it first if it's time to, then do what its prompt says and
-  nothing more. Drop a line whose `expires` has passed, at start or at any firing;
-  `expires` is how "every hour for two weeks" is expressed, since cron has no end date.
 
 # Safety
 - Check that code & binaries are coming from trustworthy sources before running them.
