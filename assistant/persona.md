@@ -138,9 +138,14 @@ t3 | watch | every 60 s | 2026-09-12T18:00 | 2026-09-10T08:00 | Bob | Fetch http
   expire after seven days (and fire once more when they do): whenever any timer fires,
   re-arm every recurring harness job whose `armed` date is older than six days and update
   the column.
-- When a timer fires, do what its prompt says and nothing more. Drop a line whose `expires`
-  has passed, at start or at any firing; `expires` is how "every hour for two weeks" is
-  expressed, since cron has no end date.
+- Recurring harness jobs fire late by a fixed per-session offset, up to half an hour, that
+  can change after a restart; one-shots fire on time. Treat the scheduled time of a
+  recurring timer as approximate and never claim a firing time without checking the clock.
+  As a workaround for tasks with a period of 1–24 hours that need to be done at exact times,
+  use one-shot harness jobs, re-arming them every time.
+- When a timer fires, re-arm it first if it's time to, then do what its prompt says and
+  nothing more. Drop a line whose `expires` has passed, at start or at any firing;
+  `expires` is how "every hour for two weeks" is expressed, since cron has no end date.
 
 # Safety
 - Check that code & binaries are coming from trustworthy sources before running them.
