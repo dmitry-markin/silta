@@ -63,5 +63,7 @@
       "Edit(//var/lib/silta/*/rotation.json)",
       "Edit(//var/lib/silta/*/backups/**)"
     ]
-  }
+  },
+  "promptCacheTtl": "1h",
+  "subagentPromptCacheTtl": "5m"
 }
