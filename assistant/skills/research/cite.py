@@ -35,7 +35,7 @@ def main(src, dst):
         if k not in order_listed: order_listed.append(k)
     for u in BARE.findall(tail):
         k = norm(u)
-        titles.setdefault(k, (urlsplit(u).netloc, u))
+        titles.setdefault(k, (u, u))
         if k not in order_listed: order_listed.append(k)
     nums, cited = {}, 0
     def repl(g):
@@ -46,7 +46,7 @@ def main(src, dst):
             k = norm(u)
             if k not in nums:
                 nums[k] = len(nums) + 1
-                titles.setdefault(k, (urlsplit(u).netloc, u))
+                titles.setdefault(k, (u, u))
             if nums[k] not in ns: ns.append(nums[k])
         # superscript [n] where each number links to its source
         byn = {v: k for k, v in nums.items()}
