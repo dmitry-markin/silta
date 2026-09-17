@@ -114,7 +114,7 @@ pub fn message(alert: &Alert, host: &str, now_ms: u64) -> String {
         Alert::Silent { session, delivered_ms, .. } => format!(
             "⚠ Silta: session \"{session}\" received a message at {} and has shown no reply, reaction \
              or typing for {}. If it repeats, check \"journalctl -u silta-session@{session}\" on {host}: \
-             an expired token shows as authentication_failed, a gateway account out of credits as an API error.",
+             an expired token shows as authentication_failed, an API account out of credits as an API error.",
             rfc3339_utc(*delivered_ms),
             minutes(now_ms.saturating_sub(*delivered_ms))
         ),

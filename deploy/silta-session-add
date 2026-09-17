@@ -75,7 +75,12 @@ without): the person's subscription token, from claude setup-token under their a
 
 install -m 0600 /dev/stdin $auth/oauth-token
 
-or their OpenRouter token (the endpoint is SILTA_GATEWAY_URL in the unit):
+or their Claude Console API key,
+
+install -m 0600 /dev/stdin $auth/api-key
+
+or their OpenRouter token (the endpoint is SILTA_GATEWAY_URL in the unit; Claude Code
+has no channels through a gateway, so this mind receives no messages):
 
 install -m 0600 /dev/stdin $auth/gateway-token
 

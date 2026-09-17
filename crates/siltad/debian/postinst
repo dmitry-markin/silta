@@ -31,7 +31,7 @@ silta: next steps, as root
   2. silta-session-add hub, then silta-session-add <name> for each person
      (the daemon refuses to start while a configured session's user does not exist)
   3. give each mind its credential, as silta-session-add prints: one file in
-     /etc/silta/auth/<name>, oauth-token (claude setup-token) or gateway-token (OpenRouter)
+     /etc/silta/auth/<name>, oauth-token (claude setup-token) or api-key (Claude Console)
   4. edit /etc/silta/siltad.toml: the homeserver, the bot's password, the people, the sessions
   5. systemctl start siltad
   6. for the md2pdf and research skills (PDF generation), otherwise they fail at use:

@@ -651,6 +651,10 @@ async fn each_credential_sets_its_own_variables_and_no_others() {
         auth_line("auth-oauth", Auth::OAuth("sub".into())).await,
         "auth oauth=sub base=unset token=unset key=unset discovery=unset"
     );
+    assert_eq!(
+        auth_line("auth-api-key", Auth::ApiKey("key".into())).await,
+        "auth oauth=unset base=unset token=unset key=key discovery=unset"
+    );
     let gateway = Auth::Gateway { url: "https://gateway.example/api".into(), token: "gw".into() };
     assert_eq!(
         auth_line("auth-gateway", gateway).await,
@@ -668,6 +672,12 @@ fn the_credential_is_exactly_one_token_file() {
     fx.set("auth_gateway-token", "gw\n");
     assert!(load(Some("https://g")).is_err());
     fs::remove_file(fx.home.join("auth_oauth-token")).unwrap();
+    fx.set("auth_api-key", "key\n");
+    assert!(load(Some("https://g")).is_err());
+    fs::remove_file(fx.home.join("auth_gateway-token")).unwrap();
+    assert_eq!(load(None).unwrap(), "a Console API key");
+    fs::remove_file(fx.home.join("auth_api-key")).unwrap();
+    fx.set("auth_gateway-token", "gw\n");
     assert!(load(None).is_err());
     assert_eq!(load(Some("https://g")).unwrap(), "a gateway token for https://g");
 }
