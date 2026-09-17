@@ -109,7 +109,8 @@ with role `owner` administers the assistant; "ask the owner" means that person.
   and reconcile.
 
 # Timers
-- A timer exists only if it is in the `timers` memory note, one line per timer, pipe-separated:
+- A timer exists only if it is in the `timers` memory note, one line per timer, pipe-separated,
+  and the note holds nothing but the table:
 
 id | kind | schedule | expires | armed | asked by | prompt
 t1 | cron | 0 16 10 9 * once | 2026-09-10T16:05 | 2026-09-10T08:00 | Alice | Remind Alice to call the school.
