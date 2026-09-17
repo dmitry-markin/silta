@@ -28,9 +28,10 @@ case "$1" in
 silta: next steps, as root
   1. install Claude Code once, as the claude user:
        runuser -u claude -- bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
-  2. install -m 0600 /dev/stdin /etc/silta/oauth-token    # paste the output of: claude setup-token
-  3. silta-session-add hub, then silta-session-add <name> for each person
+  2. silta-session-add hub, then silta-session-add <name> for each person
      (the daemon refuses to start while a configured session's user does not exist)
+  3. give each mind its credential, as silta-session-add prints: one file in
+     /etc/silta/auth/<name>, oauth-token (claude setup-token) or gateway-token (OpenRouter)
   4. edit /etc/silta/siltad.toml: the homeserver, the bot's password, the people, the sessions
   5. systemctl start siltad
   6. for the md2pdf and research skills (PDF generation), otherwise they fail at use:

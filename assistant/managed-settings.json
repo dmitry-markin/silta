@@ -35,7 +35,11 @@
     "failIfUnavailable": true,
     "allowUnsandboxedCommands": false,
     "credentials": {
-      "envVars": [ { "name": "CLAUDE_CODE_OAUTH_TOKEN", "mode": "deny" } ],
+      "envVars": [
+        { "name": "CLAUDE_CODE_OAUTH_TOKEN", "mode": "deny" },
+        { "name": "ANTHROPIC_AUTH_TOKEN", "mode": "deny" },
+        { "name": "ANTHROPIC_API_KEY", "mode": "deny" }
+      ],
       "files": [ { "path": "/run/credentials", "mode": "deny" } ]
     }
   },

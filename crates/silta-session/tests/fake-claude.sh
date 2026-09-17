@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A stand-in for claude in the supervisor's tests: speaks enough stream-json for the
 # supervisor, keeps a transcript per session id under HOME/.claude/projects like Claude
-# Code, and logs what it was started with and every line it received to HOME/fake.log.
+# Code, and logs what it was started with (the credential variables too) and every line
+# it received to HOME/fake.log.
 # HOME/fake-mode (read per line) is ok (default), error (the turn ends with an error
 # result), hang (the turn never ends), hangonce (the same, once: the mode is reset to ok
 # first), agents (the turn starts a background agent that the level signal drops two
@@ -33,6 +34,7 @@ if [ -n "$resume" ]; then
   id=$resume
 fi
 echo "start $id ${resume:+resumed}" >> "$HOME/fake.log"
+echo "auth oauth=${CLAUDE_CODE_OAUTH_TOKEN-unset} base=${ANTHROPIC_BASE_URL-unset} token=${ANTHROPIC_AUTH_TOKEN-unset} key=${ANTHROPIC_API_KEY-unset} discovery=${CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY-unset}" >> "$HOME/fake.log"
 context=$(cat "$HOME/fake-context" 2>/dev/null || echo 1000)
 # What the plugin relies on: SILTA_READY_FILE is gone at the start and appears once the
 # supervisor has read the init line.

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use silta_session::{compact, handoff, rotation::Limits, Config};
+use silta_session::{compact, handoff, rotation::Limits, Auth, Config};
 use tokio_util::sync::CancellationToken;
 
 struct Fixture {
@@ -35,7 +35,7 @@ impl Fixture {
             model: None,
             effort: None,
             fallback_model: None,
-            oauth_token: None,
+            auth: None,
             stop_grace: Duration::from_secs(2),
             limits: Limits {
                 enabled: true,
@@ -628,4 +628,46 @@ async fn a_unit_stop_during_the_wait_keeps_the_rotation_pending() {
     stop.cancel();
     assert_eq!(run.await.unwrap(), 0);
     fs::remove_dir_all(&fx.home).unwrap();
+}
+
+/// Starts a session with `auth` and returns the credential variables claude saw.
+async fn auth_line(name: &str, auth: Auth) -> String {
+    let fx = Fixture::new(name);
+    let cfg = Config { auth: Some(auth), ..fx.config() };
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    let log = fx.until(10, |l| l.contains("ready after init")).await;
+    stop.cancel();
+    run.await.unwrap();
+    log.lines().find(|l| l.starts_with("auth ")).unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn each_credential_sets_its_own_variables_and_no_others() {
+    assert_eq!(
+        auth_line("auth-oauth", Auth::OAuth("sub".into())).await,
+        "auth oauth=sub base=unset token=unset key=unset discovery=unset"
+    );
+    let gateway = Auth::Gateway { url: "https://gateway.example/api".into(), token: "gw".into() };
+    assert_eq!(
+        auth_line("auth-gateway", gateway).await,
+        "auth oauth=unset base=https://gateway.example/api token=gw key= discovery=1"
+    );
+}
+
+#[test]
+fn the_credential_is_exactly_one_token_file() {
+    let fx = Fixture::new("auth-load");
+    let load = |url| Auth::load(&fx.home, url).map(|a| format!("{a:?}"));
+    assert!(load(None).is_err());
+    fx.set("auth_oauth-token", "sub-\ntoken\n");
+    assert_eq!(load(None).unwrap(), "a subscription token");
+    fx.set("auth_gateway-token", "gw\n");
+    assert!(load(Some("https://g")).is_err());
+    fs::remove_file(fx.home.join("auth_oauth-token")).unwrap();
+    assert!(load(None).is_err());
+    assert_eq!(load(Some("https://g")).unwrap(), "a gateway token for https://g");
 }

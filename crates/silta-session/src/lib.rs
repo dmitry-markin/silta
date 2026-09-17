@@ -18,7 +18,7 @@ pub mod stream;
 
 use std::{
     os::unix::process::ExitStatusExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -54,11 +54,62 @@ pub struct Config {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub fallback_model: Option<String>,
-    pub oauth_token: Option<String>,
+    /// None leaves claude without a credential (the tests).
+    pub auth: Option<Auth>,
     /// How long to wait after closing stdin before killing claude.
     pub stop_grace: Duration,
     pub limits: Limits,
     pub backups_keep: usize,
+}
+
+/// The variables that decide how Claude Code authenticates and where.
+const AUTH_VARS: [&str; 5] = [
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+];
+
+/// The session's credential, one per mind: the person's own subscription token, or
+/// their token for a gateway that speaks the Anthropic API (OpenRouter).
+#[derive(Clone)]
+pub enum Auth {
+    OAuth(String),
+    Gateway { url: String, token: String },
+}
+
+impl std::fmt::Debug for Auth {
+    /// Never the token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Auth::OAuth(_) => write!(f, "a subscription token"),
+            Auth::Gateway { url, .. } => write!(f, "a gateway token for {url}"),
+        }
+    }
+}
+
+impl Auth {
+    /// From the unit's credentials directory, where `LoadCredential=auth:<dir>` puts
+    /// each file of `/etc/silta/auth/<session>` as `auth_<file>`: exactly one of
+    /// `oauth-token` and `gateway-token`.
+    pub fn load(credentials: &Path, gateway_url: Option<&str>) -> Result<Self, String> {
+        let read = |name: &str| {
+            std::fs::read_to_string(credentials.join(name))
+                .ok()
+                .map(|t| t.split_whitespace().collect::<String>())
+                .filter(|t| !t.is_empty())
+        };
+        match (read("auth_oauth-token"), read("auth_gateway-token")) {
+            (Some(token), None) => Ok(Auth::OAuth(token)),
+            (None, Some(token)) => match gateway_url.filter(|u| !u.is_empty()) {
+                Some(url) => Ok(Auth::Gateway { url: url.to_owned(), token }),
+                None => Err("a gateway-token, but SILTA_GATEWAY_URL is not set".into()),
+            },
+            (Some(_), Some(_)) => Err("both an oauth-token and a gateway-token: keep one".into()),
+            (None, None) => Err("neither an oauth-token nor a gateway-token".into()),
+        }
+    }
 }
 
 /// Which host line starts the session.
@@ -274,8 +325,23 @@ async fn run_once(
         .env("SILTA_INBOX", workspace.join("inbox"))
         .env("SILTA_READY_FILE", paths.channel_ready())
         .env("DISABLE_AUTOUPDATER", "1");
-    if let Some(token) = &cfg.oauth_token {
-        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+    // Exactly one way to authenticate: whatever else the unit's environment holds
+    // (a drop-in, an override) is dropped, an API key above all.
+    for var in AUTH_VARS {
+        cmd.env_remove(var);
+    }
+    match &cfg.auth {
+        Some(Auth::OAuth(token)) => {
+            cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+        }
+        Some(Auth::Gateway { url, token }) => {
+            // What OpenRouter asks of Claude Code; the empty API key is part of it.
+            cmd.env("ANTHROPIC_BASE_URL", url)
+                .env("ANTHROPIC_AUTH_TOKEN", token)
+                .env("ANTHROPIC_API_KEY", "")
+                .env("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1");
+        }
+        None => {}
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())

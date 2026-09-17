@@ -7,7 +7,7 @@ use clap::Parser;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
-use silta_session::{rotation::Limits, Config};
+use silta_session::{rotation::Limits, Auth, Config};
 
 /// Runs one Silta session headless for silta-session@<name>.service.
 #[derive(Parser, Debug)]
@@ -45,6 +45,10 @@ struct Args {
 
     #[arg(long, env = "SILTA_FALLBACK_MODEL")]
     fallback_model: Option<String>,
+
+    /// The Anthropic-compatible endpoint a session with a gateway-token talks to.
+    #[arg(long, env = "SILTA_GATEWAY_URL")]
+    gateway_url: Option<String>,
 
     /// Seconds to wait after closing stdin before killing claude; below the unit's
     /// TimeoutStopSec, so that the supervisor and not systemd ends the session.
@@ -102,14 +106,17 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let oauth_token = std::env::var("CREDENTIALS_DIRECTORY")
-        .ok()
-        .and_then(|dir| std::fs::read_to_string(PathBuf::from(dir).join("oauth-token")).ok())
-        .map(|t| t.split_whitespace().collect::<String>())
-        .filter(|t| !t.is_empty());
-    if oauth_token.is_none() {
-        eprintln!("no oauth-token credential: the session cannot authenticate (see /etc/silta/oauth-token)");
-    }
+    let auth = std::env::var_os("CREDENTIALS_DIRECTORY")
+        .ok_or_else(|| "no credentials directory".to_owned())
+        .and_then(|dir| Auth::load(&PathBuf::from(dir), args.gateway_url.as_deref()));
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(err) => {
+            eprintln!("cannot authenticate: {err} (see /etc/silta/auth/{})", args.session);
+            return ExitCode::from(78);
+        }
+    };
+    eprintln!("authenticating with {auth:?}");
     let cfg = Config {
         session: args.session,
         state: args.state,
@@ -120,7 +127,7 @@ fn main() -> ExitCode {
         model: args.model,
         effort: args.effort,
         fallback_model: args.fallback_model,
-        oauth_token,
+        auth: Some(auth),
         stop_grace: Duration::from_secs(args.stop_grace),
         limits: Limits {
             enabled: args.rotate,

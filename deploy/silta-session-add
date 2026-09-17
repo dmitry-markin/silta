@@ -2,7 +2,8 @@
 # Adds one Silta session (a "mind") to this host:  silta-session-add <name>
 #
 # As root. Creates the system user silta-<name> in the silta group with
-# /var/lib/silta/<name> as its home and the workspace below it, registers the packaged
+# /var/lib/silta/<name> as its home and the workspace below it, the empty credential
+# directory /etc/silta/auth/<name>, registers the packaged
 # marketplace and installs the silta-claude plugin at project scope as that user, and
 # prints the [[sessions]] entry for /etc/silta/siltad.toml with the commands that put
 # the mind to work. It touches no unit: enabling, starting and restarting
@@ -33,7 +34,7 @@ if [ ! -x "$claude" ]; then
   echo "  runuser -u claude -- bash -c 'curl -fsSL https://claude.ai/install.sh | bash'" >&2
   exit 1
 fi
-[ -r /etc/silta/oauth-token ] || echo "warning: /etc/silta/oauth-token is missing; the session cannot authenticate until it exists (claude setup-token)" >&2
+auth="/etc/silta/auth/$name"
 
 if getent passwd "$user" > /dev/null; then
   echo "user $user exists"
@@ -45,6 +46,8 @@ usermod -aG silta "$user"
 chmod 0700 "$home"
 chown "$user:$user" "$home"
 install -d -m 0700 -o "$user" -g "$user" "$workspace" "$workspace/inbox" "$workspace/out"
+# The mind's credential: root's, handed to the unit by systemd; the token is the operator's to add.
+install -d -m 0700 -o root -g root /etc/silta/auth "$auth"
 
 # As the session's user, with only what Claude Code needs in the environment.
 as_user() { runuser -u "$user" -- env -i HOME="$home" PATH=/usr/bin:/bin DISABLE_AUTOUPDATER=1 "$@"; }
@@ -66,6 +69,15 @@ is receive = "groups"):
 name = "$name"
 receive = { people = ["<Person>"] }
 user = "$user"
+
+Give the mind its credential, exactly one file in $auth (the unit does not start
+without): the person's subscription token, from claude setup-token under their account,
+
+install -m 0600 /dev/stdin $auth/oauth-token
+
+or their OpenRouter token (the endpoint is SILTA_GATEWAY_URL in the unit):
+
+install -m 0600 /dev/stdin $auth/gateway-token
 
 After this is done:
 

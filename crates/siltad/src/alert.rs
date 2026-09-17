@@ -104,7 +104,7 @@ pub fn message(alert: &Alert, host: &str, now_ms: u64) -> String {
         Alert::Away { session, since_ms } => format!(
             "⚠ Silta: session \"{session}\" has been disconnected for {} (since {}). Check \
              \"systemctl status silta-session@{session}\" and \"journalctl -u silta-session@{session}\" \
-             on {host}; a failed start or an expired token are the usual causes.",
+             on {host}; a failed start or a missing or expired token are the usual causes.",
             minutes(now_ms.saturating_sub(*since_ms)),
             rfc3339_utc(*since_ms)
         ),
@@ -114,7 +114,7 @@ pub fn message(alert: &Alert, host: &str, now_ms: u64) -> String {
         Alert::Silent { session, delivered_ms, .. } => format!(
             "⚠ Silta: session \"{session}\" received a message at {} and has shown no reply, reaction \
              or typing for {}. If it repeats, check \"journalctl -u silta-session@{session}\" on {host}: \
-             an expired token shows as authentication_failed.",
+             an expired token shows as authentication_failed, a gateway account out of credits as an API error.",
             rfc3339_utc(*delivered_ms),
             minutes(now_ms.saturating_sub(*delivered_ms))
         ),

@@ -2,7 +2,7 @@
 # Unix user silta-alice with /var/lib/silta/alice as its home and state, and announces
 # itself to the daemon as session "alice". Instances are created with
 # silta-session-add and hang off silta-session.target, the handle for all minds at
-# once. Per-instance overrides (a model, a version pin) go in a drop-in:
+# once. Per-instance overrides (a model, a version pin, another gateway) go in a drop-in:
 # systemctl edit silta-session@alice.
 [Unit]
 Description=Silta session %i (Claude Code with the silta channel)
@@ -61,7 +61,14 @@ Environment=SILTA_EFFORT=high
 Environment=SILTA_FALLBACK_MODEL=claude-opus-5
 # Subagents a mind spawns: read by Claude Code itself, not by silta-session.
 Environment=CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-5
-LoadCredential=oauth-token:/etc/silta/oauth-token
+# The mind's own credential (design.md, section 6): /etc/silta/auth/%i holds exactly one
+# file, oauth-token (the person's subscription token, from claude setup-token) or
+# gateway-token (their token for the gateway below). systemd hands each file over as
+# auth_<file>; a missing directory fails the start. silta-session sets the variables
+# Claude Code reads and drops every other credential variable from its environment.
+LoadCredential=auth:/etc/silta/auth/%i
+# The Anthropic-compatible endpoint of a mind with a gateway-token.
+Environment=SILTA_GATEWAY_URL=https://openrouter.ai/api
 ExecStart=/usr/lib/silta/silta-session
 Restart=always
 RestartSec=10
