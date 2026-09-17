@@ -305,6 +305,9 @@ async fn run_once(
         "--output-format",
         "stream-json",
         "--verbose",
+        // Without it Claude Code (since 2.1.27x) does not write a turn's prompt to
+        // stdout, and a channel delivery is the line the idle gap is measured from.
+        "--replay-user-messages",
         "--permission-mode",
         "auto",
         "--permission-prompts",

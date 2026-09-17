@@ -25,8 +25,10 @@ pub enum Event {
     /// channel (the text starts with the `<channel` tag), the one kind that counts as
     /// a person's presence for the threshold's idle gap.
     User { person: bool },
-    /// The end of a turn.
-    Result { is_error: bool },
+    /// The end of a turn. `person` marks a turn a channel delivery started (the
+    /// line's `origin`), which counts as a person's presence like the delivery's own
+    /// `user` line and does not depend on that line being written.
+    Result { is_error: bool, person: bool },
     /// Every live background task after a change, replacing what was known before
     /// (Claude Code's level signal, which cannot be wedged by a missed edge). Ambient
     /// tasks, which live as long as the session, are left out.
@@ -52,7 +54,7 @@ pub fn read(line: &str) -> (String, Event) {
         "user" => (message("user", &map), Event::User { person: person_of(&map) }),
         "result" => {
             let is_error = map.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-            (result(&map), Event::Result { is_error })
+            (result(&map), Event::Result { is_error, person: channel_origin(&map) })
         }
         "stream_event" => {
             let event = map.get("event").and_then(|e| e.get("type")).and_then(Value::as_str).unwrap_or("?");
@@ -104,10 +106,20 @@ fn system_event(map: &Map<String, Value>) -> Event {
     }
 }
 
-/// A message delivered through the channel: its text starts with the `<channel` tag
-/// Claude Code wraps a channel notification in (`docs/design.md`). A timer wakeup, a
-/// tool result and the compaction's own lines do not.
+/// The line's `origin` names the channel: Claude Code puts it on the replayed `user`
+/// line of a delivery and on the `result` of the turn the delivery started.
+fn channel_origin(map: &Map<String, Value>) -> bool {
+    map.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str) == Some("channel")
+}
+
+/// A message delivered through the channel: its `origin` says so, or its text starts
+/// with the `<channel` tag Claude Code wraps a channel notification in
+/// (`docs/design.md`). A timer wakeup, a tool result and the compaction's own lines
+/// do neither.
 fn person_of(map: &Map<String, Value>) -> bool {
+    if channel_origin(map) {
+        return true;
+    }
     let text = match map.get("message").and_then(|m| m.get("content")) {
         Some(Value::String(s)) => Some(s.as_str()),
         Some(Value::Array(blocks)) => blocks.iter().find_map(|b| b.get("text").and_then(Value::as_str)),
@@ -257,6 +269,9 @@ fn result(map: &Map<String, Value>) -> String {
         tokens("cache_creation_input_tokens"),
         map.get("total_cost_usd").and_then(Value::as_f64).unwrap_or(0.0),
     );
+    if channel_origin(map) {
+        line.push_str(", channel turn");
+    }
     if let Some(denials) = map.get("permission_denials").and_then(Value::as_array).filter(|d| !d.is_empty()) {
         line.push_str(&format!(", {} permission denials", denials.len()));
     }
@@ -358,6 +373,13 @@ mod tests {
         assert_eq!(read(channel).1, Event::User { person: true });
         let blocks = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<channel person=\"Bob\">hi</channel>"}]}}"#;
         assert_eq!(read(blocks).1, Event::User { person: true });
+        // The replayed line of a delivery carries the origin, whatever its text.
+        let origin = r#"{"type":"user","message":{"role":"user","content":"hello"},"isReplay":true,"origin":{"kind":"channel","server":"plugin:silta-claude:silta"}}"#;
+        assert_eq!(read(origin).1, Event::User { person: true });
+        let turn = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"usage":{},"origin":{"kind":"channel","server":"plugin:silta-claude:silta"}}"#;
+        let (s, event) = read(turn);
+        assert!(s.ends_with(", channel turn"), "{s}");
+        assert_eq!(event, Event::Result { is_error: false, person: true });
         // A timer wakeup and the compaction's summary are user lines, not a person.
         let timer = r#"{"type":"user","message":{"role":"user","content":"Keep-warm: send nothing, answer ack."}}"#;
         assert_eq!(summarize(timer), "user: 1 text (36 bytes)");
@@ -370,13 +392,13 @@ mod tests {
         let (s, event) = read(ok);
         assert_eq!(s, "result success: 3 turns, 8123 ms (api 7000 ms), tokens in 12 out 345 cache read 250000 write 1000, cost $0.0421");
         assert!(!s.contains("private"));
-        assert_eq!(event, Event::Result { is_error: false });
+        assert_eq!(event, Event::Result { is_error: false, person: false });
         let err = r#"{"type":"result","subtype":"success","is_error":true,"num_turns":1,"duration_ms":2000,"duration_api_ms":0,"result":"Failed to authenticate. API Error: 401 OAuth access token is invalid.","total_cost_usd":0,"usage":{},"permission_denials":[{"tool_name":"Bash"}]}"#;
         assert_eq!(
             summarize(err),
             "result success ERROR: 1 turns, 2000 ms (api 0 ms), tokens in 0 out 0 cache read 0 write 0, cost $0.0000, 1 permission denials; Failed to authenticate. API Error: 401 OAuth access token is invalid."
         );
-        assert_eq!(read(err).1, Event::Result { is_error: true });
+        assert_eq!(read(err).1, Event::Result { is_error: true, person: false });
     }
 
     #[test]

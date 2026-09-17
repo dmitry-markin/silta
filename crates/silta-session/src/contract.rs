@@ -65,7 +65,7 @@ mod tests {
     use super::*;
 
     const CAP: Duration = Duration::from_secs(1800);
-    const OK: Event = Event::Result { is_error: false };
+    const OK: Event = Event::Result { is_error: false, person: false };
 
     fn assistant() -> Event {
         Event::Assistant { subagent: false, context_tokens: Some(10) }

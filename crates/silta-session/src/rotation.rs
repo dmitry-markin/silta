@@ -266,8 +266,11 @@ impl Tracker {
                     self.last_person = now;
                 }
             }
-            Event::Result { is_error } => {
+            Event::Result { is_error, person } => {
                 self.turn = false;
+                if *person {
+                    self.last_person = now;
+                }
                 match self.phase {
                     Phase::Handoff { .. } => {
                         if !*is_error && !self.note_written {
@@ -423,8 +426,8 @@ mod tests {
         Event::BackgroundTasks { ids: ids.iter().map(|s| s.to_string()).collect() }
     }
 
-    const OK: Event = Event::Result { is_error: false };
-    const ERR: Event = Event::Result { is_error: true };
+    const OK: Event = Event::Result { is_error: false, person: false };
+    const ERR: Event = Event::Result { is_error: true, person: false };
     const PERSON: Event = Event::User { person: true };
     const TIMER: Event = Event::User { person: false };
     const BOUNDARY: Event = Event::Compacted { auto: false };
@@ -491,6 +494,16 @@ mod tests {
         tr.event(&OK, t0 + secs(3 * 3600 + 2));
         assert!(tr.tick(t0 + secs(7 * 3600 - 1)).is_empty());
         assert_eq!(tr.tick(t0 + secs(7 * 3600))[0], Action::MarkPending);
+    }
+
+    #[test]
+    fn a_channel_turns_result_resets_the_gap_without_its_user_line() {
+        let t0 = Instant::now();
+        let mut tr = Tracker::new(limits(), t0);
+        tr.event(&assistant(310_000), t0 + secs(3 * 3600));
+        tr.event(&Event::Result { is_error: false, person: true }, t0 + secs(3 * 3600 + 2));
+        assert!(tr.tick(t0 + secs(7 * 3600)).is_empty());
+        assert_eq!(tr.tick(t0 + secs(7 * 3600 + 2))[0], Action::MarkPending);
     }
 
     #[test]

@@ -7,8 +7,9 @@
 #   CLAUDE_BIN=/opt/claude/.local/share/claude/versions/2.1.270 dev/contract-check.sh
 #
 # Asserts: the init line names a version and it is in silta-session's TESTED_VERSIONS;
-# a main-line assistant line carries the three usage counts; the result line carries
-# is_error. Agents, compaction and the hook stay in the manual procedure of the doc's
+# a main-line assistant line carries the three usage counts; the turn's prompt comes
+# back as a user line (the idle gap rests on that line for a channel delivery); the
+# result line carries is_error. Agents, compaction and the hook stay in the manual procedure of the doc's
 # last section. Exit 0 when every check passes, 1 otherwise; the failures are listed.
 set -uo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -18,7 +19,7 @@ out=$(mktemp "${TMPDIR:-/tmp}/contract-check.XXXXXX")
 trap 'rm -f "$out"' EXIT
 printf '%s\n' '{"type":"user","message":{"role":"user","content":"Reply with the single word ok and nothing else."}}' \
   | "$claude" -p --input-format stream-json --output-format stream-json --verbose \
-      --permission-mode auto --permission-prompts none > "$out" 2>"$out.err"
+      --replay-user-messages --permission-mode auto --permission-prompts none > "$out" 2>"$out.err"
 status=$?
 if [ $status -ne 0 ]; then
   echo "claude exited with $status; stderr:" >&2
@@ -49,6 +50,10 @@ else:
         for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
             if not isinstance(usage.get(key), int):
                 fails.append(f"message.usage.{key} is missing or not an integer")
+echoed = [l for l in lines if l.get("type") == "user" and isinstance(l.get("message", {}).get("content"), str)
+          and l["message"]["content"].startswith("Reply with the single word")]
+if not echoed:
+    fails.append("the prompt is not echoed as a user line with --replay-user-messages; a channel delivery would not restart the idle gap")
 results = [l for l in lines if l.get("type") == "result"]
 if not results:
     fails.append("no result line")
