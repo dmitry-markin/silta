@@ -1,6 +1,6 @@
 [package]
 name = "siltad"
-description = "silta daemon: the assistant's Matrix device, routing rooms to its sessions"
+description = "Silta assistant daemon: the Matrix client that routes rooms to the assistant's sessions"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

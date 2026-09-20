@@ -10,7 +10,7 @@ license = "Apache-2.0 OR MIT"
 repository = "https://github.com/dmitry-markin/silta"
 
 [workspace.dependencies]
-silta = { path = "crates/silta" }
+silta = { path = "crates/silta", version = "0.5.1" }
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
