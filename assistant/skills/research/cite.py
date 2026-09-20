@@ -8,6 +8,8 @@ distinct URLs in order of first citation, replaces the markers with clickable su
 end), and prints a short report to stderr: citations, sources, uncited sources,
 bare URLs left in the body (likely broken citations).
 
+Safe to run again on its own output (an addendum with new markers gets numbered after the rest).
+
 Usage: cite.py report.md            # rewrites in place
        cite.py report.md out.md
 """
@@ -24,10 +26,17 @@ def norm(u):
     p = urlsplit(u.strip())
     return urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path.rstrip('/') or '/', p.query, ''))
 
+SUPER = re.compile(r'\^\\\[((?:\[\d+\]\(https?://[^)\s]+\),?)+)\\\]\^')
+NUMLINK = re.compile(r'\[\d+\]\((https?://[^)\s]+)\)')
+
+def unsuper(text):
+    # Make a second run idempotent: turn this script's own superscript output back into [@](URL) markers.
+    return SUPER.sub(lambda m: ''.join(f'[@]({u})' for u in NUMLINK.findall(m.group(1))), text)
+
 def main(src, dst):
-    text = open(src, encoding='utf-8').read()
+    text = unsuper(open(src, encoding='utf-8').read())
     m = SRC_HEAD.search(text)
-    body, head, tail = (text, None, '') if not m else (text[:m.start()], m.group(0), text[m.end():])
+    body, head, tail = (text, None, '') if not m else (text[:m.start()], m.group(0).strip(), text[m.end():])
     titles, order_listed = {}, []
     for t, u in LINK.findall(tail):
         k = norm(u)
