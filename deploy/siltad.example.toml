@@ -43,11 +43,11 @@ send = "own"
 user = "silta-hub"
 
 [[sessions]]
-name = "bob"
+name = "user-1"
 receive = { people = ["Bob"] }
-user = "silta-bob"
+user = "silta-user-1"
 
 [[sessions]]
-name = "alice"
+name = "user-2"
 receive = { people = ["Alice"] }
-user = "silta-alice"
+user = "silta-user-2"
