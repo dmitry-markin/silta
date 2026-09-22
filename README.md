@@ -15,8 +15,14 @@ Family AI assistant that runs on Claude Code and speaks Matrix. Keeps its memory
 ## Security
 
 1. Claude Code's bubblewrap sandbox to protect the API token and the harness's own state from the agent. Outbound network requests go through a filtering proxy (pass-through by default), and Write/Edit deny rules keep the agent out of the harness configuration.
-2. A separate Linux user per session with systemd hardening isolates sessions from the VM and from each other.
+2. A separate Linux user per session with systemd hardening isolates sessions from the VM and from each other. User namespaces are, unfortunately, allowed for the bubblewrap sandbox to work.
 3. Designed to run in a dedicated VM as a natural security boundary from the host.
+
+## Privacy
+
+1. Matrix IDs of the users and of the assistant are not intentionally forwarded to the agent (user names from the config are used instead to identify people), but can reach the context through side channels. Mentions in the rooms and error messages from Matrix SDK returned as tool call errors might carry real user IDs.
+2. The agent sees real room IDs, including the homeserver's server name for rooms older than version 12. The server's name and URL might still reach the context via tool call errors coming from Matrix SDK.
+3. No user or assistant messages reach the journal log, but message sizes and attachment filenames are logged.
 
 ## Architecture overview
 
@@ -67,14 +73,14 @@ This allows the assistant to continue from the point where it was before the com
 
 ## Project status
 
-Used daily by family and friends since 7 September 2026. Built with Claude Code and the assistant itself. Expect things to break (and get fixed).
+Used daily by the author, his family, and friends since 7 September 2026. Built with Claude Code and the assistant itself. Expect things to break (and get fixed).
 
 ## Known issues
 
 1. Claude Code evolves fast, breaking the integration. An automatic tool for checking the contract surface is planned.
 2. A running `Monitor` task blocks the graceful stop, so the supervisor waits out its timeout and restarts the session before compaction. Session continuity is unaffected.
 3. Support for third-party gateways (like OpenRouter) is implemented, but effectively dormant until Anthropic extends the Claude Code channels beta to them.
-4. Some sites block web fetch requests coming from datacenter IPs, making the research less efficient. They are in the minority, and this can be worked around by using a residential IP for the network egress of the VM or session's Linux user.
+4. Some sites block web fetch requests coming from datacenter IPs, making the research less efficient. Such sites are in the minority, and this can be worked around by using a residential IP for the network egress of the VM or session's Linux user.
 
 ## Deployment
 
