@@ -17,7 +17,7 @@
    ```
    and `cargo-deb` for packaging:
    ```bash
-   cargo install --locked cargo-deb`
+   cargo install --locked cargo-deb
    ```
 4. Clone the repo and build the `.deb` package:
    ```bash
