@@ -3,7 +3,9 @@
 
 use matrix_sdk::ruma::{
     events::room::{
-        message::{sanitize::remove_plain_reply_fallback, MessageType, Relation, RoomMessageEventContent},
+        message::{
+            sanitize::remove_plain_reply_fallback, MessageType, Relation, RoomMessageEventContent,
+        },
         MediaSource,
     },
     UInt,
@@ -42,7 +44,13 @@ pub fn parse(content: &RoomMessageEventContent) -> Parsed {
     let mut thread = None;
     let mut fallback = false;
     match &content.relates_to {
-        Some(Relation::Replacement(_)) => return Parsed { in_reply_to: None, thread: None, body: Body::Edit },
+        Some(Relation::Replacement(_)) => {
+            return Parsed {
+                in_reply_to: None,
+                thread: None,
+                body: Body::Edit,
+            }
+        }
         Some(Relation::Reply(reply)) => {
             in_reply_to = Some(reply.in_reply_to.event_id.to_string());
             fallback = true;
@@ -98,19 +106,38 @@ pub fn parse(content: &RoomMessageEventContent) -> Parsed {
         )),
         other => Body::Other(other.msgtype().to_owned()),
     };
-    Parsed { in_reply_to, thread, body }
+    Parsed {
+        in_reply_to,
+        thread,
+        body,
+    }
 }
 
 /// The spec's rule: with a `filename`, `body` is a caption when it differs from it;
 /// without one, `body` is the file name.
-fn media(body: &str, filename: Option<&str>, mimetype: Option<&str>, size: Option<UInt>, source: &MediaSource) -> Media {
+fn media(
+    body: &str,
+    filename: Option<&str>,
+    mimetype: Option<&str>,
+    size: Option<UInt>,
+    source: &MediaSource,
+) -> Media {
     let (name, caption) = match filename {
         Some(f) if f != body => (f.to_owned(), body.to_owned()),
         Some(f) => (f.to_owned(), String::new()),
         None => (body.to_owned(), String::new()),
     };
-    let mime = mimetype
-        .map(str::to_owned)
-        .unwrap_or_else(|| mime_guess::from_path(&name).first_raw().unwrap_or("application/octet-stream").to_owned());
-    Media { name, mime, size: size.map(u64::from), caption, source: source.clone() }
+    let mime = mimetype.map(str::to_owned).unwrap_or_else(|| {
+        mime_guess::from_path(&name)
+            .first_raw()
+            .unwrap_or("application/octet-stream")
+            .to_owned()
+    });
+    Media {
+        name,
+        mime,
+        size: size.map(u64::from),
+        caption,
+        source: source.clone(),
+    }
 }

@@ -34,8 +34,8 @@ use matrix_sdk::{
                 encrypted::OriginalSyncRoomEncryptedEvent,
                 member::{MembershipState, StrippedRoomMemberEvent},
                 message::{
-                    MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata, RoomMessageEventContent,
-                    TextMessageEventContent,
+                    MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
+                    RoomMessageEventContent, TextMessageEventContent,
                 },
                 MediaSource,
             },
@@ -61,12 +61,19 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let user = env::var("TESTCLIENT_USER").or_else(|_| env::var("ALICE_USER")).context("set TESTCLIENT_USER or ALICE_USER")?;
-    let password = env::var("TESTCLIENT_PASSWORD").or_else(|_| env::var("ALICE_PASSWORD")).context("set TESTCLIENT_PASSWORD or ALICE_PASSWORD")?;
-    let homeserver = env::var("TESTCLIENT_HOMESERVER").unwrap_or_else(|_| "http://localhost".into());
+    let user = env::var("TESTCLIENT_USER")
+        .or_else(|_| env::var("ALICE_USER"))
+        .context("set TESTCLIENT_USER or ALICE_USER")?;
+    let password = env::var("TESTCLIENT_PASSWORD")
+        .or_else(|_| env::var("ALICE_PASSWORD"))
+        .context("set TESTCLIENT_PASSWORD or ALICE_PASSWORD")?;
+    let homeserver =
+        env::var("TESTCLIENT_HOMESERVER").unwrap_or_else(|_| "http://localhost".into());
     let state_root = env::var("TESTCLIENT_STATE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dev/state/testclient"));
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dev/state/testclient")
+        });
     let device = env::var("TESTCLIENT_DEVICE").unwrap_or_else(|_| "testclient".into());
     let user_id = UserId::parse(&user).context("TESTCLIENT_USER is not a Matrix user id")?;
     let state_dir = state_root.join(user_id.localpart());
@@ -124,7 +131,9 @@ async fn run() -> Result<()> {
 }
 
 async fn sync_once(client: &Client) -> Result<()> {
-    client.sync_once(SyncSettings::default().timeout(Duration::from_secs(5))).await?;
+    client
+        .sync_once(SyncSettings::default().timeout(Duration::from_secs(5)))
+        .await?;
     Ok(())
 }
 
@@ -165,7 +174,9 @@ async fn room(client: &Client, name: &str, users: &[&str]) -> Result<()> {
 async fn joined_room(client: &Client, room_id: &str) -> Result<Room> {
     let room_id = RoomId::parse(room_id)?;
     sync_once(client).await?;
-    let room = client.get_room(&room_id).context("not in that room (run watch to accept invites)")?;
+    let room = client
+        .get_room(&room_id)
+        .context("not in that room (run watch to accept invites)")?;
     if room.state() != RoomState::Joined {
         bail!("not joined to {room_id}");
     }
@@ -182,7 +193,11 @@ async fn send(client: &Client, room_id: &str, content: impl MessageLikeEventCont
 async fn sendfile(client: &Client, room_id: &str, path: &str, caption: String) -> Result<()> {
     let path = PathBuf::from(path);
     let data = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
-    let name = path.file_name().and_then(|n| n.to_str()).context("bad file name")?.to_owned();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("bad file name")?
+        .to_owned();
     let mime = mime_guess::from_path(&path).first_or_octet_stream();
     let mut config = AttachmentConfig::new();
     if !caption.trim().is_empty() {
@@ -197,35 +212,95 @@ async fn sendfile(client: &Client, room_id: &str, path: &str, caption: String) -
 async fn watch(client: &Client, downloads: PathBuf) -> Result<()> {
     std::fs::create_dir_all(&downloads)?;
     client.add_event_handler_context(downloads);
-    client.add_event_handler(|event: StrippedRoomMemberEvent, room: Room, client: Client| async move {
-        if Some(event.state_key.as_ref()) == client.user_id() && event.content.membership == MembershipState::Invite {
-            eprintln!("invite to {} from {}, joining", room.room_id(), event.sender);
-            if let Err(err) = room.join().await {
-                eprintln!("join failed: {err}");
+    client.add_event_handler(
+        |event: StrippedRoomMemberEvent, room: Room, client: Client| async move {
+            if Some(event.state_key.as_ref()) == client.user_id()
+                && event.content.membership == MembershipState::Invite
+            {
+                eprintln!(
+                    "invite to {} from {}, joining",
+                    room.room_id(),
+                    event.sender
+                );
+                if let Err(err) = room.join().await {
+                    eprintln!("join failed: {err}");
+                }
             }
-        }
-    });
-    client.add_event_handler(|event: OriginalSyncRoomMessageEvent, room: Room, client: Client, Ctx(downloads): Ctx<PathBuf>| async move {
-        if room.state() != RoomState::Joined {
-            return;
-        }
-        let relation = match &event.content.relates_to {
-            Some(Relation::Reply(r)) => format!(" (reply to {})", r.in_reply_to.event_id),
-            Some(Relation::Thread(t)) => format!(" (thread {})", t.event_id),
-            Some(Relation::Replacement(r)) => format!(" (edit of {})", r.event_id),
-            _ => String::new(),
-        };
-        let body = match &event.content.msgtype {
-            MessageType::Text(text) => text.body.clone(),
-            MessageType::Emote(emote) => format!("/me {}", emote.body),
-            MessageType::Image(c) => media(&client, &downloads, "image", &c.body, c.filename.as_deref(), &c.source).await,
-            MessageType::File(c) => media(&client, &downloads, "file", &c.body, c.filename.as_deref(), &c.source).await,
-            MessageType::Audio(c) => media(&client, &downloads, "audio", &c.body, c.filename.as_deref(), &c.source).await,
-            MessageType::Video(c) => media(&client, &downloads, "video", &c.body, c.filename.as_deref(), &c.source).await,
-            other => format!("<{}>", other.msgtype()),
-        };
-        println!("[{}] {} {}{}: {}", room.room_id(), event.event_id, event.sender, relation, body.replace('\n', "\\n"));
-    });
+        },
+    );
+    client.add_event_handler(
+        |event: OriginalSyncRoomMessageEvent,
+         room: Room,
+         client: Client,
+         Ctx(downloads): Ctx<PathBuf>| async move {
+            if room.state() != RoomState::Joined {
+                return;
+            }
+            let relation = match &event.content.relates_to {
+                Some(Relation::Reply(r)) => format!(" (reply to {})", r.in_reply_to.event_id),
+                Some(Relation::Thread(t)) => format!(" (thread {})", t.event_id),
+                Some(Relation::Replacement(r)) => format!(" (edit of {})", r.event_id),
+                _ => String::new(),
+            };
+            let body = match &event.content.msgtype {
+                MessageType::Text(text) => text.body.clone(),
+                MessageType::Emote(emote) => format!("/me {}", emote.body),
+                MessageType::Image(c) => {
+                    media(
+                        &client,
+                        &downloads,
+                        "image",
+                        &c.body,
+                        c.filename.as_deref(),
+                        &c.source,
+                    )
+                    .await
+                }
+                MessageType::File(c) => {
+                    media(
+                        &client,
+                        &downloads,
+                        "file",
+                        &c.body,
+                        c.filename.as_deref(),
+                        &c.source,
+                    )
+                    .await
+                }
+                MessageType::Audio(c) => {
+                    media(
+                        &client,
+                        &downloads,
+                        "audio",
+                        &c.body,
+                        c.filename.as_deref(),
+                        &c.source,
+                    )
+                    .await
+                }
+                MessageType::Video(c) => {
+                    media(
+                        &client,
+                        &downloads,
+                        "video",
+                        &c.body,
+                        c.filename.as_deref(),
+                        &c.source,
+                    )
+                    .await
+                }
+                other => format!("<{}>", other.msgtype()),
+            };
+            println!(
+                "[{}] {} {}{}: {}",
+                room.room_id(),
+                event.event_id,
+                event.sender,
+                relation,
+                body.replace('\n', "\\n")
+            );
+        },
+    );
     client.add_event_handler(|event: OriginalSyncReactionEvent, room: Room| async move {
         println!(
             "[{}] {} {} reaction {} on {}",
@@ -236,31 +311,73 @@ async fn watch(client: &Client, downloads: PathBuf) -> Result<()> {
             event.content.relates_to.event_id
         );
     });
-    client.add_event_handler(|event: OriginalSyncRoomEncryptedEvent, room: Room| async move {
-        println!("[{}] {} {}: <undecryptable>", room.room_id(), event.event_id, event.sender);
-    });
+    client.add_event_handler(
+        |event: OriginalSyncRoomEncryptedEvent, room: Room| async move {
+            println!(
+                "[{}] {} {}: <undecryptable>",
+                room.room_id(),
+                event.event_id,
+                event.sender
+            );
+        },
+    );
     client.add_event_handler(|event: SyncTypingEvent, room: Room| async move {
-        let who: Vec<String> = event.content.user_ids.iter().map(|u| u.to_string()).collect();
+        let who: Vec<String> = event
+            .content
+            .user_ids
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
         let now = silta::time::rfc3339_utc(
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
         );
-        println!("[{}] {} typing: {}", room.room_id(), &now[11..19], if who.is_empty() { "(none)".to_owned() } else { who.join(", ") });
+        println!(
+            "[{}] {} typing: {}",
+            room.room_id(),
+            &now[11..19],
+            if who.is_empty() {
+                "(none)".to_owned()
+            } else {
+                who.join(", ")
+            }
+        );
     });
-    eprintln!("watching as {} (Ctrl-C to stop)", client.user_id().map(|u| u.to_string()).unwrap_or_default());
-    client.sync(SyncSettings::default().timeout(Duration::from_secs(30))).await?;
+    eprintln!(
+        "watching as {} (Ctrl-C to stop)",
+        client.user_id().map(|u| u.to_string()).unwrap_or_default()
+    );
+    client
+        .sync(SyncSettings::default().timeout(Duration::from_secs(30)))
+        .await?;
     Ok(())
 }
 
 /// Download an attachment into the downloads directory and describe it.
-async fn media(client: &Client, downloads: &std::path::Path, kind: &str, body: &str, filename: Option<&str>, source: &MediaSource) -> String {
+async fn media(
+    client: &Client,
+    downloads: &std::path::Path,
+    kind: &str,
+    body: &str,
+    filename: Option<&str>,
+    source: &MediaSource,
+) -> String {
     let (name, caption) = match filename {
         Some(f) if f != body => (f, Some(body)),
         Some(f) => (f, None),
         None => (body, None),
     };
-    let safe: String = name.chars().map(|c| if c == '/' || c.is_control() { '_' } else { c }).collect();
+    let safe: String = name
+        .chars()
+        .map(|c| if c == '/' || c.is_control() { '_' } else { c })
+        .collect();
     let path = downloads.join(&safe);
-    let request = MediaRequestParameters { source: source.clone(), format: MediaFormat::File };
+    let request = MediaRequestParameters {
+        source: source.clone(),
+        format: MediaFormat::File,
+    };
     let saved = match client.media().get_media_content(&request, false).await {
         Ok(data) => match std::fs::write(&path, &data) {
             Ok(()) => format!("{} bytes saved to {}", data.len(), path.display()),
@@ -268,6 +385,8 @@ async fn media(client: &Client, downloads: &std::path::Path, kind: &str, body: &
         },
         Err(err) => format!("download failed: {err}"),
     };
-    let caption = caption.map(|c| format!(" caption: {c}")).unwrap_or_default();
+    let caption = caption
+        .map(|c| format!(" caption: {c}"))
+        .unwrap_or_default();
     format!("<{kind} {name}: {saved}>{caption}")
 }

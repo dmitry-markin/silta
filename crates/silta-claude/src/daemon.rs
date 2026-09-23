@@ -14,8 +14,8 @@ use std::{
 use silta::{
     line::{write_line, LineReader},
     protocol::{
-        parse_daemon_line, Ack, Cmd, CmdKind, CmdResult, ClientMessage, DaemonMessage, Event, FileHeader, Hello,
-        ResultError, SendFile, Welcome, PROTOCOL_VERSION,
+        parse_daemon_line, Ack, ClientMessage, Cmd, CmdKind, CmdResult, DaemonMessage, Event,
+        FileHeader, Hello, ResultError, SendFile, Welcome, PROTOCOL_VERSION,
     },
     transfer::{self, sweep, Piece, Receiver},
 };
@@ -117,20 +117,48 @@ impl DaemonClient {
     /// Stream a file from this host to the daemon, then the `send_file` command for it.
     /// The path is checked here, as this process's user, which is the whole point: a
     /// session can only send what it can read.
-    pub async fn send_file(&self, path: PathBuf, mut cmd: SendFile) -> Result<CmdResult, DaemonError> {
-        let refuse = |message: String| DaemonError::Refused { code: ResultError::FileError, message };
+    pub async fn send_file(
+        &self,
+        path: PathBuf,
+        mut cmd: SendFile,
+    ) -> Result<CmdResult, DaemonError> {
+        let refuse = |message: String| DaemonError::Refused {
+            code: ResultError::FileError,
+            message,
+        };
         if !path.is_absolute() {
-            return Err(refuse(format!("{} is not an absolute path", path.display())));
+            return Err(refuse(format!(
+                "{} is not an absolute path",
+                path.display()
+            )));
         }
-        let meta = tokio::fs::metadata(&path).await.map_err(|e| refuse(format!("cannot read {}: {e}", path.display())))?;
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| refuse(format!("cannot read {}: {e}", path.display())))?;
         if !meta.is_file() {
             return Err(refuse(format!("{} is not a regular file", path.display())));
         }
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_owned();
-        let mime = mime_guess::from_path(&path).first_or_octet_stream().to_string();
-        let header = FileHeader { transfer: String::new(), name, mime, size: meta.len() };
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_owned();
+        let mime = mime_guess::from_path(&path)
+            .first_or_octet_stream()
+            .to_string();
+        let header = FileHeader {
+            transfer: String::new(),
+            name,
+            mime,
+            size: meta.len(),
+        };
         cmd.transfer = String::new();
-        self.submit(CmdKind::SendFile(cmd), Some((path, header)), SEND_FILE_TIMEOUT).await
+        self.submit(
+            CmdKind::SendFile(cmd),
+            Some((path, header)),
+            SEND_FILE_TIMEOUT,
+        )
+        .await
     }
 
     /// Tell the daemon that an event's channel notification reached Claude Code. Best
@@ -141,10 +169,18 @@ impl DaemonClient {
         }
     }
 
-    async fn submit(&self, kind: CmdKind, file: Option<(PathBuf, FileHeader)>, timeout: Duration) -> Result<CmdResult, DaemonError> {
+    async fn submit(
+        &self,
+        kind: CmdKind,
+        file: Option<(PathBuf, FileHeader)>,
+        timeout: Duration,
+    ) -> Result<CmdResult, DaemonError> {
         let (done, wait) = oneshot::channel();
         let out = Outgoing::Command(Box::new(Command { kind, file, done }));
-        self.tx.send(out).await.map_err(|_| DaemonError::Unavailable("connection task stopped".into()))?;
+        self.tx
+            .send(out)
+            .await
+            .map_err(|_| DaemonError::Unavailable("connection task stopped".into()))?;
         let result = time::timeout(timeout, wait)
             .await
             .map_err(|_| DaemonError::Timeout(timeout))?
@@ -170,7 +206,11 @@ impl DaemonClient {
 /// shutting down). In `-p` mode Claude Code installs the channel's handler later still,
 /// when its command loop starts the first turn, and the daemon sends its backlog at
 /// once: the supervisor creates the ready file when that turn's `init` line appears.
-async fn wait_until_ready(ready: oneshot::Receiver<()>, ready_file: Option<&Path>, cancel: &CancellationToken) -> bool {
+async fn wait_until_ready(
+    ready: oneshot::Receiver<()>,
+    ready_file: Option<&Path>,
+    cancel: &CancellationToken,
+) -> bool {
     tokio::select! {
         _ = cancel.cancelled() => return false,
         ready = ready => if ready.is_err() {
@@ -180,7 +220,10 @@ async fn wait_until_ready(ready: oneshot::Receiver<()>, ready_file: Option<&Path
     let Some(path) = ready_file else {
         return true;
     };
-    info!("waiting for {} before connecting to the daemon", path.display());
+    info!(
+        "waiting for {} before connecting to the daemon",
+        path.display()
+    );
     let started = time::Instant::now();
     while !path.exists() {
         tokio::select! {
@@ -188,7 +231,10 @@ async fn wait_until_ready(ready: oneshot::Receiver<()>, ready_file: Option<&Path
             _ = time::sleep(READY_POLL) => {}
         }
     }
-    info!(waited_ms = started.elapsed().as_millis() as u64, "Claude Code has registered the channel, connecting to the daemon");
+    info!(
+        waited_ms = started.elapsed().as_millis() as u64,
+        "Claude Code has registered the channel, connecting to the daemon"
+    );
     true
 }
 
@@ -216,7 +262,8 @@ async fn run(
                 );
                 backoff.reset();
                 if sweeper.is_none() {
-                    let max_age = Duration::from_secs(welcome.inbox_max_age_days.saturating_mul(86_400));
+                    let max_age =
+                        Duration::from_secs(welcome.inbox_max_age_days.saturating_mul(86_400));
                     sweeper = Some(spawn_sweeper(inbox.clone(), max_age));
                 }
                 let reason = serve(reader, writer, &inbox, &events, &mut rx, &cancel).await;
@@ -262,7 +309,11 @@ fn spawn_sweeper(inbox: PathBuf, max_age: Duration) -> JoinHandle<()> {
         loop {
             match sweep(&inbox, max_age).await {
                 Ok(0) => debug!("inbox sweep: nothing to remove"),
-                Ok(removed) => info!(removed, "inbox sweep: removed files older than {} days", max_age.as_secs() / 86_400),
+                Ok(removed) => info!(
+                    removed,
+                    "inbox sweep: removed files older than {} days",
+                    max_age.as_secs() / 86_400
+                ),
                 Err(err) => warn!("inbox sweep of {} failed: {err}", inbox.display()),
             }
             time::sleep(SWEEP_EVERY).await;
@@ -275,8 +326,13 @@ type Reader = LineReader<OwnedReadHalf>;
 /// Connect and complete the handshake. The reader that read the `welcome` is handed
 /// on: the daemon may follow the welcome with queued events at once, and a throwaway
 /// buffered reader would swallow them.
-async fn connect(socket: &Path, session: &str) -> Result<(Reader, OwnedWriteHalf, Welcome), String> {
-    let stream = UnixStream::connect(socket).await.map_err(|e| e.to_string())?;
+async fn connect(
+    socket: &Path,
+    session: &str,
+) -> Result<(Reader, OwnedWriteHalf, Welcome), String> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .map_err(|e| e.to_string())?;
     let (read_half, mut writer) = stream.into_split();
     let mut reader = LineReader::new(read_half);
     let hello = ClientMessage::Hello(Hello {
@@ -284,7 +340,9 @@ async fn connect(socket: &Path, session: &str) -> Result<(Reader, OwnedWriteHalf
         session: session.to_owned(),
         client: CLIENT_NAME.to_owned(),
     });
-    write_line(&mut writer, &hello).await.map_err(|e| format!("cannot send hello: {e}"))?;
+    write_line(&mut writer, &hello)
+        .await
+        .map_err(|e| format!("cannot send hello: {e}"))?;
 
     let first = time::timeout(WELCOME_TIMEOUT, reader.next_json::<DaemonMessage>())
         .await
@@ -293,12 +351,18 @@ async fn connect(socket: &Path, session: &str) -> Result<(Reader, OwnedWriteHalf
     match first {
         Some(DaemonMessage::Welcome(welcome)) => {
             if welcome.protocol != PROTOCOL_VERSION {
-                return Err(format!("daemon speaks protocol {}, this plugin speaks {PROTOCOL_VERSION}", welcome.protocol));
+                return Err(format!(
+                    "daemon speaks protocol {}, this plugin speaks {PROTOCOL_VERSION}",
+                    welcome.protocol
+                ));
             }
             Ok((reader, writer, welcome))
         }
         Some(DaemonMessage::Error(err)) => {
-            error!(code = err.code.as_str(), "daemon refused the session: {}", err.message);
+            error!(
+                code = err.code.as_str(),
+                "daemon refused the session: {}", err.message
+            );
             Err(format!("{}: {}", err.code.as_str(), err.message))
         }
         Some(other) => Err(format!("expected welcome, got {other:?}")),
@@ -428,7 +492,10 @@ async fn serve(
 }
 
 fn is_local(err: &io::Error) -> bool {
-    matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::IsADirectory)
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::IsADirectory
+    )
 }
 
 async fn send_cmd(writer: &mut OwnedWriteHalf, id: u64, kind: CmdKind) -> std::io::Result<()> {
@@ -443,7 +510,9 @@ struct Backoff {
 
 impl Backoff {
     fn new() -> Self {
-        Backoff { current: BACKOFF_MIN }
+        Backoff {
+            current: BACKOFF_MIN,
+        }
     }
 
     fn reset(&mut self) {
@@ -484,7 +553,10 @@ mod tests {
         time::sleep(Duration::from_millis(300)).await;
         assert!(!wait.is_finished(), "went on without the ready file");
         std::fs::write(&path, "").unwrap();
-        assert!(time::timeout(Duration::from_secs(2), wait).await.unwrap().unwrap());
+        assert!(time::timeout(Duration::from_secs(2), wait)
+            .await
+            .unwrap()
+            .unwrap());
         std::fs::remove_file(&path).unwrap();
 
         let wait = tokio::spawn({
@@ -492,6 +564,9 @@ mod tests {
             async move { wait_until_ready(initialized(), Some(&path), &cancel).await }
         });
         cancel.cancel();
-        assert!(!time::timeout(Duration::from_secs(2), wait).await.unwrap().unwrap());
+        assert!(!time::timeout(Duration::from_secs(2), wait)
+            .await
+            .unwrap()
+            .unwrap());
     }
 }

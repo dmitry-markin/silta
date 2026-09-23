@@ -14,7 +14,11 @@ pub struct Backlog<T> {
 
 impl<T> Backlog<T> {
     pub fn new(max_len: usize, max_age_ms: u64) -> Self {
-        Backlog { items: VecDeque::new(), max_len, max_age_ms }
+        Backlog {
+            items: VecDeque::new(),
+            max_len,
+            max_age_ms,
+        }
     }
 
     /// Queue an item stamped `ts_ms`; returns how many older items were evicted.
@@ -105,7 +109,13 @@ mod tests {
         assert_eq!(b.drain(300).0, vec![(100, "a"), (200, "b"), (300, "new")]);
         // The age cap and then the count cap take the oldest restored ones.
         b.push(500, "x", 500);
-        assert_eq!(b.restore(vec![(1, "expired"), (350, "w"), (400, "y"), (450, "z")], 1_200), 2);
+        assert_eq!(
+            b.restore(
+                vec![(1, "expired"), (350, "w"), (400, "y"), (450, "z")],
+                1_200
+            ),
+            2
+        );
         assert_eq!(b.drain(1_200).0, vec![(400, "y"), (450, "z"), (500, "x")]);
     }
 

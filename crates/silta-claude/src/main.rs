@@ -48,7 +48,9 @@ struct Args {
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .with_target(false)
@@ -119,7 +121,9 @@ async fn run(args: Args, parent: libc::pid_t) -> i32 {
         }
     });
 
-    let inbox = std::env::current_dir().map(|cwd| cwd.join(&args.inbox)).unwrap_or(args.inbox);
+    let inbox = std::env::current_dir()
+        .map(|cwd| cwd.join(&args.inbox))
+        .unwrap_or(args.inbox);
     if let Err(err) = std::fs::create_dir_all(&inbox) {
         error!("cannot create the inbox {}: {err}", inbox.display());
         return 1;
@@ -127,7 +131,15 @@ async fn run(args: Args, parent: libc::pid_t) -> i32 {
     info!(session = %args.session, socket = %args.socket.display(), inbox = %inbox.display(), "silta-claude {} starting", env!("CARGO_PKG_VERSION"));
     let (events_tx, events_rx) = mpsc::channel(256);
     let (ready_tx, ready_rx) = oneshot::channel();
-    let daemon = daemon::DaemonClient::start(args.socket, args.session, inbox, args.ready_file, events_tx, ready_rx, cancel.clone());
+    let daemon = daemon::DaemonClient::start(
+        args.socket,
+        args.session,
+        inbox,
+        args.ready_file,
+        events_tx,
+        ready_rx,
+        cancel.clone(),
+    );
     let handler = mcp::SiltaChannel::new(daemon, events_rx, ready_tx);
 
     // The handshake waits for the client's initialize request; a shutdown signal must

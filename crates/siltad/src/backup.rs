@@ -30,7 +30,11 @@ pub fn stamp(now_ms: u64) -> String {
 }
 
 fn is_stamp(name: &str) -> bool {
-    name.len() == 20 && name.ends_with('Z') && name.chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | 'T' | 'Z'))
+    name.len() == 20
+        && name.ends_with('Z')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | 'T' | 'Z'))
 }
 
 /// Copy the store of `state_dir` into `to/<stamp>` and keep the newest `keep` copies.
@@ -80,13 +84,21 @@ pub fn run(state_dir: &Path, to: &Path, keep: usize, stamp: &str) -> Result<Path
     for name in [SESSION_FILE, MARKS_FILE] {
         let src = state_dir.join(name);
         if src.is_file() {
-            bytes += fs::copy(&src, tmp.join(name)).with_context(|| format!("cannot copy {}", src.display()))?;
+            bytes += fs::copy(&src, tmp.join(name))
+                .with_context(|| format!("cannot copy {}", src.display()))?;
             files += 1;
         }
     }
-    fs::rename(&tmp, &target).with_context(|| format!("cannot move the copy to {}", target.display()))?;
+    fs::rename(&tmp, &target)
+        .with_context(|| format!("cannot move the copy to {}", target.display()))?;
     let removed = prune(to, keep)?;
-    info!(files, bytes, removed, "store copied to {}", target.display());
+    info!(
+        files,
+        bytes,
+        removed,
+        "store copied to {}",
+        target.display()
+    );
     Ok(target)
 }
 
@@ -95,7 +107,8 @@ fn copy_database(src: &Path, dest: &Path) -> Result<()> {
     let conn = Connection::open(src).with_context(|| format!("cannot open {}", src.display()))?;
     conn.busy_timeout(Duration::from_secs(60))?;
     let dest = dest.to_str().context("the destination path is not UTF-8")?;
-    conn.execute("VACUUM INTO ?1", [dest]).with_context(|| format!("VACUUM INTO {dest} failed for {}", src.display()))?;
+    conn.execute("VACUUM INTO ?1", [dest])
+        .with_context(|| format!("VACUUM INTO {dest} failed for {}", src.display()))?;
     Ok(())
 }
 
@@ -120,7 +133,8 @@ fn prune(to: &Path, keep: usize) -> Result<usize> {
     copies.sort();
     while copies.len() > keep {
         let oldest = copies.remove(0);
-        fs::remove_dir_all(to.join(&oldest)).with_context(|| format!("cannot remove the old copy {oldest}"))?;
+        fs::remove_dir_all(to.join(&oldest))
+            .with_context(|| format!("cannot remove the old copy {oldest}"))?;
         removed += 1;
     }
     Ok(removed)
@@ -153,9 +167,13 @@ mod tests {
         fs::create_dir_all(&store).unwrap();
         // A database in WAL mode, held open with uncheckpointed writes, as the daemon's are.
         let live = Connection::open(store.join("matrix-sdk-crypto.sqlite3")).unwrap();
-        live.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE keys(id INTEGER PRIMARY KEY, v TEXT);").unwrap();
+        live.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE keys(id INTEGER PRIMARY KEY, v TEXT);",
+        )
+        .unwrap();
         for i in 0..50 {
-            live.execute("INSERT INTO keys(v) VALUES (?1)", [format!("key-{i}")]).unwrap();
+            live.execute("INSERT INTO keys(v) VALUES (?1)", [format!("key-{i}")])
+                .unwrap();
         }
         fs::write(state.join(SESSION_FILE), "{\"token\":\"t\"}").unwrap();
         fs::write(state.join(MARKS_FILE), "{}").unwrap();
@@ -165,19 +183,28 @@ mod tests {
         let first = run(&state, &to, 2, "2026-09-06T01-00-00Z").unwrap();
         assert_eq!(first, to.join("2026-09-06T01-00-00Z"));
         let copy = Connection::open(first.join("matrix-sdk-crypto.sqlite3")).unwrap();
-        let n: i64 = copy.query_row("SELECT count(*) FROM keys", [], |r| r.get(0)).unwrap();
+        let n: i64 = copy
+            .query_row("SELECT count(*) FROM keys", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 50);
-        assert_eq!(fs::read_to_string(first.join(SESSION_FILE)).unwrap(), "{\"token\":\"t\"}");
+        assert_eq!(
+            fs::read_to_string(first.join(SESSION_FILE)).unwrap(),
+            "{\"token\":\"t\"}"
+        );
         assert!(first.join(MARKS_FILE).is_file());
         assert!(!first.join("not-a-db.txt").exists());
         // The live database is untouched and still writable.
-        live.execute("INSERT INTO keys(v) VALUES ('later')", []).unwrap();
+        live.execute("INSERT INTO keys(v) VALUES ('later')", [])
+            .unwrap();
 
         // A leftover temporary directory and the oldest copies beyond `keep` go.
         fs::create_dir(to.join(".2026-09-06T00-30-00Z.tmp")).unwrap();
         run(&state, &to, 2, "2026-09-06T02-00-00Z").unwrap();
         run(&state, &to, 2, "2026-09-06T03-00-00Z").unwrap();
-        let mut left: Vec<_> = fs::read_dir(&to).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let mut left: Vec<_> = fs::read_dir(&to)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         left.sort();
         assert_eq!(left, vec!["2026-09-06T02-00-00Z", "2026-09-06T03-00-00Z"]);
         // The same stamp twice is refused rather than overwritten.

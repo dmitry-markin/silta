@@ -5,8 +5,8 @@ use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, sync::Arc};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, ContentBlock, CustomNotification, Implementation, InitializeResult, JsonObject,
-        ProtocolVersion, ServerCapabilities, ServerInfo, ServerNotification,
+        CallToolResult, ContentBlock, CustomNotification, Implementation, InitializeResult,
+        JsonObject, ProtocolVersion, ServerCapabilities, ServerInfo, ServerNotification,
     },
     service::{NotificationContext, RoleServer},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
@@ -15,7 +15,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use silta::protocol::{
-    CmdKind, Edit, EventKind, FetchMessage, FetchMessages, HistoryMessage, React, Reply, SearchMessages, SendFile, Typing,
+    CmdKind, Edit, EventKind, FetchMessage, FetchMessages, HistoryMessage, React, Reply,
+    SearchMessages, SendFile, Typing,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -165,45 +166,96 @@ struct Startup {
 
 #[tool_router]
 impl SiltaChannel {
-    pub fn new(daemon: DaemonClient, events: mpsc::Receiver<Inbound>, ready: oneshot::Sender<()>) -> Self {
-        SiltaChannel { daemon, startup: Arc::new(Mutex::new(Some(Startup { events, ready }))), tool_router: Self::tool_router() }
+    pub fn new(
+        daemon: DaemonClient,
+        events: mpsc::Receiver<Inbound>,
+        ready: oneshot::Sender<()>,
+    ) -> Self {
+        SiltaChannel {
+            daemon,
+            startup: Arc::new(Mutex::new(Some(Startup { events, ready }))),
+            tool_router: Self::tool_router(),
+        }
     }
 
     #[tool(
         name = "reply",
         description = "Send a text message to a Matrix room. Markdown is rendered; long text is split into several messages. Pass reply_to to quote a specific message and thread to answer inside a thread. `more` is required: true keeps the typing indicator on because another message of yours follows in this turn, false ends it. Fails with a code: room_not_allowed (policy), room_unknown (the bot is not in that room), not_found (the quoted event does not exist), send_failed, daemon_unavailable (no daemon connection)."
     )]
-    async fn reply(&self, Parameters(p): Parameters<ReplyParams>) -> Result<CallToolResult, McpError> {
-        self.send(CmdKind::Reply(Reply { room_id: p.room_id, text: p.text, reply_to: p.reply_to, thread: p.thread, more: p.more })).await
+    async fn reply(
+        &self,
+        Parameters(p): Parameters<ReplyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(CmdKind::Reply(Reply {
+            room_id: p.room_id,
+            text: p.text,
+            reply_to: p.reply_to,
+            thread: p.thread,
+            more: p.more,
+        }))
+        .await
     }
 
     #[tool(
         name = "react",
         description = "React to a message with an emoji. Use it when a reaction is the whole answer (a thumbs-up to a thank-you, say) or to mark that you have seen a message before starting a task that will likely take more than 30 seconds. more=true keeps the typing indicator on if your next message is expected within 30 seconds. Same failure codes as reply."
     )]
-    async fn react(&self, Parameters(p): Parameters<ReactParams>) -> Result<CallToolResult, McpError> {
-        self.send(CmdKind::React(React { room_id: p.room_id, event_id: p.event_id, emoji: p.emoji, more: p.more })).await
+    async fn react(
+        &self,
+        Parameters(p): Parameters<ReactParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(CmdKind::React(React {
+            room_id: p.room_id,
+            event_id: p.event_id,
+            emoji: p.emoji,
+            more: p.more,
+        }))
+        .await
     }
 
     #[tool(
         name = "edit_message",
         description = "Replace the text of one of your own earlier messages (the event id a reply returned). Use it narrowly: a progress message that becomes the result, or a correction; never to rewrite a conversation. The new text must fit one message of 8 KiB. Fails with not_found when the event is not your own message, bad_request when the text is too long, plus the codes of reply."
     )]
-    async fn edit_message(&self, Parameters(p): Parameters<EditParams>) -> Result<CallToolResult, McpError> {
-        self.send(CmdKind::Edit(Edit { room_id: p.room_id, event_id: p.event_id, text: p.text, more: p.more })).await
+    async fn edit_message(
+        &self,
+        Parameters(p): Parameters<EditParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send(CmdKind::Edit(Edit {
+            room_id: p.room_id,
+            event_id: p.event_id,
+            text: p.text,
+            more: p.more,
+        }))
+        .await
     }
 
     #[tool(
         name = "send_file",
         description = "Send a file from this host into a room: an absolute path of an existing file this session can read. Images, audio and video are shown as such, everything else as a file. Optional caption (Markdown), reply_to and thread as for reply. Fails with file_error when the path is not a readable regular file or the file is larger than the server accepts, plus the codes of reply."
     )]
-    async fn send_file(&self, Parameters(p): Parameters<SendFileParams>) -> Result<CallToolResult, McpError> {
-        let cmd = SendFile { room_id: p.room_id, transfer: String::new(), caption: p.caption, reply_to: p.reply_to, thread: p.thread, more: p.more };
+    async fn send_file(
+        &self,
+        Parameters(p): Parameters<SendFileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cmd = SendFile {
+            room_id: p.room_id,
+            transfer: String::new(),
+            caption: p.caption,
+            reply_to: p.reply_to,
+            thread: p.thread,
+            more: p.more,
+        };
         match self.daemon.send_file(PathBuf::from(p.path), cmd).await {
-            Ok(result) => Ok(CallToolResult::success(vec![ContentBlock::text(format!("sent: {}", result.event_id.unwrap_or_default()))])),
+            Ok(result) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "sent: {}",
+                result.event_id.unwrap_or_default()
+            ))])),
             Err(err) => {
                 warn!("send_file failed: {err}");
-                Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]))
+                Ok(CallToolResult::error(vec![ContentBlock::text(
+                    err.to_string(),
+                )]))
             }
         }
     }
@@ -212,12 +264,21 @@ impl SiltaChannel {
         name = "typing",
         description = "Show the typing indicator in a room again. Use it when, after a send with more=false, you decide to send another message there after all; the indicator then runs until your next send or for at most ten minutes. Not needed when the previous send said more=true."
     )]
-    async fn typing(&self, Parameters(p): Parameters<TypingParams>) -> Result<CallToolResult, McpError> {
-        match self.daemon.command(CmdKind::Typing(Typing { room_id: p.room_id })).await {
+    async fn typing(
+        &self,
+        Parameters(p): Parameters<TypingParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .daemon
+            .command(CmdKind::Typing(Typing { room_id: p.room_id }))
+            .await
+        {
             Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text("typing")])),
             Err(err) => {
                 warn!("typing failed: {err}");
-                Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]))
+                Ok(CallToolResult::error(vec![ContentBlock::text(
+                    err.to_string(),
+                )]))
             }
         }
     }
@@ -226,12 +287,22 @@ impl SiltaChannel {
         name = "fetch_messages",
         description = "Fetch recent messages of a room, newest first (at least `limit` when the room has them, default 20, at most 100; the last page is returned whole so a few more may come), one JSON object per line with event_id, person (absent for your own messages, which have own=true), ts, text (shortened to 300 characters), in_reply_to, thread and attachments (names only, not downloaded). The last line carries a `more` token to pass as `from` for older messages, when there are any. Keep the limit small and page when needed. Use it when something the person refers to has fallen out of your context. Fails with room_not_allowed when this session does not own the room."
     )]
-    async fn fetch_messages(&self, Parameters(p): Parameters<FetchMessagesParams>) -> Result<CallToolResult, McpError> {
-        let kind = CmdKind::FetchMessages(FetchMessages { room_id: p.room_id, limit: p.limit, from: p.from });
+    async fn fetch_messages(
+        &self,
+        Parameters(p): Parameters<FetchMessagesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind = CmdKind::FetchMessages(FetchMessages {
+            room_id: p.room_id,
+            limit: p.limit,
+            from: p.from,
+        });
         match self.daemon.command(kind).await {
             Ok(result) => {
                 let messages = result.messages.unwrap_or_default();
-                let mut lines: Vec<String> = messages.iter().map(|m| history_line(m, Some(HISTORY_TEXT_CHARS))).collect();
+                let mut lines: Vec<String> = messages
+                    .iter()
+                    .map(|m| history_line(m, Some(HISTORY_TEXT_CHARS)))
+                    .collect();
                 if lines.is_empty() {
                     lines.push("(no messages)".to_owned());
                 }
@@ -239,11 +310,15 @@ impl SiltaChannel {
                     Some(token) => lines.push(format!("more: {token}")),
                     None => lines.push("(start of the room's history)".to_owned()),
                 }
-                Ok(CallToolResult::success(vec![ContentBlock::text(lines.join("\n"))]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    lines.join("\n"),
+                )]))
             }
             Err(err) => {
                 warn!("fetch_messages failed: {err}");
-                Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]))
+                Ok(CallToolResult::error(vec![ContentBlock::text(
+                    err.to_string(),
+                )]))
             }
         }
     }
@@ -252,12 +327,23 @@ impl SiltaChannel {
         name = "search_messages",
         description = "Search a room's history with a regular expression, newest first: the message texts and attachment names, case-insensitive unless the pattern turns it off with (?-i). Use alternation, character classes and \\b freely, and escape literal punctuation. Returns up to `limit` matches (default 20, at most 100) as lines like fetch_messages, each text windowed around its first match, then a line saying how many events were scanned and back to when, and `more: <token>` when the scan stopped before the start of the room (pass it as `from` to continue; a call scans at most 1000 events). Fails with bad_request for an invalid pattern and room_not_allowed when this session does not own the room."
     )]
-    async fn search_messages(&self, Parameters(p): Parameters<SearchMessagesParams>) -> Result<CallToolResult, McpError> {
-        let kind = CmdKind::SearchMessages(SearchMessages { room_id: p.room_id, pattern: p.pattern, limit: p.limit, from: p.from });
+    async fn search_messages(
+        &self,
+        Parameters(p): Parameters<SearchMessagesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind = CmdKind::SearchMessages(SearchMessages {
+            room_id: p.room_id,
+            pattern: p.pattern,
+            limit: p.limit,
+            from: p.from,
+        });
         match self.daemon.command(kind).await {
             Ok(result) => {
                 let messages = result.messages.unwrap_or_default();
-                let mut lines: Vec<String> = messages.iter().map(|m| history_line(m, Some(HISTORY_TEXT_CHARS))).collect();
+                let mut lines: Vec<String> = messages
+                    .iter()
+                    .map(|m| history_line(m, Some(HISTORY_TEXT_CHARS)))
+                    .collect();
                 if lines.is_empty() {
                     lines.push("(no matches)".to_owned());
                 }
@@ -268,13 +354,19 @@ impl SiltaChannel {
                 ));
                 match result.more {
                     Some(token) => lines.push(format!("more: {token}")),
-                    None => lines.push("(searched back to the start of the room's history)".to_owned()),
+                    None => {
+                        lines.push("(searched back to the start of the room's history)".to_owned())
+                    }
                 }
-                Ok(CallToolResult::success(vec![ContentBlock::text(lines.join("\n"))]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    lines.join("\n"),
+                )]))
             }
             Err(err) => {
                 warn!("search_messages failed: {err}");
-                Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]))
+                Ok(CallToolResult::error(vec![ContentBlock::text(
+                    err.to_string(),
+                )]))
             }
         }
     }
@@ -283,16 +375,29 @@ impl SiltaChannel {
         name = "fetch_message",
         description = "Fetch one message whole by its event id (from a fetch_messages line or a channel tag): the same fields as fetch_messages, with the full text. Use it after fetch_messages when you need the whole text of a shortened message. Fails with not_found when the event does not exist or is not a message from a registered person or yourself, and with room_not_allowed when this session does not own the room."
     )]
-    async fn fetch_message(&self, Parameters(p): Parameters<FetchMessageParams>) -> Result<CallToolResult, McpError> {
-        let kind = CmdKind::FetchMessage(FetchMessage { room_id: p.room_id, event_id: p.event_id });
+    async fn fetch_message(
+        &self,
+        Parameters(p): Parameters<FetchMessageParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind = CmdKind::FetchMessage(FetchMessage {
+            room_id: p.room_id,
+            event_id: p.event_id,
+        });
         match self.daemon.command(kind).await {
             Ok(result) => {
-                let line = result.messages.unwrap_or_default().first().map(|m| history_line(m, None)).unwrap_or_default();
+                let line = result
+                    .messages
+                    .unwrap_or_default()
+                    .first()
+                    .map(|m| history_line(m, None))
+                    .unwrap_or_default();
                 Ok(CallToolResult::success(vec![ContentBlock::text(line)]))
             }
             Err(err) => {
                 warn!("fetch_message failed: {err}");
-                Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]))
+                Ok(CallToolResult::error(vec![ContentBlock::text(
+                    err.to_string(),
+                )]))
             }
         }
     }
@@ -303,12 +408,15 @@ impl SiltaChannel {
     async fn send(&self, kind: CmdKind) -> Result<CallToolResult, McpError> {
         let name = kind.name();
         match self.daemon.command(kind).await {
-            Ok(result) => {
-                Ok(CallToolResult::success(vec![ContentBlock::text(format!("sent: {}", result.event_id.unwrap_or_default()))]))
-            }
+            Ok(result) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "sent: {}",
+                result.event_id.unwrap_or_default()
+            ))])),
             Err(err) => {
                 warn!("{name} failed: {err}");
-                Ok(CallToolResult::error(vec![ContentBlock::text(err.to_string())]))
+                Ok(CallToolResult::error(vec![ContentBlock::text(
+                    err.to_string(),
+                )]))
             }
         }
     }
@@ -338,7 +446,10 @@ fn history_line(m: &HistoryMessage, max_chars: Option<usize>) -> String {
     let chars = m.text.chars().count();
     if let Some(max) = max_chars.filter(|&max| chars > max) {
         // A window around the first match when there is one, the start otherwise.
-        let start = m.match_start.map(|at| at.saturating_sub(max / 3).min(chars - max)).unwrap_or(0);
+        let start = m
+            .match_start
+            .map(|at| at.saturating_sub(max / 3).min(chars - max))
+            .unwrap_or(0);
         let window: String = m.text.chars().skip(start).take(max).collect();
         let after = chars - start - max;
         let mut text = String::new();
@@ -354,7 +465,11 @@ fn history_line(m: &HistoryMessage, max_chars: Option<usize>) -> String {
         line.insert("text".into(), json!(m.text));
     }
     if !m.attachments.is_empty() {
-        let names: Vec<String> = m.attachments.iter().map(|a| format!("{} ({}, {} bytes)", a.name, a.mime, a.size)).collect();
+        let names: Vec<String> = m
+            .attachments
+            .iter()
+            .map(|a| format!("{} ({}, {} bytes)", a.name, a.mime, a.size))
+            .collect();
         line.insert("attachments".into(), json!(names));
     }
     serde_json::to_string(&line).unwrap_or_default()
@@ -391,16 +506,30 @@ fn channel_params(inbound: &Inbound) -> serde_json::Value {
         let n = i + 1;
         meta.insert(format!("attachment_{n}_name"), json!(attachment.name));
         meta.insert(format!("attachment_{n}_mime"), json!(attachment.mime));
-        meta.insert(format!("attachment_{n}_size"), json!(attachment.size.to_string()));
+        meta.insert(
+            format!("attachment_{n}_size"),
+            json!(attachment.size.to_string()),
+        );
         match inbound.paths.get(i).and_then(|p| p.as_ref()) {
             Some(path) => {
-                meta.insert(format!("attachment_{n}_path"), json!(path.to_string_lossy()));
+                meta.insert(
+                    format!("attachment_{n}_path"),
+                    json!(path.to_string_lossy()),
+                );
             }
-            None => missing.push(format!("[attachment \"{}\" was not received; ask for it again]", attachment.name)),
+            None => missing.push(format!(
+                "[attachment \"{}\" was not received; ask for it again]",
+                attachment.name
+            )),
         }
     }
     let mut content = if event.text.is_empty() && !event.attachments.is_empty() {
-        event.attachments.iter().map(|a| format!("[attachment: {}]", a.name)).collect::<Vec<_>>().join("\n")
+        event
+            .attachments
+            .iter()
+            .map(|a| format!("[attachment: {}]", a.name))
+            .collect::<Vec<_>>()
+            .join("\n")
     } else {
         event.text.clone()
     };
@@ -417,9 +546,15 @@ fn channel_params(inbound: &Inbound) -> serde_json::Value {
 impl ServerHandler for SiltaChannel {
     fn get_info(&self) -> ServerInfo {
         let mut capabilities = ServerCapabilities::builder().enable_tools().build();
-        capabilities.experimental = Some(BTreeMap::from([("claude/channel".to_owned(), JsonObject::new())]));
+        capabilities.experimental = Some(BTreeMap::from([(
+            "claude/channel".to_owned(),
+            JsonObject::new(),
+        )]));
         InitializeResult::new(capabilities)
-            .with_server_info(Implementation::new("silta-claude", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                "silta-claude",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(INSTRUCTIONS)
     }
@@ -441,10 +576,17 @@ impl ServerHandler for SiltaChannel {
         let daemon = self.daemon.clone();
         tokio::spawn(async move {
             while let Some(inbound) = events.recv().await {
-                let notification = CustomNotification::new(CHANNEL_NOTIFICATION, Some(channel_params(&inbound)));
-                match peer.send_notification(ServerNotification::CustomNotification(notification)).await {
+                let notification =
+                    CustomNotification::new(CHANNEL_NOTIFICATION, Some(channel_params(&inbound)));
+                match peer
+                    .send_notification(ServerNotification::CustomNotification(notification))
+                    .await
+                {
                     Ok(()) => {
-                        debug!(kind = inbound.event.kind.as_str(), "channel notification delivered");
+                        debug!(
+                            kind = inbound.event.kind.as_str(),
+                            "channel notification delivered"
+                        );
                         // Only now does the daemon count the event as delivered; until
                         // the acknowledgement it would come again.
                         daemon.ack(inbound.event.event_id).await;
@@ -459,7 +601,11 @@ impl ServerHandler for SiltaChannel {
         });
     }
 
-    async fn on_custom_notification(&self, notification: CustomNotification, _context: NotificationContext<RoleServer>) {
+    async fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        _context: NotificationContext<RoleServer>,
+    ) {
         // A later version handles notifications/claude/channel/permission_request here.
         info!(method = %notification.method, "ignoring custom notification");
     }
@@ -492,23 +638,43 @@ mod tests {
     #[test]
     fn attachments_become_numbered_attributes_and_a_body() {
         let mut e = event();
-        e.attachments.push(Attachment { transfer: "e-1".into(), name: "photo.jpg".into(), mime: "image/jpeg".into(), size: 1234 });
-        let inbound = Inbound { event: e.clone(), paths: vec![Some(PathBuf::from("/inbox/e-1-photo.jpg"))] };
+        e.attachments.push(Attachment {
+            transfer: "e-1".into(),
+            name: "photo.jpg".into(),
+            mime: "image/jpeg".into(),
+            size: 1234,
+        });
+        let inbound = Inbound {
+            event: e.clone(),
+            paths: vec![Some(PathBuf::from("/inbox/e-1-photo.jpg"))],
+        };
         let params = channel_params(&inbound);
         assert_eq!(params["content"], "[attachment: photo.jpg]");
         assert_eq!(params["meta"]["attachment_1_path"], "/inbox/e-1-photo.jpg");
         assert_eq!(params["meta"]["attachment_1_size"], "1234");
         assert!(params["meta"].get("kind").is_none());
         assert_eq!(params["meta"]["room"], "dm");
-        assert!(params["meta"].get("sender").is_none(), "the Matrix id must not reach the model");
+        assert!(
+            params["meta"].get("sender").is_none(),
+            "the Matrix id must not reach the model"
+        );
         e.text = "look at this".into();
-        let inbound = Inbound { event: e.clone(), paths: vec![Some(PathBuf::from("/inbox/e-1-photo.jpg"))] };
+        let inbound = Inbound {
+            event: e.clone(),
+            paths: vec![Some(PathBuf::from("/inbox/e-1-photo.jpg"))],
+        };
         assert_eq!(channel_params(&inbound)["content"], "look at this");
         // A transfer that never arrived: no path, and the text says so.
-        let inbound = Inbound { event: e, paths: vec![None] };
+        let inbound = Inbound {
+            event: e,
+            paths: vec![None],
+        };
         let params = channel_params(&inbound);
         assert!(params["meta"].get("attachment_1_path").is_none());
-        assert_eq!(params["content"], "look at this\n[attachment \"photo.jpg\" was not received; ask for it again]");
+        assert_eq!(
+            params["content"],
+            "look at this\n[attachment \"photo.jpg\" was not received; ask for it again]"
+        );
     }
 
     #[test]
@@ -525,7 +691,11 @@ mod tests {
             thread: Some("$root".into()),
             text: "ж".repeat(1000),
             match_start: None,
-            attachments: vec![HistoryAttachment { name: "a.pdf".into(), mime: "application/pdf".into(), size: 10 }],
+            attachments: vec![HistoryAttachment {
+                name: "a.pdf".into(),
+                mime: "application/pdf".into(),
+                size: 10,
+            }],
         };
         let whole: serde_json::Value = serde_json::from_str(&history_line(&long, None)).unwrap();
         assert_eq!(whole["text"].as_str().unwrap().chars().count(), 1000);
@@ -533,8 +703,14 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["own"], true);
         assert!(v.get("person").is_none() && v.get("sender").is_none());
-        assert!(v["text"].as_str().unwrap().ends_with("… [700 more characters]"));
-        assert_eq!(v["text"].as_str().unwrap().chars().count(), 300 + "… [700 more characters]".chars().count());
+        assert!(v["text"]
+            .as_str()
+            .unwrap()
+            .ends_with("… [700 more characters]"));
+        assert_eq!(
+            v["text"].as_str().unwrap().chars().count(),
+            300 + "… [700 more characters]".chars().count()
+        );
         assert_eq!(v["attachments"][0], "a.pdf (application/pdf, 10 bytes)");
         assert_eq!(v["thread"], "$root");
     }
@@ -563,7 +739,12 @@ mod tests {
         m.match_start = Some(2000);
         let v: serde_json::Value = serde_json::from_str(&history_line(&m, Some(300))).unwrap();
         let text = v["text"].as_str().unwrap();
-        assert!(text.starts_with("[1706 characters] …") && text.ends_with('b') && !text.contains("more characters"), "{text}");
+        assert!(
+            text.starts_with("[1706 characters] …")
+                && text.ends_with('b')
+                && !text.contains("more characters"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -572,7 +753,10 @@ mod tests {
         e.kind = EventKind::Reaction;
         e.reacts_to = Some("$bot".into());
         e.text = "👍".into();
-        let params = channel_params(&Inbound { event: e, paths: Vec::new() });
+        let params = channel_params(&Inbound {
+            event: e,
+            paths: Vec::new(),
+        });
         assert_eq!(params["meta"]["kind"], "reaction");
         assert_eq!(params["meta"]["reacts_to"], "$bot");
         assert_eq!(params["content"], "👍");
@@ -580,7 +764,10 @@ mod tests {
         let mut e = event();
         e.thread = Some("$root".into());
         e.in_reply_to = Some("$q".into());
-        let params = channel_params(&Inbound { event: e, paths: Vec::new() });
+        let params = channel_params(&Inbound {
+            event: e,
+            paths: Vec::new(),
+        });
         assert_eq!(params["meta"]["thread"], "$root");
         assert_eq!(params["meta"]["in_reply_to"], "$q");
     }

@@ -32,13 +32,18 @@ pub struct Spool {
 
 impl Spool {
     pub fn new(state_dir: &Path, max_bytes: u64) -> Spool {
-        Spool { inbox: state_dir.join("inbox"), outbox: state_dir.join("outbox"), max_bytes }
+        Spool {
+            inbox: state_dir.join("inbox"),
+            outbox: state_dir.join("outbox"),
+            max_bytes,
+        }
     }
 
     /// Create both directories, readable by the daemon's user only.
     pub fn prepare(&self) -> anyhow::Result<()> {
         for dir in [&self.inbox, &self.outbox] {
-            std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("cannot create {}", dir.display()))?;
             std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
         }
         Ok(())
@@ -58,9 +63,21 @@ pub enum DownloadError {
 
 /// Download (and decrypt) an attachment into `path`, mode 0600. The content is
 /// checked against `max_bytes` before anything is written.
-pub async fn download(client: &Client, source: MediaSource, path: &Path, max_bytes: u64) -> Result<u64, DownloadError> {
-    let request = MediaRequestParameters { source, format: MediaFormat::File };
-    let data = client.media().get_media_content(&request, false).await.map_err(|e| DownloadError::Failed(e.into()))?;
+pub async fn download(
+    client: &Client,
+    source: MediaSource,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<u64, DownloadError> {
+    let request = MediaRequestParameters {
+        source,
+        format: MediaFormat::File,
+    };
+    let data = client
+        .media()
+        .get_media_content(&request, false)
+        .await
+        .map_err(|e| DownloadError::Failed(e.into()))?;
     let len = data.len() as u64;
     if len > max_bytes {
         return Err(DownloadError::TooLarge(len));
@@ -74,7 +91,9 @@ pub async fn download(client: &Client, source: MediaSource, path: &Path, max_byt
             .open(path)
             .await
             .with_context(|| format!("cannot create {}", path.display()))?;
-        file.write_all(&data).await.with_context(|| format!("cannot write {}", path.display()))?;
+        file.write_all(&data)
+            .await
+            .with_context(|| format!("cannot write {}", path.display()))?;
         file.flush().await?;
         anyhow::Ok(())
     };
@@ -89,7 +108,11 @@ pub fn spawn_sweeper(spool: Spool, cancel: CancellationToken) {
             for dir in [&spool.inbox, &spool.outbox] {
                 match sweep(dir, LEFTOVER_MAX_AGE).await {
                     Ok(0) => debug!("spool sweep of {}: nothing to remove", dir.display()),
-                    Ok(removed) => info!(removed, "spool sweep of {}: removed leftovers older than a day", dir.display()),
+                    Ok(removed) => info!(
+                        removed,
+                        "spool sweep of {}: removed leftovers older than a day",
+                        dir.display()
+                    ),
                     Err(err) => warn!("spool sweep of {} failed: {err:#}", dir.display()),
                 }
             }

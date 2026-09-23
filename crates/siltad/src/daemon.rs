@@ -41,7 +41,10 @@ const TYPING_POLL: Duration = Duration::from_secs(1);
 pub const MARKS_FILE: &str = "delivered.json";
 
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub struct Daemon {
@@ -96,7 +99,11 @@ impl Daemon {
         silence: mpsc::UnboundedSender<Silence>,
     ) -> Daemon {
         let replay_window_ms = settings.replay_window_secs.saturating_mul(1000);
-        let alerts = Watch::new(routing.session_names().map(str::to_owned), settings.alert_grace_secs, now_ms());
+        let alerts = Watch::new(
+            routing.session_names().map(str::to_owned),
+            settings.alert_grace_secs,
+            now_ms(),
+        );
         let hostname = nix::unistd::gethostname()
             .ok()
             .and_then(|h| h.into_string().ok())
@@ -138,10 +145,20 @@ impl Daemon {
             CmdKind::Reply(reply) => outbound::reply(self, session, cmd.id, reply).await,
             CmdKind::React(react) => outbound::react(self, session, cmd.id, react).await,
             CmdKind::Edit(edit) => outbound::edit(self, session, cmd.id, edit).await,
-            CmdKind::SendFile(_) => CmdResult::err(cmd.id, ResultError::BadRequest, "send_file is handled per connection"),
-            CmdKind::FetchMessages(fetch) => outbound::fetch_messages(self, session, cmd.id, fetch).await,
-            CmdKind::FetchMessage(fetch) => outbound::fetch_message(self, session, cmd.id, fetch).await,
-            CmdKind::SearchMessages(search) => outbound::search_messages(self, session, cmd.id, search).await,
+            CmdKind::SendFile(_) => CmdResult::err(
+                cmd.id,
+                ResultError::BadRequest,
+                "send_file is handled per connection",
+            ),
+            CmdKind::FetchMessages(fetch) => {
+                outbound::fetch_messages(self, session, cmd.id, fetch).await
+            }
+            CmdKind::FetchMessage(fetch) => {
+                outbound::fetch_message(self, session, cmd.id, fetch).await
+            }
+            CmdKind::SearchMessages(search) => {
+                outbound::search_messages(self, session, cmd.id, search).await
+            }
             CmdKind::Typing(typing) => outbound::typing(self, session, cmd.id, typing).await,
         }
     }
@@ -157,7 +174,12 @@ impl Daemon {
             Err(DeliverError::NotConnected) => {
                 let (waiting, evicted) = self.registry.enqueue(session, ts_ms, event, now_ms());
                 if evicted > 0 {
-                    warn!(dir = "in", session, evicted, "permanently lost incoming messages queued beyond the backlog limits");
+                    warn!(
+                        dir = "in",
+                        session,
+                        evicted,
+                        "permanently lost incoming messages queued beyond the backlog limits"
+                    );
                 }
                 let _ = room;
                 Dispatch::Queued(waiting)
@@ -171,12 +193,21 @@ impl Daemon {
     /// the message read. For a message the typing indicator then runs until the
     /// session's first visible action; a reaction expects no answer.
     pub fn acked(&self, session: &str, event: &Event, ts_ms: u64) {
-        self.marks.set(&event.room_id, Watermark { ts_ms, event_id: event.event_id.clone() });
+        self.marks.set(
+            &event.room_id,
+            Watermark {
+                ts_ms,
+                event_id: event.event_id.clone(),
+            },
+        );
         for attachment in &event.attachments {
             let _ = fs::remove_file(self.spool.inbox_path(&attachment.transfer));
         }
         debug!(dir = "in", session, event_id = %event.event_id, "the session acknowledged the event");
-        let Some(room) = RoomId::parse(&event.room_id).ok().and_then(|id| self.client.get_room(&id)) else {
+        let Some(room) = RoomId::parse(&event.room_id)
+            .ok()
+            .and_then(|id| self.client.get_room(&id))
+        else {
             debug!(dir = "out", room = %event.room_id, "no room object for the read marker");
             return;
         };
@@ -191,12 +222,17 @@ impl Daemon {
     /// when the answer comes back. Fire and forget: a failed receipt costs nothing.
     fn mark_read(&self, room: &Room, event_id: &str) {
         let Ok(event_id) = EventId::parse(event_id) else {
-            debug!(dir = "out", event_id, "cannot parse the event id for the read marker");
+            debug!(
+                dir = "out",
+                event_id, "cannot parse the event id for the read marker"
+            );
             return;
         };
         let room = room.clone();
         tokio::spawn(async move {
-            let receipts = Receipts::new().fully_read_marker(event_id.clone()).public_read_receipt(event_id);
+            let receipts = Receipts::new()
+                .fully_read_marker(event_id.clone())
+                .public_read_receipt(event_id);
             if let Err(err) = room.send_multiple_receipts(receipts).await {
                 debug!(dir = "out", room = %room.room_id(), "cannot move the room's read marker: {err}");
             }
@@ -226,7 +262,12 @@ impl Daemon {
         let watch = Arc::new(AtomicBool::new(watch));
         tasks.insert(
             room.room_id().to_owned(),
-            TypingTask { session: session.to_owned(), generation, cancel: cancel.clone(), watch: watch.clone() },
+            TypingTask {
+                session: session.to_owned(),
+                generation,
+                cancel: cancel.clone(),
+                watch: watch.clone(),
+            },
         );
         drop(tasks);
 
@@ -247,7 +288,11 @@ impl Daemon {
                 if started.elapsed() > TYPING_MAX {
                     debug!(room = %room.room_id(), "typing notice cap reached");
                     if watch.load(Ordering::Relaxed) {
-                        let _ = silence.send(Silence { session, room_id: room.room_id().to_string(), delivered_ms: started_ms });
+                        let _ = silence.send(Silence {
+                            session,
+                            room_id: room.room_id().to_string(),
+                            delivered_ms: started_ms,
+                        });
                     }
                     break;
                 }
@@ -272,8 +317,11 @@ impl Daemon {
     /// Stop every typing refresh started for a session (it disconnected).
     pub fn typing_stop_session(&self, session: &str) {
         let mut tasks = self.typing.lock().unwrap();
-        let rooms: Vec<OwnedRoomId> =
-            tasks.iter().filter(|(_, t)| t.session == session).map(|(r, _)| r.clone()).collect();
+        let rooms: Vec<OwnedRoomId> = tasks
+            .iter()
+            .filter(|(_, t)| t.session == session)
+            .map(|(r, _)| r.clone())
+            .collect();
         for room in rooms {
             if let Some(task) = tasks.remove(&room) {
                 task.cancel.cancel();
@@ -302,7 +350,11 @@ impl Marks {
         let map = match fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<HashMap<String, Watermark>>(&text) {
                 Ok(map) => {
-                    info!(rooms = map.len(), "delivery watermarks loaded from {}", path.display());
+                    info!(
+                        rooms = map.len(),
+                        "delivery watermarks loaded from {}",
+                        path.display()
+                    );
                     map
                 }
                 Err(err) => {
@@ -312,7 +364,10 @@ impl Marks {
             },
             Err(_) => HashMap::new(),
         };
-        Marks { path, map: Mutex::new(map) }
+        Marks {
+            path,
+            map: Mutex::new(map),
+        }
     }
 
     fn get(&self, room_id: &str) -> Option<Watermark> {
@@ -324,7 +379,10 @@ impl Marks {
     fn set(&self, room_id: &str, mark: Watermark) {
         let snapshot = {
             let mut map = self.map.lock().unwrap();
-            if map.get(room_id).is_some_and(|current| current.ts_ms > mark.ts_ms) {
+            if map
+                .get(room_id)
+                .is_some_and(|current| current.ts_ms > mark.ts_ms)
+            {
                 return;
             }
             map.insert(room_id.to_owned(), mark);
@@ -332,7 +390,10 @@ impl Marks {
         };
         let tmp = self.path.with_extension("json.tmp");
         if let Err(err) = fs::write(&tmp, snapshot).and_then(|_| fs::rename(&tmp, &self.path)) {
-            warn!("cannot persist delivery watermarks to {}: {err}", self.path.display());
+            warn!(
+                "cannot persist delivery watermarks to {}: {err}",
+                self.path.display()
+            );
         }
     }
 }
@@ -367,20 +428,39 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(max_age_ms: u64) -> Registry {
-        Registry { inner: Default::default(), backlogs: Default::default(), inflight: Default::default(), max_age_ms }
+        Registry {
+            inner: Default::default(),
+            backlogs: Default::default(),
+            inflight: Default::default(),
+            max_age_ms,
+        }
     }
 
     /// Claim a session for a connection: the sender the connection answers its own
     /// commands through, the queue its writer drains, and the claim. `None` if another
     /// connection holds the session.
-    pub fn claim(&self, session: &str) -> Option<(mpsc::Sender<DaemonMessage>, mpsc::Receiver<DaemonMessage>, Claim)> {
+    pub fn claim(
+        &self,
+        session: &str,
+    ) -> Option<(
+        mpsc::Sender<DaemonMessage>,
+        mpsc::Receiver<DaemonMessage>,
+        Claim,
+    )> {
         let mut map = self.inner.lock().unwrap();
         if map.contains_key(session) {
             return None;
         }
         let (tx, rx) = mpsc::channel(SESSION_QUEUE);
         map.insert(session.to_owned(), tx.clone());
-        Some((tx, rx, Claim { registry: self.clone(), session: session.to_owned() }))
+        Some((
+            tx,
+            rx,
+            Claim {
+                registry: self.clone(),
+                session: session.to_owned(),
+            },
+        ))
     }
 
     pub fn is_connected(&self, session: &str) -> bool {
@@ -411,7 +491,9 @@ impl Registry {
     /// many were evicted to make room.
     pub fn enqueue(&self, session: &str, ts_ms: u64, event: Event, now_ms: u64) -> (usize, usize) {
         let mut backlogs = self.backlogs.lock().unwrap();
-        let backlog = backlogs.entry(session.to_owned()).or_insert_with(|| Backlog::new(BACKLOG_MAX, self.max_age_ms));
+        let backlog = backlogs
+            .entry(session.to_owned())
+            .or_insert_with(|| Backlog::new(BACKLOG_MAX, self.max_age_ms));
         let evicted = backlog.push(ts_ms, event, now_ms);
         (backlog.len(), evicted)
     }
@@ -424,7 +506,12 @@ impl Registry {
             None => (Vec::new(), 0),
         };
         if !items.is_empty() {
-            self.inflight.lock().unwrap().entry(session.to_owned()).or_default().extend(items.iter().cloned());
+            self.inflight
+                .lock()
+                .unwrap()
+                .entry(session.to_owned())
+                .or_default()
+                .extend(items.iter().cloned());
         }
         (items, evicted)
     }
@@ -433,7 +520,9 @@ impl Registry {
     pub fn ack(&self, session: &str, event_id: &str) -> Option<(u64, Event)> {
         let mut inflight = self.inflight.lock().unwrap();
         let list = inflight.get_mut(session)?;
-        let at = list.iter().position(|(_, event)| event.event_id == event_id)?;
+        let at = list
+            .iter()
+            .position(|(_, event)| event.event_id == event_id)?;
         Some(list.remove(at))
     }
 
@@ -441,13 +530,20 @@ impl Registry {
     /// backlog for the next one. Returns how many went back and how many of those were
     /// evicted.
     fn restore(&self, session: &str, now_ms: u64) -> (usize, usize) {
-        let items = self.inflight.lock().unwrap().remove(session).unwrap_or_default();
+        let items = self
+            .inflight
+            .lock()
+            .unwrap()
+            .remove(session)
+            .unwrap_or_default();
         if items.is_empty() {
             return (0, 0);
         }
         let count = items.len();
         let mut backlogs = self.backlogs.lock().unwrap();
-        let backlog = backlogs.entry(session.to_owned()).or_insert_with(|| Backlog::new(BACKLOG_MAX, self.max_age_ms));
+        let backlog = backlogs
+            .entry(session.to_owned())
+            .or_insert_with(|| Backlog::new(BACKLOG_MAX, self.max_age_ms));
         (count, backlog.restore(items, now_ms))
     }
 }

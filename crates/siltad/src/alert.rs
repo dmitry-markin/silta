@@ -32,7 +32,11 @@ const TICK: Duration = Duration::from_secs(30);
 
 /// Send the away alerts as they come due, and the silent ones as the typing tasks
 /// report them.
-pub fn spawn_watcher(daemon: Shared, mut silence: mpsc::UnboundedReceiver<Silence>, cancel: CancellationToken) {
+pub fn spawn_watcher(
+    daemon: Shared,
+    mut silence: mpsc::UnboundedReceiver<Silence>,
+    cancel: CancellationToken,
+) {
     if !daemon.alerts.lock().unwrap().enabled() {
         info!("owner alerts are off (alert_grace_secs = 0)");
         return;
@@ -76,12 +80,16 @@ pub async fn send(daemon: &Daemon, alert: Alert) {
 /// with the owner role, and at least one; the first found.
 async fn owner_dm(daemon: &Daemon) -> Option<Room> {
     for room in daemon.client.joined_rooms() {
-        let Ok(members) = member_ids(&room).await else { continue };
+        let Ok(members) = member_ids(&room).await else {
+            continue;
+        };
         let mut owner: Option<&str> = None;
         let mut only_owner = true;
         for member in members.iter().filter(|m| !daemon.routing.is_bot(m)) {
             match daemon.routing.person_for(member) {
-                Some(person) if person.role == Role::Owner && owner.is_none_or(|o| o == person.name) => {
+                Some(person)
+                    if person.role == Role::Owner && owner.is_none_or(|o| o == person.name) =>
+                {
                     owner = Some(&person.name);
                 }
                 _ => {
@@ -139,13 +147,37 @@ mod tests {
     #[test]
     fn wording_names_the_unit_the_host_and_the_times() {
         let t0 = 1_788_631_331_000; // 2026-09-05T18:02:11Z
-        let away = message(&Alert::Away { session: "alice".into(), since_ms: t0 }, "myhost", t0 + 25 * 60_000);
+        let away = message(
+            &Alert::Away {
+                session: "alice".into(),
+                since_ms: t0,
+            },
+            "myhost",
+            t0 + 25 * 60_000,
+        );
         assert!(away.starts_with("⚠ Silta: session \"alice\" has been disconnected for 25 min (since 2026-09-05T18:02:11Z)"));
         assert!(away.contains("journalctl -u silta-session@alice\" on myhost"));
-        let back = message(&Alert::Back { session: "hub".into(), away_ms: 90 * 60_000 }, "myhost", t0);
-        assert_eq!(back, "Silta: session \"hub\" is connected again after 1 h 30 min.");
-        let silent =
-            message(&Alert::Silent { session: "alice".into(), room_id: "!r".into(), delivered_ms: t0 }, "myhost", t0 + 600_000);
+        let back = message(
+            &Alert::Back {
+                session: "hub".into(),
+                away_ms: 90 * 60_000,
+            },
+            "myhost",
+            t0,
+        );
+        assert_eq!(
+            back,
+            "Silta: session \"hub\" is connected again after 1 h 30 min."
+        );
+        let silent = message(
+            &Alert::Silent {
+                session: "alice".into(),
+                room_id: "!r".into(),
+                delivered_ms: t0,
+            },
+            "myhost",
+            t0 + 600_000,
+        );
         assert!(silent.contains("received a message at 2026-09-05T18:02:11Z and has shown no reply, reaction or typing for 10 min"));
         assert_eq!(minutes(2 * 3_600_000), "2 h");
     }

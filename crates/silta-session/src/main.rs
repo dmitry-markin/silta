@@ -26,11 +26,19 @@ struct Args {
     persona: PathBuf,
 
     /// Claude Code; a versions/<n> path pins one.
-    #[arg(long, env = "CLAUDE_BIN", default_value = "/opt/claude/.local/bin/claude")]
+    #[arg(
+        long,
+        env = "CLAUDE_BIN",
+        default_value = "/opt/claude/.local/bin/claude"
+    )]
     claude_bin: PathBuf,
 
     /// The channel plugin's binary, for the plugin's .mcp.json.
-    #[arg(long, env = "SILTA_CLAUDE_BIN", default_value = "/usr/bin/silta-claude")]
+    #[arg(
+        long,
+        env = "SILTA_CLAUDE_BIN",
+        default_value = "/usr/bin/silta-claude"
+    )]
     plugin_bin: PathBuf,
 
     /// The daemon's socket, for the plugin.
@@ -112,7 +120,10 @@ fn main() -> ExitCode {
     let auth = match auth {
         Ok(auth) => auth,
         Err(err) => {
-            eprintln!("cannot authenticate: {err} (see /etc/silta/auth/{})", args.session);
+            eprintln!(
+                "cannot authenticate: {err} (see /etc/silta/auth/{})",
+                args.session
+            );
             return ExitCode::from(78);
         }
     };

@@ -92,7 +92,13 @@ fn split_chars(line: &str, max_bytes: usize) -> Vec<String> {
     out
 }
 
-fn append(chunks: &mut Vec<String>, current: &mut String, piece: &str, sep: &str, max_bytes: usize) {
+fn append(
+    chunks: &mut Vec<String>,
+    current: &mut String,
+    piece: &str,
+    sep: &str,
+    max_bytes: usize,
+) {
     if current.is_empty() {
         current.push_str(piece);
     } else if current.len() + sep.len() + piece.len() <= max_bytes {

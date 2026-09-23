@@ -34,7 +34,8 @@ pub struct Credentials<'a> {
 /// Refuses to open a store that has no `session.json` next to it: the builder would
 /// happily open it, and a fresh login onto an old encryption store corrupts it.
 pub async fn build_client(homeserver_url: &str, state_dir: &Path) -> Result<Client> {
-    fs::create_dir_all(state_dir).with_context(|| format!("cannot create {}", state_dir.display()))?;
+    fs::create_dir_all(state_dir)
+        .with_context(|| format!("cannot create {}", state_dir.display()))?;
     fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
     let session_file = state_dir.join(SESSION_FILE);
     let store_dir = state_dir.join(STORE_DIR);
@@ -70,15 +71,19 @@ pub async fn build_client(homeserver_url: &str, state_dir: &Path) -> Result<Clie
 
 /// Restore `state_dir/session.json` if it exists, otherwise log in once with the fixed
 /// device id and save the session. Refuses a login onto an existing store.
-pub async fn login_or_restore(client: &Client, state_dir: &Path, creds: &Credentials<'_>) -> Result<()> {
+pub async fn login_or_restore(
+    client: &Client,
+    state_dir: &Path,
+    creds: &Credentials<'_>,
+) -> Result<()> {
     let session_file = state_dir.join(SESSION_FILE);
     let store_dir = state_dir.join(STORE_DIR);
 
     if session_file.exists() {
         let text = fs::read_to_string(&session_file)
             .with_context(|| format!("cannot read {}", session_file.display()))?;
-        let session: MatrixSession =
-            serde_json::from_str(&text).with_context(|| format!("cannot parse {}", session_file.display()))?;
+        let session: MatrixSession = serde_json::from_str(&text)
+            .with_context(|| format!("cannot parse {}", session_file.display()))?;
         if session.meta.user_id != creds.user_id {
             bail!(
                 "{} belongs to {} but the configuration says {}; delete {} and {} together to log in again",
@@ -95,7 +100,10 @@ pub async fn login_or_restore(client: &Client, state_dir: &Path, creds: &Credent
                 session.meta.device_id, creds.device_id
             );
         }
-        client.restore_session(session).await.context("cannot restore the saved session")?;
+        client
+            .restore_session(session)
+            .await
+            .context("cannot restore the saved session")?;
         // Confirm the token when the server is reachable. Only a rejected token is
         // fatal; an unreachable server is left to the sync loop's retries.
         match client.whoami().await {
@@ -114,7 +122,11 @@ pub async fn login_or_restore(client: &Client, state_dir: &Path, creds: &Credent
     // created the (then empty) store.
     let _ = store_dir;
 
-    info!(user = creds.user_id, device = creds.device_id, "no saved session, logging in");
+    info!(
+        user = creds.user_id,
+        device = creds.device_id,
+        "no saved session, logging in"
+    );
     let response = client
         .matrix_auth()
         .login_username(creds.user_id, creds.password)
@@ -140,13 +152,19 @@ pub async fn login_or_restore(client: &Client, state_dir: &Path, creds: &Credent
         }
     }
 
-    client.encryption().wait_for_e2ee_initialization_tasks().await;
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
     match client.encryption().cross_signing_status().await {
         Some(status) if status.is_complete() => info!("cross-signing bootstrapped"),
         status => warn!("cross-signing is not complete ({status:?}); the device works unsigned"),
     }
 
-    let session = client.matrix_auth().session().context("no session after login")?;
+    let session = client
+        .matrix_auth()
+        .session()
+        .context("no session after login")?;
     write_private(&session_file, &serde_json::to_string_pretty(&session)?)?;
     info!(user = %session.meta.user_id, device = %session.meta.device_id, "logged in, session saved to {}", session_file.display());
     Ok(())
@@ -154,11 +172,16 @@ pub async fn login_or_restore(client: &Client, state_dir: &Path, creds: &Credent
 
 /// M_UNKNOWN_TOKEN or M_MISSING_TOKEN: the saved session is dead.
 pub fn is_token_error(err: &matrix_sdk::HttpError) -> bool {
-    matches!(err.client_api_error_kind(), Some(ErrorKind::UnknownToken { .. } | ErrorKind::MissingToken))
+    matches!(
+        err.client_api_error_kind(),
+        Some(ErrorKind::UnknownToken { .. } | ErrorKind::MissingToken)
+    )
 }
 
 fn store_has_data(store_dir: &Path) -> bool {
-    fs::read_dir(store_dir).map(|mut entries| entries.next().is_some()).unwrap_or(false)
+    fs::read_dir(store_dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
 }
 
 fn write_private(path: &Path, contents: &str) -> Result<()> {

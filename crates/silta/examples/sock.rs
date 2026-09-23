@@ -17,7 +17,9 @@ use tokio::{
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let (mode, path) = match args.as_slice() {
-        [_, mode, path] if mode == "listen" || mode == "connect" => (mode.as_str(), PathBuf::from(path)),
+        [_, mode, path] if mode == "listen" || mode == "connect" => {
+            (mode.as_str(), PathBuf::from(path))
+        }
         _ => {
             eprintln!("usage: sock listen <socket-path> | sock connect <socket-path>");
             return ExitCode::from(2);

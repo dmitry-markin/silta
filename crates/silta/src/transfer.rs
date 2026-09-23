@@ -35,7 +35,12 @@ pub enum Piece {
 
 /// Stream the file at `path` as a transfer. `header.size` is what the receiver checks
 /// the byte count against, so it must be the file's size.
-pub async fn send<W, M>(writer: &mut W, header: FileHeader, path: &Path, wrap: impl Fn(Piece) -> M) -> io::Result<()>
+pub async fn send<W, M>(
+    writer: &mut W,
+    header: FileHeader,
+    path: &Path,
+    wrap: impl Fn(Piece) -> M,
+) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
     M: Serialize,
@@ -49,7 +54,10 @@ where
         if n == 0 {
             break;
         }
-        let chunk = FileChunk { transfer: transfer.clone(), data: BASE64.encode(&buf[..n]) };
+        let chunk = FileChunk {
+            transfer: transfer.clone(),
+            data: BASE64.encode(&buf[..n]),
+        };
         write_line(writer, &wrap(Piece::Chunk(chunk))).await?;
     }
     write_line(writer, &wrap(Piece::End(FileEnd { transfer }))).await
@@ -76,7 +84,11 @@ pub enum TransferError {
     #[error("{name} is {size} bytes, over the {max} byte limit")]
     TooLarge { name: String, size: u64, max: u64 },
     #[error("transfer {transfer}: {received} bytes received for a declared size of {declared}")]
-    SizeMismatch { transfer: String, received: u64, declared: u64 },
+    SizeMismatch {
+        transfer: String,
+        received: u64,
+        declared: u64,
+    },
     #[error("transfer {0}: a chunk is not base64: {1}")]
     Base64(String, base64::DecodeError),
     #[error(transparent)]
@@ -109,7 +121,12 @@ struct Open {
 
 impl Receiver {
     pub fn new(dir: PathBuf, prefix: impl Into<String>, max_bytes: u64) -> Self {
-        Receiver { dir, prefix: prefix.into(), max_bytes, open: HashMap::new() }
+        Receiver {
+            dir,
+            prefix: prefix.into(),
+            max_bytes,
+            open: HashMap::new(),
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -118,7 +135,12 @@ impl Receiver {
 
     /// Where a transfer lands: deterministic, so the sender's name cannot choose it.
     pub fn path_for(&self, header: &FileHeader) -> PathBuf {
-        self.dir.join(format!("{}{}-{}", self.prefix, safe_id(&header.transfer), safe_name(&header.name, &header.mime)))
+        self.dir.join(format!(
+            "{}{}-{}",
+            self.prefix,
+            safe_id(&header.transfer),
+            safe_name(&header.name, &header.mime)
+        ))
     }
 
     pub async fn begin(&mut self, header: FileHeader) -> Result<(), TransferError> {
@@ -126,12 +148,30 @@ impl Receiver {
             return Err(TransferError::Duplicate(header.transfer));
         }
         if header.size > self.max_bytes {
-            return Err(TransferError::TooLarge { name: header.name, size: header.size, max: self.max_bytes });
+            return Err(TransferError::TooLarge {
+                name: header.name,
+                size: header.size,
+                max: self.max_bytes,
+            });
         }
         tokio::fs::create_dir_all(&self.dir).await?;
         let path = self.path_for(&header);
-        let file = tokio::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path).await?;
-        self.open.insert(header.transfer.clone(), Open { header, file, path, received: 0 });
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .await?;
+        self.open.insert(
+            header.transfer.clone(),
+            Open {
+                header,
+                file,
+                path,
+                received: 0,
+            },
+        );
         Ok(())
     }
 
@@ -152,7 +192,11 @@ impl Receiver {
         let declared = open.header.size;
         if received > declared {
             self.discard(&transfer).await;
-            return Err(TransferError::SizeMismatch { transfer, received, declared });
+            return Err(TransferError::SizeMismatch {
+                transfer,
+                received,
+                declared,
+            });
         }
         if let Err(err) = open.file.write_all(&bytes).await {
             self.discard(&transfer).await;
@@ -173,9 +217,16 @@ impl Receiver {
         drop(open.file);
         if open.received != open.header.size {
             let _ = tokio::fs::remove_file(&open.path).await;
-            return Err(TransferError::SizeMismatch { transfer: end.transfer, received: open.received, declared: open.header.size });
+            return Err(TransferError::SizeMismatch {
+                transfer: end.transfer,
+                received: open.received,
+                declared: open.header.size,
+            });
         }
-        Ok(Received { header: open.header, path: open.path })
+        Ok(Received {
+            header: open.header,
+            path: open.path,
+        })
     }
 
     /// Forget every transfer in progress and delete its partial file (the connection
@@ -199,7 +250,13 @@ impl Receiver {
 pub fn safe_id(id: &str) -> String {
     id.trim_start_matches('$')
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -210,14 +267,23 @@ pub fn safe_name(name: &str, mime: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
     let mut out: String = base
         .chars()
-        .map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':') { '_' } else { c })
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     out = out.trim().trim_start_matches('.').to_owned();
     while out.len() > NAME_MAX {
         out.pop();
     }
     if out.is_empty() {
-        let ext = mime_guess::get_mime_extensions_str(mime).and_then(|e| e.first()).map(|e| format!(".{e}")).unwrap_or_default();
+        let ext = mime_guess::get_mime_extensions_str(mime)
+            .and_then(|e| e.first())
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
         return format!("file{ext}");
     }
     out
@@ -240,7 +306,9 @@ pub fn human_size(bytes: u64) -> String {
 /// Delete the regular files in `dir` older than `max_age`. Returns how many were
 /// removed; a missing directory counts as empty.
 pub async fn sweep(dir: &Path, max_age: Duration) -> io::Result<usize> {
-    let cutoff = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
+    let cutoff = SystemTime::now()
+        .checked_sub(max_age)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let mut removed = 0;
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
@@ -249,7 +317,10 @@ pub async fn sweep(dir: &Path, max_age: Duration) -> io::Result<usize> {
     };
     while let Some(entry) = entries.next_entry().await? {
         let meta = entry.metadata().await?;
-        if meta.is_file() && meta.modified()? < cutoff && tokio::fs::remove_file(entry.path()).await.is_ok() {
+        if meta.is_file()
+            && meta.modified()? < cutoff
+            && tokio::fs::remove_file(entry.path()).await.is_ok()
+        {
             removed += 1;
         }
     }
@@ -294,26 +365,47 @@ mod tests {
     #[tokio::test]
     async fn round_trip_in_chunks() {
         let dir = temp_dir("roundtrip");
-        let content: Vec<u8> = (0..(2 * CHUNK_BYTES + 12345)).map(|i| (i % 251) as u8).collect();
+        let content: Vec<u8> = (0..(2 * CHUNK_BYTES + 12345))
+            .map(|i| (i % 251) as u8)
+            .collect();
         let source = dir.join("source.bin");
         std::fs::write(&source, &content).unwrap();
-        let header = FileHeader { transfer: "$ev:x-1".into(), name: "../photo.jpg".into(), mime: "image/jpeg".into(), size: content.len() as u64 };
+        let header = FileHeader {
+            transfer: "$ev:x-1".into(),
+            name: "../photo.jpg".into(),
+            mime: "image/jpeg".into(),
+            size: content.len() as u64,
+        };
 
         let mut lines = Vec::new();
         send(&mut lines, header, &source, wrap).await.unwrap();
-        assert_eq!(lines.iter().filter(|&&b| b == b'\n').count(), 5, "header, three chunks, end");
+        assert_eq!(
+            lines.iter().filter(|&&b| b == b'\n').count(),
+            5,
+            "header, three chunks, end"
+        );
 
         let mut receiver = Receiver::new(dir.join("inbox"), "", 100 * 1024 * 1024);
         let received = feed(&mut receiver, &lines).await.unwrap();
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].path, dir.join("inbox").join("ev_x-1-photo.jpg"));
         assert_eq!(std::fs::read(&received[0].path).unwrap(), content);
-        assert_eq!(std::fs::metadata(&received[0].path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&received[0].path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
 
         // The daemon prefixes its outbox files with the session name.
         let mut receiver = Receiver::new(dir.join("outbox"), "alice-", u64::MAX);
         let received = feed(&mut receiver, &lines).await.unwrap();
-        assert_eq!(received[0].path, dir.join("outbox").join("alice-ev_x-1-photo.jpg"));
+        assert_eq!(
+            received[0].path,
+            dir.join("outbox").join("alice-ev_x-1-photo.jpg")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -322,33 +414,89 @@ mod tests {
     async fn broken_transfers_leave_nothing_behind() {
         let dir = temp_dir("broken");
         let inbox = dir.join("inbox");
-        let header = |size: u64| FileHeader { transfer: "t1".into(), name: "a.bin".into(), mime: "application/octet-stream".into(), size };
+        let header = |size: u64| FileHeader {
+            transfer: "t1".into(),
+            name: "a.bin".into(),
+            mime: "application/octet-stream".into(),
+            size,
+        };
         let mut receiver = Receiver::new(inbox.clone(), "", 10);
 
-        assert!(matches!(receiver.begin(header(11)).await, Err(TransferError::TooLarge { max: 10, .. })));
-        assert!(matches!(receiver.chunk(FileChunk { transfer: "t1".into(), data: "AQ==".into() }).await, Err(TransferError::Unknown(_))));
+        assert!(matches!(
+            receiver.begin(header(11)).await,
+            Err(TransferError::TooLarge { max: 10, .. })
+        ));
+        assert!(matches!(
+            receiver
+                .chunk(FileChunk {
+                    transfer: "t1".into(),
+                    data: "AQ==".into()
+                })
+                .await,
+            Err(TransferError::Unknown(_))
+        ));
 
         // More bytes than declared: refused at the chunk, the file removed.
         receiver.begin(header(2)).await.unwrap();
         assert!(inbox.join("t1-a.bin").exists());
-        assert!(matches!(receiver.chunk(FileChunk { transfer: "t1".into(), data: "AQID".into() }).await, Err(TransferError::SizeMismatch { .. })));
+        assert!(matches!(
+            receiver
+                .chunk(FileChunk {
+                    transfer: "t1".into(),
+                    data: "AQID".into()
+                })
+                .await,
+            Err(TransferError::SizeMismatch { .. })
+        ));
         assert!(!inbox.join("t1-a.bin").exists());
 
         // Fewer bytes than declared: refused at the end.
         receiver.begin(header(3)).await.unwrap();
-        receiver.chunk(FileChunk { transfer: "t1".into(), data: "AQ==".into() }).await.unwrap();
-        assert!(matches!(receiver.end(FileEnd { transfer: "t1".into() }).await, Err(TransferError::SizeMismatch { received: 1, declared: 3, .. })));
+        receiver
+            .chunk(FileChunk {
+                transfer: "t1".into(),
+                data: "AQ==".into(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver
+                .end(FileEnd {
+                    transfer: "t1".into()
+                })
+                .await,
+            Err(TransferError::SizeMismatch {
+                received: 1,
+                declared: 3,
+                ..
+            })
+        ));
         assert!(!inbox.join("t1-a.bin").exists());
 
         // Not base64.
         receiver.begin(header(3)).await.unwrap();
-        assert!(matches!(receiver.chunk(FileChunk { transfer: "t1".into(), data: "!!".into() }).await, Err(TransferError::Base64(..))));
+        assert!(matches!(
+            receiver
+                .chunk(FileChunk {
+                    transfer: "t1".into(),
+                    data: "!!".into()
+                })
+                .await,
+            Err(TransferError::Base64(..))
+        ));
 
         // A connection that drops mid-transfer.
         receiver.begin(header(3)).await.unwrap();
         receiver.abort_all().await;
         assert!(!inbox.join("t1-a.bin").exists());
-        assert!(matches!(receiver.end(FileEnd { transfer: "t1".into() }).await, Err(TransferError::Unknown(_))));
+        assert!(matches!(
+            receiver
+                .end(FileEnd {
+                    transfer: "t1".into()
+                })
+                .await,
+            Err(TransferError::Unknown(_))
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -359,10 +507,18 @@ mod tests {
         std::fs::write(dir.join("old"), b"x").unwrap();
         std::fs::write(dir.join("new"), b"y").unwrap();
         let old = SystemTime::now() - Duration::from_secs(3 * 86_400);
-        std::fs::File::open(dir.join("old")).unwrap().set_modified(old).unwrap();
+        std::fs::File::open(dir.join("old"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         assert_eq!(sweep(&dir, Duration::from_secs(86_400)).await.unwrap(), 1);
         assert!(!dir.join("old").exists() && dir.join("new").exists());
-        assert_eq!(sweep(&dir.join("missing"), Duration::from_secs(1)).await.unwrap(), 0);
+        assert_eq!(
+            sweep(&dir.join("missing"), Duration::from_secs(1))
+                .await
+                .unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -370,7 +526,10 @@ mod tests {
     fn names_are_reduced_to_a_safe_basename() {
         assert_eq!(safe_name("photo.jpg", "image/jpeg"), "photo.jpg");
         assert_eq!(safe_name("../../etc/passwd", "text/plain"), "passwd");
-        assert_eq!(safe_name("C:\\Users\\x\\report.pdf", "application/pdf"), "report.pdf");
+        assert_eq!(
+            safe_name("C:\\Users\\x\\report.pdf", "application/pdf"),
+            "report.pdf"
+        );
         assert_eq!(safe_name(".hidden", "text/plain"), "hidden");
         assert_eq!(safe_name("a\u{0}b\nc", "text/plain"), "a_b_c");
         assert_eq!(safe_name("kesä kuva ö.png", "image/png"), "kesä kuva ö.png");

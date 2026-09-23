@@ -2,9 +2,8 @@
 target/
 
 # Claude Code local state
-.claude/settings.local.json
 **/.claude/settings.local.json
-CLAUDE.local.md
+**/CLAUDE.local.md
 
 # Dev session workspace: runtime files (inbox, out, notes, memory); only the plugin
 # enablement is tracked

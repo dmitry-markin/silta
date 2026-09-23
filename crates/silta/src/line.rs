@@ -33,7 +33,11 @@ impl<R: AsyncRead + Unpin> LineReader<R> {
     }
 
     pub fn with_max(reader: R, max: usize) -> Self {
-        LineReader { inner: BufReader::new(reader), buf: Vec::new(), max }
+        LineReader {
+            inner: BufReader::new(reader),
+            buf: Vec::new(),
+            max,
+        }
     }
 
     /// The next line without its terminator, `None` at EOF. A final unterminated line
@@ -116,7 +120,10 @@ mod tests {
     async fn rejects_over_long_lines() {
         let input = b"0123456789abcdef\nshort\n".as_slice();
         let mut r = LineReader::with_max(input, 8);
-        assert!(matches!(r.next_line().await, Err(LineError::TooLong { max: 8 })));
+        assert!(matches!(
+            r.next_line().await,
+            Err(LineError::TooLong { max: 8 })
+        ));
 
         // Exactly the cap is fine.
         let input = b"12345678\n".as_slice();
@@ -130,7 +137,11 @@ mod tests {
         let mut r = LineReader::new(server);
         client.write_all(b"hel").await.unwrap();
         // The first attempt reads "hel", then waits for more and is dropped by the timeout.
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), r.next_line()).await.is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), r.next_line())
+                .await
+                .is_err()
+        );
         client.write_all(b"lo\nnext\n").await.unwrap();
         assert_eq!(r.next_line().await.unwrap().as_deref(), Some("hello"));
         assert_eq!(r.next_line().await.unwrap().as_deref(), Some("next"));
@@ -139,7 +150,9 @@ mod tests {
     #[tokio::test]
     async fn json_roundtrip() {
         let mut out = Vec::new();
-        write_line(&mut out, &serde_json::json!({"a": "line\nbreak"})).await.unwrap();
+        write_line(&mut out, &serde_json::json!({"a": "line\nbreak"}))
+            .await
+            .unwrap();
         assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
         let mut r = LineReader::new(out.as_slice());
         let v: serde_json::Value = r.next_json().await.unwrap().unwrap();
@@ -147,6 +160,9 @@ mod tests {
         assert!(r.next_json::<serde_json::Value>().await.unwrap().is_none());
 
         let mut r = LineReader::new(b"not json\n".as_slice());
-        assert!(matches!(r.next_json::<serde_json::Value>().await, Err(LineError::Json(_))));
+        assert!(matches!(
+            r.next_json::<serde_json::Value>().await,
+            Err(LineError::Json(_))
+        ));
     }
 }

@@ -23,7 +23,11 @@ pub enum Next {
     /// says whether the before-handoff snapshot is still due (the cut came before the
     /// handoff line went out), `attempts` how many the rotation has spent, the cut
     /// included, and `handoff` whether one of them wrote the note.
-    Retry { snapshot: bool, attempts: u32, handoff: bool },
+    Retry {
+        snapshot: bool,
+        attempts: u32,
+        handoff: bool,
+    },
     /// Resume the saved session normally; the rotation stays pending after this many
     /// attempts (a failed handoff turn or compaction is the last of them), `handoff`
     /// as for `Retry`.
@@ -67,7 +71,9 @@ pub struct Paths {
 
 impl Paths {
     pub fn new(state: &Path) -> Self {
-        Self { state: state.to_path_buf() }
+        Self {
+            state: state.to_path_buf(),
+        }
     }
 
     pub fn workspace(&self) -> PathBuf {
@@ -98,7 +104,9 @@ impl Paths {
     /// The transcript of a session, if Claude Code has one under any project.
     pub fn transcript(&self, id: &str) -> Option<PathBuf> {
         let dirs = fs::read_dir(self.projects()).ok()?;
-        dirs.flatten().map(|d| d.path().join(format!("{id}.jsonl"))).find(|p| p.is_file())
+        dirs.flatten()
+            .map(|d| d.path().join(format!("{id}.jsonl")))
+            .find(|p| p.is_file())
     }
 
     pub fn read_id(&self) -> Option<String> {
@@ -179,7 +187,10 @@ impl Paths {
     pub fn watch_handoff(&self) -> HandoffWatch {
         HandoffWatch {
             since_secs: unix_millis() / 1000,
-            note_existed: self.memory_dirs().iter().any(|(_, m)| m.join(HANDOFF_NOTE).is_file()),
+            note_existed: self
+                .memory_dirs()
+                .iter()
+                .any(|(_, m)| m.join(HANDOFF_NOTE).is_file()),
         }
     }
 
@@ -211,14 +222,21 @@ impl Paths {
     /// files. Keeps the last `keep` rotations' worth, two snapshots each. Returns the
     /// count of memory files copied and whether the transcript was found.
     pub fn snapshot(&self, moment: &str, id: &str, keep: usize) -> io::Result<Snapshot> {
-        let target = self.backups().join(format!("{}-{moment}", silta::time::rfc3339_utc(unix_millis())));
+        let target = self.backups().join(format!(
+            "{}-{moment}",
+            silta::time::rfc3339_utc(unix_millis())
+        ));
         let mut memory_files = 0;
         for (slug, memory) in self.memory_dirs() {
             memory_files += copy_dir(&memory, &target.join(&slug).join("memory"))?;
         }
         let transcript = match self.transcript(id) {
             Some(path) => {
-                let slug = path.parent().and_then(Path::file_name).map(OsString::from).unwrap_or_default();
+                let slug = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .map(OsString::from)
+                    .unwrap_or_default();
                 let dir = target.join(slug);
                 fs::create_dir_all(&dir)?;
                 fs::copy(&path, dir.join(format!("{id}.jsonl")))?;
@@ -232,13 +250,24 @@ impl Paths {
         let mut old: Vec<PathBuf> = fs::read_dir(self.backups())?
             .flatten()
             .map(|d| d.path())
-            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with("-before-handoff") || n.ends_with("-after-handoff")))
+            .filter(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.ends_with("-before-handoff") || n.ends_with("-after-handoff")
+                })
+            })
             .collect();
         old.sort();
         for dir in old.iter().rev().skip(2 * keep) {
             let _ = fs::remove_dir_all(dir);
         }
-        Ok(Snapshot { name: target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), memory_files, transcript })
+        Ok(Snapshot {
+            name: target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            memory_files,
+            transcript,
+        })
     }
 
     /// Claude Code keeps one log file per start of an MCP server and never removes them.
@@ -249,7 +278,9 @@ impl Paths {
 }
 
 fn prune_older(dir: &Path, cutoff: SystemTime) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(meta) = entry.metadata() else { continue };
@@ -263,7 +294,9 @@ fn prune_older(dir: &Path, cutoff: SystemTime) {
 
 /// Whether any file below `dir` satisfies `pred`.
 fn any_file(dir: &Path, pred: &dyn Fn(&Path) -> bool) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else { return false };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
     entries.flatten().any(|entry| {
         let path = entry.path();
         if path.is_dir() {
@@ -297,7 +330,9 @@ fn write_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
 }
 
 pub fn unix_millis() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// A random version-4 UUID, as Claude Code expects for `--session-id`.
@@ -309,7 +344,14 @@ pub fn new_id() -> io::Result<String> {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
     let hex = hex.concat();
-    Ok(format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]))
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
 }
 
 #[cfg(test)]
@@ -317,7 +359,8 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("silta-session-state-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("silta-session-state-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -329,14 +372,47 @@ mod tests {
         let paths = Paths::new(&dir);
         assert_eq!(paths.read_next(), Next::Normal);
         paths.write_next(Next::Fresh { handoff: true }).unwrap();
-        assert_eq!(fs::read_to_string(dir.join("rotation.json")).unwrap(), "{\"next\":\"fresh\",\"handoff\":true}\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("rotation.json")).unwrap(),
+            "{\"next\":\"fresh\",\"handoff\":true}\n"
+        );
         assert_eq!(paths.read_next(), Next::Fresh { handoff: true });
-        paths.write_next(Next::Retry { snapshot: true, attempts: 1, handoff: false }).unwrap();
-        assert_eq!(fs::read_to_string(dir.join("rotation.json")).unwrap(), "{\"next\":\"retry\",\"snapshot\":true,\"attempts\":1,\"handoff\":false}\n");
-        assert_eq!(paths.read_next(), Next::Retry { snapshot: true, attempts: 1, handoff: false });
-        paths.write_next(Next::Postponed { attempts: 1, handoff: true }).unwrap();
-        assert_eq!(fs::read_to_string(dir.join("rotation.json")).unwrap(), "{\"next\":\"postponed\",\"attempts\":1,\"handoff\":true}\n");
-        assert_eq!(paths.read_next(), Next::Postponed { attempts: 1, handoff: true });
+        paths
+            .write_next(Next::Retry {
+                snapshot: true,
+                attempts: 1,
+                handoff: false,
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("rotation.json")).unwrap(),
+            "{\"next\":\"retry\",\"snapshot\":true,\"attempts\":1,\"handoff\":false}\n"
+        );
+        assert_eq!(
+            paths.read_next(),
+            Next::Retry {
+                snapshot: true,
+                attempts: 1,
+                handoff: false
+            }
+        );
+        paths
+            .write_next(Next::Postponed {
+                attempts: 1,
+                handoff: true,
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("rotation.json")).unwrap(),
+            "{\"next\":\"postponed\",\"attempts\":1,\"handoff\":true}\n"
+        );
+        assert_eq!(
+            paths.read_next(),
+            Next::Postponed {
+                attempts: 1,
+                handoff: true
+            }
+        );
         paths.write_next(Next::Normal).unwrap();
         assert!(!dir.join("rotation.json").exists());
         paths.write_next(Next::Normal).unwrap();
@@ -412,12 +488,22 @@ mod tests {
         fs::write(memory.join("MEMORY.md"), "index").unwrap();
         fs::write(memory.join("sub/note.md"), "note").unwrap();
         fs::write(project.join("s1.jsonl"), "{}\n").unwrap();
-        for name in ["2020-01-01T00:00:00Z-before-handoff", "2020-01-01T00:10:00Z-after-handoff", "2020-01-02T00:00:00Z-before-handoff", "2020-01-02T00:10:00Z-after-handoff", "memory-2020-01-03T00:00:00Z"] {
+        for name in [
+            "2020-01-01T00:00:00Z-before-handoff",
+            "2020-01-01T00:10:00Z-after-handoff",
+            "2020-01-02T00:00:00Z-before-handoff",
+            "2020-01-02T00:10:00Z-after-handoff",
+            "memory-2020-01-03T00:00:00Z",
+        ] {
             fs::create_dir_all(dir.join("backups").join(name)).unwrap();
         }
         let snap = paths.snapshot("after-handoff", "s1", 2).unwrap();
         assert_eq!((snap.memory_files, snap.transcript), (2, true));
-        let mut names: Vec<String> = fs::read_dir(dir.join("backups")).unwrap().flatten().map(|d| d.file_name().to_string_lossy().into_owned()).collect();
+        let mut names: Vec<String> = fs::read_dir(dir.join("backups"))
+            .unwrap()
+            .flatten()
+            .map(|d| d.file_name().to_string_lossy().into_owned())
+            .collect();
         names.sort();
         // Two rotations' worth (four) kept, the oldest two gone; a copy from before
         // the snapshots is not counted and not touched.
@@ -430,9 +516,18 @@ mod tests {
         assert_eq!(&names[2..4], &ours[..]);
         assert_eq!(names[4], "memory-2020-01-03T00:00:00Z");
         let latest = dir.join("backups").join(&snap.name);
-        assert_eq!(fs::read_to_string(latest.join("-w/memory/sub/note.md")).unwrap(), "note");
-        assert_eq!(fs::read_to_string(latest.join("-w/memory/MEMORY.md")).unwrap(), "index");
-        assert_eq!(fs::read_to_string(latest.join("-w/s1.jsonl")).unwrap(), "{}\n");
+        assert_eq!(
+            fs::read_to_string(latest.join("-w/memory/sub/note.md")).unwrap(),
+            "note"
+        );
+        assert_eq!(
+            fs::read_to_string(latest.join("-w/memory/MEMORY.md")).unwrap(),
+            "index"
+        );
+        assert_eq!(
+            fs::read_to_string(latest.join("-w/s1.jsonl")).unwrap(),
+            "{}\n"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

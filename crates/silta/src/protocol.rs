@@ -403,7 +403,17 @@ impl CmdResult {
 
     /// A command that produced no event (`typing`).
     pub fn done(id: u64) -> Self {
-        Self { id, ok: true, event_id: None, error: None, message: None, messages: None, more: None, scanned: None, until: None }
+        Self {
+            id,
+            ok: true,
+            event_id: None,
+            error: None,
+            message: None,
+            messages: None,
+            more: None,
+            scanned: None,
+            until: None,
+        }
     }
 
     pub fn history(id: u64, messages: Vec<HistoryMessage>, more: Option<String>) -> Self {
@@ -523,10 +533,16 @@ pub fn parse_client_line(line: &str) -> Result<Incoming, serde_json::Error> {
     match ClientMessage::deserialize(&value) {
         Ok(message) => Ok(Incoming::Message(message)),
         Err(err) => {
-            let cmd_id = value.get("cmd").and_then(|c| c.get("id")).and_then(Value::as_u64);
+            let cmd_id = value
+                .get("cmd")
+                .and_then(|c| c.get("id"))
+                .and_then(Value::as_u64);
             let message = if let Some(cmd) = value.get("cmd").and_then(Value::as_object) {
-                let names: Vec<&str> =
-                    cmd.keys().filter(|k| k.as_str() != "id").map(String::as_str).collect();
+                let names: Vec<&str> = cmd
+                    .keys()
+                    .filter(|k| k.as_str() != "id")
+                    .map(String::as_str)
+                    .collect();
                 format!("unsupported or malformed command {:?}: {err}", names)
             } else {
                 err.to_string()
@@ -554,19 +570,29 @@ mod tests {
 
     fn roundtrip_client(json: &str) -> ClientMessage {
         let msg: ClientMessage = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(serde_json::to_string(&msg).unwrap(), json, "serialization must match the pinned wire format");
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            json,
+            "serialization must match the pinned wire format"
+        );
         msg
     }
 
     fn roundtrip_daemon(json: &str) -> DaemonMessage {
         let msg: DaemonMessage = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(serde_json::to_string(&msg).unwrap(), json, "serialization must match the pinned wire format");
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            json,
+            "serialization must match the pinned wire format"
+        );
         msg
     }
 
     #[test]
     fn hello() {
-        let msg = roundtrip_client(r#"{"hello":{"protocol":4,"session":"hub","client":"silta-claude/0.1.0"}}"#);
+        let msg = roundtrip_client(
+            r#"{"hello":{"protocol":4,"session":"hub","client":"silta-claude/0.1.0"}}"#,
+        );
         assert_eq!(
             msg,
             ClientMessage::Hello(Hello {
@@ -582,18 +608,34 @@ mod tests {
         let msg = roundtrip_daemon(
             r#"{"welcome":{"protocol":4,"session":"hub","user_id":"@silta:silta.test","people":[{"name":"Bob","role":"owner"},{"name":"Alice","role":"family"}],"inbox_max_age_days":30}}"#,
         );
-        let DaemonMessage::Welcome(w) = msg else { panic!("not welcome") };
+        let DaemonMessage::Welcome(w) = msg else {
+            panic!("not welcome")
+        };
         assert_eq!(w.people[0].role, Role::Owner);
-        assert_eq!(w.people[1], Person { name: "Alice".into(), role: Role::Family });
+        assert_eq!(
+            w.people[1],
+            Person {
+                name: "Alice".into(),
+                role: Role::Family
+            }
+        );
         assert_eq!(w.inbox_max_age_days, 30);
     }
 
     #[test]
     fn handshake_errors() {
-        for code in ["protocol_mismatch", "unknown_session", "session_busy", "bad_request", "wrong_user"] {
+        for code in [
+            "protocol_mismatch",
+            "unknown_session",
+            "session_busy",
+            "bad_request",
+            "wrong_user",
+        ] {
             let json = format!(r#"{{"error":{{"code":"{code}","message":"..."}}}}"#);
             let msg = roundtrip_daemon(&json);
-            let DaemonMessage::Error(e) = msg else { panic!("not error") };
+            let DaemonMessage::Error(e) = msg else {
+                panic!("not error")
+            };
             assert_eq!(e.code.as_str(), code);
         }
     }
@@ -603,7 +645,9 @@ mod tests {
         let msg = roundtrip_daemon(
             r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","room":"dm","event_id":"$xyz","ts":"2026-09-05T18:02:11Z","text":"hello","transcribed":false,"attachments":[]}}"#,
         );
-        let DaemonMessage::Event(e) = msg else { panic!("not event") };
+        let DaemonMessage::Event(e) = msg else {
+            panic!("not event")
+        };
         assert_eq!(e.kind, EventKind::Message);
         assert_eq!(e.person, "Alice");
         assert!(e.attachments.is_empty());
@@ -612,7 +656,9 @@ mod tests {
     #[test]
     fn event_room_kind_is_mandatory() {
         let group = r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","room":"group","event_id":"$xyz","ts":"2026-09-05T18:02:11Z","text":"hello","transcribed":false,"attachments":[]}}"#;
-        let DaemonMessage::Event(e) = roundtrip_daemon(group) else { panic!("not event") };
+        let DaemonMessage::Event(e) = roundtrip_daemon(group) else {
+            panic!("not event")
+        };
         assert_eq!(e.room, RoomKind::Group);
         assert_eq!(e.room.as_str(), "group");
         // A protocol 3 event without the kind does not parse.
@@ -624,7 +670,9 @@ mod tests {
     fn event_with_in_reply_to() {
         let json = r#"{"event":{"kind":"message","person":"Bob","role":"owner","sender":"@bob:silta.test","room_id":"!abc:silta.test","room":"dm","event_id":"$q","ts":"2026-09-06T03:00:00Z","in_reply_to":"$xyz","text":"yes, that one","transcribed":false,"attachments":[]}}"#;
         let msg = roundtrip_daemon(json);
-        let DaemonMessage::Event(e) = msg else { panic!("not event") };
+        let DaemonMessage::Event(e) = msg else {
+            panic!("not event")
+        };
         assert_eq!(e.in_reply_to.as_deref(), Some("$xyz"));
     }
 
@@ -632,7 +680,9 @@ mod tests {
     fn event_with_attachments() {
         let json = r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","room":"dm","event_id":"$xyz","ts":"2026-09-05T18:02:11Z","text":"","transcribed":true,"attachments":[{"transfer":"xyz-1","name":"a.ogg","mime":"audio/ogg","size":12}]}}"#;
         let msg = roundtrip_daemon(json);
-        let DaemonMessage::Event(e) = msg else { panic!("not event") };
+        let DaemonMessage::Event(e) = msg else {
+            panic!("not event")
+        };
         assert_eq!(e.attachments[0].size, 12);
         assert_eq!(e.attachments[0].transfer, "xyz-1");
     }
@@ -640,12 +690,16 @@ mod tests {
     #[test]
     fn thread_and_reaction_events() {
         let json = r#"{"event":{"kind":"message","person":"Alice","role":"family","sender":"@alice:silta.test","room_id":"!abc:silta.test","room":"dm","event_id":"$t2","ts":"2026-09-06T10:00:00Z","thread":"$root","text":"in the thread","transcribed":false,"attachments":[]}}"#;
-        let DaemonMessage::Event(e) = roundtrip_daemon(json) else { panic!("not event") };
+        let DaemonMessage::Event(e) = roundtrip_daemon(json) else {
+            panic!("not event")
+        };
         assert_eq!(e.thread.as_deref(), Some("$root"));
         assert_eq!(e.in_reply_to, None);
 
         let json = r#"{"event":{"kind":"reaction","person":"Bob","role":"owner","sender":"@bob:silta.test","room_id":"!abc:silta.test","room":"dm","event_id":"$r","ts":"2026-09-06T10:00:01Z","reacts_to":"$bot","text":"👍","transcribed":false,"attachments":[]}}"#;
-        let DaemonMessage::Event(e) = roundtrip_daemon(json) else { panic!("not event") };
+        let DaemonMessage::Event(e) = roundtrip_daemon(json) else {
+            panic!("not event")
+        };
         assert_eq!(e.kind, EventKind::Reaction);
         assert_eq!(e.kind.as_str(), "reaction");
         assert_eq!(e.reacts_to.as_deref(), Some("$bot"));
@@ -657,79 +711,170 @@ mod tests {
         let msg = roundtrip_client(
             r#"{"cmd":{"id":7,"reply":{"room_id":"!abc:silta.test","text":"**hi**","reply_to":"$xyz"}}}"#,
         );
-        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        let ClientMessage::Cmd(cmd) = msg else {
+            panic!("not cmd")
+        };
         assert_eq!(cmd.id, 7);
-        let CmdKind::Reply(r) = cmd.kind else { panic!("not reply") };
+        let CmdKind::Reply(r) = cmd.kind else {
+            panic!("not reply")
+        };
         assert_eq!(r.reply_to.as_deref(), Some("$xyz"));
 
-        let msg = roundtrip_client(r#"{"cmd":{"id":8,"reply":{"room_id":"!abc:silta.test","text":"plain"}}}"#);
-        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
-        let CmdKind::Reply(r) = cmd.kind else { panic!("not reply") };
+        let msg = roundtrip_client(
+            r#"{"cmd":{"id":8,"reply":{"room_id":"!abc:silta.test","text":"plain"}}}"#,
+        );
+        let ClientMessage::Cmd(cmd) = msg else {
+            panic!("not cmd")
+        };
+        let CmdKind::Reply(r) = cmd.kind else {
+            panic!("not reply")
+        };
         assert_eq!(r.reply_to, None);
 
-        let msg = roundtrip_client(r#"{"cmd":{"id":9,"reply":{"room_id":"!abc:silta.test","text":"t","thread":"$root"}}}"#);
-        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
-        let CmdKind::Reply(r) = cmd.kind else { panic!("not reply") };
+        let msg = roundtrip_client(
+            r#"{"cmd":{"id":9,"reply":{"room_id":"!abc:silta.test","text":"t","thread":"$root"}}}"#,
+        );
+        let ClientMessage::Cmd(cmd) = msg else {
+            panic!("not cmd")
+        };
+        let CmdKind::Reply(r) = cmd.kind else {
+            panic!("not reply")
+        };
         assert_eq!(r.thread.as_deref(), Some("$root"));
-        assert!(!r.more, "absent means false, so an older plugin's replies still parse");
+        assert!(
+            !r.more,
+            "absent means false, so an older plugin's replies still parse"
+        );
 
-        let msg = roundtrip_client(r#"{"cmd":{"id":10,"reply":{"room_id":"!abc:silta.test","text":"part 1","more":true}}}"#);
-        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
-        let CmdKind::Reply(r) = cmd.kind else { panic!("not reply") };
+        let msg = roundtrip_client(
+            r#"{"cmd":{"id":10,"reply":{"room_id":"!abc:silta.test","text":"part 1","more":true}}}"#,
+        );
+        let ClientMessage::Cmd(cmd) = msg else {
+            panic!("not cmd")
+        };
+        let CmdKind::Reply(r) = cmd.kind else {
+            panic!("not reply")
+        };
         assert!(r.more);
     }
 
     #[test]
     fn typing_command_and_result() {
         let msg = roundtrip_client(r#"{"cmd":{"id":11,"typing":{"room_id":"!r"}}}"#);
-        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        let ClientMessage::Cmd(cmd) = msg else {
+            panic!("not cmd")
+        };
         assert_eq!(cmd.kind.name(), "typing");
-        assert_eq!(roundtrip_daemon(r#"{"result":{"id":11,"ok":true}}"#), DaemonMessage::Result(CmdResult::done(11)));
+        assert_eq!(
+            roundtrip_daemon(r#"{"result":{"id":11,"ok":true}}"#),
+            DaemonMessage::Result(CmdResult::done(11))
+        );
         // `more` on the other sending commands, absent when false.
-        let msg = roundtrip_client(r#"{"cmd":{"id":12,"react":{"room_id":"!r","event_id":"$e","emoji":"👀","more":true}}}"#);
-        assert!(matches!(msg, ClientMessage::Cmd(Cmd { kind: CmdKind::React(React { more: true, .. }), .. })));
-        let msg = roundtrip_client(r#"{"cmd":{"id":13,"send_file":{"room_id":"!r","transfer":"t3","more":true}}}"#);
-        assert!(matches!(msg, ClientMessage::Cmd(Cmd { kind: CmdKind::SendFile(SendFile { more: true, .. }), .. })));
+        let msg = roundtrip_client(
+            r#"{"cmd":{"id":12,"react":{"room_id":"!r","event_id":"$e","emoji":"👀","more":true}}}"#,
+        );
+        assert!(matches!(
+            msg,
+            ClientMessage::Cmd(Cmd {
+                kind: CmdKind::React(React { more: true, .. }),
+                ..
+            })
+        ));
+        let msg = roundtrip_client(
+            r#"{"cmd":{"id":13,"send_file":{"room_id":"!r","transfer":"t3","more":true}}}"#,
+        );
+        assert!(matches!(
+            msg,
+            ClientMessage::Cmd(Cmd {
+                kind: CmdKind::SendFile(SendFile { more: true, .. }),
+                ..
+            })
+        ));
     }
 
     #[test]
     fn phase2_commands() {
-        let msg = roundtrip_client(r#"{"cmd":{"id":1,"react":{"room_id":"!r","event_id":"$e","emoji":"👀"}}}"#);
-        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        let msg = roundtrip_client(
+            r#"{"cmd":{"id":1,"react":{"room_id":"!r","event_id":"$e","emoji":"👀"}}}"#,
+        );
+        let ClientMessage::Cmd(cmd) = msg else {
+            panic!("not cmd")
+        };
         assert_eq!(cmd.kind.name(), "react");
-        let CmdKind::React(r) = cmd.kind else { panic!("not react") };
+        let CmdKind::React(r) = cmd.kind else {
+            panic!("not react")
+        };
         assert_eq!(r.emoji, "👀");
 
-        let msg = roundtrip_client(r#"{"cmd":{"id":2,"edit":{"room_id":"!r","event_id":"$own","text":"done"}}}"#);
-        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        let msg = roundtrip_client(
+            r#"{"cmd":{"id":2,"edit":{"room_id":"!r","event_id":"$own","text":"done"}}}"#,
+        );
+        let ClientMessage::Cmd(cmd) = msg else {
+            panic!("not cmd")
+        };
         assert_eq!(cmd.kind.name(), "edit");
 
         let msg = roundtrip_client(
             r#"{"cmd":{"id":3,"send_file":{"room_id":"!r","transfer":"t1","caption":"the report","reply_to":"$e","thread":"$root"}}}"#,
         );
-        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
-        let CmdKind::SendFile(f) = cmd.kind else { panic!("not send_file") };
+        let ClientMessage::Cmd(cmd) = msg else {
+            panic!("not cmd")
+        };
+        let CmdKind::SendFile(f) = cmd.kind else {
+            panic!("not send_file")
+        };
         assert_eq!(f.caption.as_deref(), Some("the report"));
-        let msg = roundtrip_client(r#"{"cmd":{"id":4,"send_file":{"room_id":"!r","transfer":"t2"}}}"#);
-        assert!(matches!(msg, ClientMessage::Cmd(Cmd { kind: CmdKind::SendFile(_), .. })));
+        let msg =
+            roundtrip_client(r#"{"cmd":{"id":4,"send_file":{"room_id":"!r","transfer":"t2"}}}"#);
+        assert!(matches!(
+            msg,
+            ClientMessage::Cmd(Cmd {
+                kind: CmdKind::SendFile(_),
+                ..
+            })
+        ));
 
-        let msg = roundtrip_client(r#"{"cmd":{"id":5,"fetch_messages":{"room_id":"!r","limit":20,"from":"t1"}}}"#);
-        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
-        let CmdKind::FetchMessages(f) = cmd.kind else { panic!("not fetch_messages") };
+        let msg = roundtrip_client(
+            r#"{"cmd":{"id":5,"fetch_messages":{"room_id":"!r","limit":20,"from":"t1"}}}"#,
+        );
+        let ClientMessage::Cmd(cmd) = msg else {
+            panic!("not cmd")
+        };
+        let CmdKind::FetchMessages(f) = cmd.kind else {
+            panic!("not fetch_messages")
+        };
         assert_eq!(f.limit, Some(20));
         let msg = roundtrip_client(r#"{"cmd":{"id":6,"fetch_messages":{"room_id":"!r"}}}"#);
-        assert!(matches!(msg, ClientMessage::Cmd(Cmd { kind: CmdKind::FetchMessages(_), .. })));
+        assert!(matches!(
+            msg,
+            ClientMessage::Cmd(Cmd {
+                kind: CmdKind::FetchMessages(_),
+                ..
+            })
+        ));
 
-        let msg = roundtrip_client(r#"{"cmd":{"id":7,"fetch_message":{"room_id":"!r","event_id":"$e"}}}"#);
-        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        let msg = roundtrip_client(
+            r#"{"cmd":{"id":7,"fetch_message":{"room_id":"!r","event_id":"$e"}}}"#,
+        );
+        let ClientMessage::Cmd(cmd) = msg else {
+            panic!("not cmd")
+        };
         assert_eq!(cmd.kind.name(), "fetch_message");
-        let CmdKind::FetchMessage(f) = cmd.kind else { panic!("not fetch_message") };
+        let CmdKind::FetchMessage(f) = cmd.kind else {
+            panic!("not fetch_message")
+        };
         assert_eq!(f.event_id, "$e");
 
-        let msg = roundtrip_client(r#"{"cmd":{"id":8,"search_messages":{"room_id":"!r","pattern":"code word is \\w+","limit":5,"from":"t9"}}}"#);
-        let ClientMessage::Cmd(cmd) = msg else { panic!("not cmd") };
+        let msg = roundtrip_client(
+            r#"{"cmd":{"id":8,"search_messages":{"room_id":"!r","pattern":"code word is \\w+","limit":5,"from":"t9"}}}"#,
+        );
+        let ClientMessage::Cmd(cmd) = msg else {
+            panic!("not cmd")
+        };
         assert_eq!(cmd.kind.name(), "search_messages");
-        let CmdKind::SearchMessages(s) = cmd.kind else { panic!("not search_messages") };
+        let CmdKind::SearchMessages(s) = cmd.kind else {
+            panic!("not search_messages")
+        };
         assert_eq!(s.pattern, r"code word is \w+");
         assert_eq!(s.limit, Some(5));
     }
@@ -737,10 +882,13 @@ mod tests {
     #[test]
     fn search_result() {
         let json = r#"{"result":{"id":8,"ok":true,"messages":[{"event_id":"$e","sender":"@alice:x","person":"Alice","role":"family","own":false,"ts":"t","text":"the code word is PELICAN","match_start":4,"attachments":[]}],"more":"t3","scanned":250,"until":"2026-09-01T00:00:00Z"}}"#;
-        let DaemonMessage::Result(r) = roundtrip_daemon(json) else { panic!("not result") };
+        let DaemonMessage::Result(r) = roundtrip_daemon(json) else {
+            panic!("not result")
+        };
         assert_eq!(r.messages.as_ref().unwrap()[0].match_start, Some(4));
         assert_eq!(r.scanned, Some(250));
-        let built = CmdResult::history(8, r.messages.clone().unwrap(), Some("t3".into())).with_scan(250, Some("2026-09-01T00:00:00Z".into()));
+        let built = CmdResult::history(8, r.messages.clone().unwrap(), Some("t3".into()))
+            .with_scan(250, Some("2026-09-01T00:00:00Z".into()));
         assert_eq!(built, r);
     }
 
@@ -761,9 +909,9 @@ mod tests {
             ))
         );
         for code in ["not_found", "file_error"] {
-            let DaemonMessage::Result(r) =
-                roundtrip_daemon(&format!(r#"{{"result":{{"id":1,"ok":false,"error":"{code}","message":"m"}}}}"#))
-            else {
+            let DaemonMessage::Result(r) = roundtrip_daemon(&format!(
+                r#"{{"result":{{"id":1,"ok":false,"error":"{code}","message":"m"}}}}"#
+            )) else {
                 panic!("not result")
             };
             assert_eq!(r.error.unwrap().as_str(), code);
@@ -771,15 +919,20 @@ mod tests {
 
         // A newer daemon's error code is tolerated.
         let msg: DaemonMessage =
-            serde_json::from_str(r#"{"result":{"id":9,"ok":false,"error":"quota","message":"m"}}"#).unwrap();
-        let DaemonMessage::Result(r) = msg else { panic!("not result") };
+            serde_json::from_str(r#"{"result":{"id":9,"ok":false,"error":"quota","message":"m"}}"#)
+                .unwrap();
+        let DaemonMessage::Result(r) = msg else {
+            panic!("not result")
+        };
         assert_eq!(r.error, Some(ResultError::Unknown));
     }
 
     #[test]
     fn history_result() {
         let json = r#"{"result":{"id":5,"ok":true,"messages":[{"event_id":"$e","sender":"@alice:x","person":"Alice","role":"family","own":false,"ts":"2026-09-06T10:00:00Z","in_reply_to":"$q","thread":"$root","text":"hi","attachments":[{"name":"a.pdf","mime":"application/pdf","size":10}]},{"event_id":"$b","sender":"@silta:x","own":true,"ts":"2026-09-06T09:59:00Z","text":"hello","attachments":[]}],"more":"t123"}}"#;
-        let DaemonMessage::Result(r) = roundtrip_daemon(json) else { panic!("not result") };
+        let DaemonMessage::Result(r) = roundtrip_daemon(json) else {
+            panic!("not result")
+        };
         let messages = r.messages.unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].attachments[0].size, 10);
@@ -787,7 +940,9 @@ mod tests {
         assert_eq!(r.more.as_deref(), Some("t123"));
 
         // The end of history: no token.
-        let DaemonMessage::Result(r) = roundtrip_daemon(r#"{"result":{"id":6,"ok":true,"messages":[]}}"#) else {
+        let DaemonMessage::Result(r) =
+            roundtrip_daemon(r#"{"result":{"id":6,"ok":true,"messages":[]}}"#)
+        else {
             panic!("not result")
         };
         assert_eq!(r, CmdResult::history(6, Vec::new(), None));
@@ -795,11 +950,14 @@ mod tests {
 
     #[test]
     fn classify_client_lines() {
-        let good = parse_client_line(r#"{"hello":{"protocol":4,"session":"hub","client":"x"}}"#).unwrap();
+        let good =
+            parse_client_line(r#"{"hello":{"protocol":4,"session":"hub","client":"x"}}"#).unwrap();
         assert!(matches!(good, Incoming::Message(ClientMessage::Hello(_))));
 
         // A reserved command with an id: bad_request.
-        let reserved = parse_client_line(r#"{"cmd":{"id":3,"permission_request":{"request_id":"abcde"}}}"#).unwrap();
+        let reserved =
+            parse_client_line(r#"{"cmd":{"id":3,"permission_request":{"request_id":"abcde"}}}"#)
+                .unwrap();
         match reserved {
             Incoming::BadRequest { id, message } => {
                 assert_eq!(id, 3);
@@ -809,7 +967,8 @@ mod tests {
         }
 
         // A reply missing a required field is also a bad request, not a disconnect.
-        let malformed = parse_client_line(r#"{"cmd":{"id":4,"reply":{"text":"no room"}}}"#).unwrap();
+        let malformed =
+            parse_client_line(r#"{"cmd":{"id":4,"reply":{"text":"no room"}}}"#).unwrap();
         assert!(matches!(malformed, Incoming::BadRequest { id: 4, .. }));
 
         // Unknown top-level key without a command id: ignored.
@@ -826,28 +985,56 @@ mod tests {
 
     #[test]
     fn file_transfer_lines() {
-        let header = r#"{"file":{"transfer":"abc-1","name":"photo.jpg","mime":"image/jpeg","size":3}}"#;
-        let DaemonMessage::File(h) = roundtrip_daemon(header) else { panic!("not file") };
+        let header =
+            r#"{"file":{"transfer":"abc-1","name":"photo.jpg","mime":"image/jpeg","size":3}}"#;
+        let DaemonMessage::File(h) = roundtrip_daemon(header) else {
+            panic!("not file")
+        };
         assert_eq!((h.transfer.as_str(), h.size), ("abc-1", 3));
-        let DaemonMessage::Chunk(c) = roundtrip_daemon(r#"{"chunk":{"transfer":"abc-1","data":"AQID"}}"#) else { panic!("not chunk") };
+        let DaemonMessage::Chunk(c) =
+            roundtrip_daemon(r#"{"chunk":{"transfer":"abc-1","data":"AQID"}}"#)
+        else {
+            panic!("not chunk")
+        };
         assert_eq!(c.data, "AQID");
-        assert!(matches!(roundtrip_daemon(r#"{"file_end":{"transfer":"abc-1"}}"#), DaemonMessage::FileEnd(_)));
+        assert!(matches!(
+            roundtrip_daemon(r#"{"file_end":{"transfer":"abc-1"}}"#),
+            DaemonMessage::FileEnd(_)
+        ));
         // The same three lines go the other way before a send_file command.
-        assert!(matches!(roundtrip_client(r#"{"file":{"transfer":"t1","name":"a.md","mime":"text/markdown","size":9}}"#), ClientMessage::File(_)));
-        assert!(matches!(roundtrip_client(r#"{"chunk":{"transfer":"t1","data":"AQID"}}"#), ClientMessage::Chunk(_)));
-        assert!(matches!(roundtrip_client(r#"{"file_end":{"transfer":"t1"}}"#), ClientMessage::FileEnd(_)));
+        assert!(matches!(
+            roundtrip_client(
+                r#"{"file":{"transfer":"t1","name":"a.md","mime":"text/markdown","size":9}}"#
+            ),
+            ClientMessage::File(_)
+        ));
+        assert!(matches!(
+            roundtrip_client(r#"{"chunk":{"transfer":"t1","data":"AQID"}}"#),
+            ClientMessage::Chunk(_)
+        ));
+        assert!(matches!(
+            roundtrip_client(r#"{"file_end":{"transfer":"t1"}}"#),
+            ClientMessage::FileEnd(_)
+        ));
     }
 
     #[test]
     fn ack_line() {
-        assert_eq!(roundtrip_client(r#"{"ack":{"event_id":"$e"}}"#), ClientMessage::Ack(Ack { event_id: "$e".into() }));
+        assert_eq!(
+            roundtrip_client(r#"{"ack":{"event_id":"$e"}}"#),
+            ClientMessage::Ack(Ack {
+                event_id: "$e".into()
+            })
+        );
     }
 
     #[test]
     fn extra_fields_are_tolerated() {
         // A newer plugin may add fields; the daemon must not disconnect over them.
-        let msg: ClientMessage =
-            serde_json::from_str(r#"{"hello":{"protocol":4,"session":"hub","client":"x","features":["a"]}}"#).unwrap();
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"hello":{"protocol":4,"session":"hub","client":"x","features":["a"]}}"#,
+        )
+        .unwrap();
         assert!(matches!(msg, ClientMessage::Hello(_)));
         let msg: DaemonMessage = serde_json::from_str(
             r#"{"event":{"kind":"message","person":"A","role":"owner","sender":"@a:x","room_id":"!r","room":"group","event_id":"$e","ts":"t","text":"x","transcribed":false,"attachments":[],"thread":"$t"}}"#,
