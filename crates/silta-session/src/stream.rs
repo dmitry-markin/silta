@@ -19,7 +19,10 @@ pub enum Event {
     /// `parent_tool_use_id`). `context_tokens` is the size of the prompt of the API call
     /// that produced it (input plus cache read plus cache creation); `None` on a
     /// main-line message means the usage is missing, which the contract check reports.
-    Assistant { subagent: bool, context_tokens: Option<u64> },
+    Assistant {
+        subagent: bool,
+        context_tokens: Option<u64>,
+    },
     /// A user message: a tool result, a timer wakeup, the compaction's own lines or a
     /// delivered message; a turn is in progress. `person` marks a delivery through the
     /// channel (the text starts with the `<channel` tag), the one kind that counts as
@@ -50,14 +53,38 @@ pub fn read(line: &str) -> (String, Event) {
     let kind = map.get("type").and_then(Value::as_str).unwrap_or("?");
     match kind {
         "system" => (system(&map), system_event(&map)),
-        "assistant" => (message("assistant", &map), Event::Assistant { subagent: subagent(&map), context_tokens: context_of(&map) }),
-        "user" => (message("user", &map), Event::User { person: person_of(&map) }),
+        "assistant" => (
+            message("assistant", &map),
+            Event::Assistant {
+                subagent: subagent(&map),
+                context_tokens: context_of(&map),
+            },
+        ),
+        "user" => (
+            message("user", &map),
+            Event::User {
+                person: person_of(&map),
+            },
+        ),
         "result" => {
-            let is_error = map.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-            (result(&map), Event::Result { is_error, person: channel_origin(&map) })
+            let is_error = map
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            (
+                result(&map),
+                Event::Result {
+                    is_error,
+                    person: channel_origin(&map),
+                },
+            )
         }
         "stream_event" => {
-            let event = map.get("event").and_then(|e| e.get("type")).and_then(Value::as_str).unwrap_or("?");
+            let event = map
+                .get("event")
+                .and_then(|e| e.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
             (format!("stream_event {event}"), Event::Other)
         }
         other => {
@@ -83,7 +110,11 @@ fn system_event(map: &Map<String, Value>) -> Event {
             version: str_of(map, "claude_code_version").to_owned(),
         },
         Some("compact_boundary") => Event::Compacted {
-            auto: map.get("compact_metadata").and_then(|m| m.get("trigger")).and_then(Value::as_str) == Some("auto"),
+            auto: map
+                .get("compact_metadata")
+                .and_then(|m| m.get("trigger"))
+                .and_then(Value::as_str)
+                == Some("auto"),
         },
         Some("status") => match map.get("compact_result").and_then(Value::as_str) {
             Some(result) if result != "success" => Event::CompactionFailed,
@@ -109,20 +140,24 @@ fn system_event(map: &Map<String, Value>) -> Event {
 /// The line's `origin` names the channel: Claude Code puts it on the replayed `user`
 /// line of a delivery and on the `result` of the turn the delivery started.
 fn channel_origin(map: &Map<String, Value>) -> bool {
-    map.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str) == Some("channel")
+    map.get("origin")
+        .and_then(|o| o.get("kind"))
+        .and_then(Value::as_str)
+        == Some("channel")
 }
 
 /// A message delivered through the channel: its `origin` says so, or its text starts
-/// with the `<channel` tag Claude Code wraps a channel notification in
-/// (`docs/design.md`). A timer wakeup, a tool result and the compaction's own lines
-/// do neither.
+/// with the `<channel` tag Claude Code wraps a channel notification in.
+/// A timer wakeup, a tool result and the compaction's own lines do neither.
 fn person_of(map: &Map<String, Value>) -> bool {
     if channel_origin(map) {
         return true;
     }
     let text = match map.get("message").and_then(|m| m.get("content")) {
         Some(Value::String(s)) => Some(s.as_str()),
-        Some(Value::Array(blocks)) => blocks.iter().find_map(|b| b.get("text").and_then(Value::as_str)),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .find_map(|b| b.get("text").and_then(Value::as_str)),
         _ => None,
     };
     text.is_some_and(|t| t.trim_start().starts_with("<channel"))
@@ -161,13 +196,22 @@ fn system(map: &Map<String, Value>) -> String {
     // carry the conversation's content.
     let mut parts = Vec::new();
     // A compaction's numbers are one level down.
-    let nested = map.get("compact_metadata").and_then(Value::as_object).into_iter().flatten();
+    let nested = map
+        .get("compact_metadata")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten();
     for (key, value) in map.iter().chain(nested) {
-        if matches!(key.as_str(), "type" | "subtype" | "session_id" | "uuid" | "compact_metadata") {
+        if matches!(
+            key.as_str(),
+            "type" | "subtype" | "session_id" | "uuid" | "compact_metadata"
+        ) {
             continue;
         }
         match value {
-            Value::String(s) if !s.contains(char::is_whitespace) => parts.push(format!("{key}={}", shorten(s, 200))),
+            Value::String(s) if !s.contains(char::is_whitespace) => {
+                parts.push(format!("{key}={}", shorten(s, 200)))
+            }
             Value::Number(n) => parts.push(format!("{key}={n}")),
             Value::Bool(b) => parts.push(format!("{key}={b}")),
             Value::Array(items) => parts.push(format!("{key}={}", items.len())),
@@ -196,10 +240,19 @@ fn message(role: &str, map: &Map<String, Value>) -> String {
                 match block.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         texts += 1;
-                        bytes += block.get("text").and_then(Value::as_str).map_or(0, str::len);
+                        bytes += block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map_or(0, str::len);
                     }
                     Some("tool_use") => {
-                        tools.push(block.get("name").and_then(Value::as_str).unwrap_or("?").to_owned());
+                        tools.push(
+                            block
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("?")
+                                .to_owned(),
+                        );
                     }
                     Some("tool_result") => {
                         results += 1;
@@ -208,7 +261,10 @@ fn message(role: &str, map: &Map<String, Value>) -> String {
                         }
                         bytes += match block.get("content") {
                             Some(Value::String(s)) => s.len(),
-                            Some(Value::Array(items)) => items.iter().map(|i| i.get("text").and_then(Value::as_str).map_or(0, str::len)).sum(),
+                            Some(Value::Array(items)) => items
+                                .iter()
+                                .map(|i| i.get("text").and_then(Value::as_str).map_or(0, str::len))
+                                .sum(),
                             _ => 0,
                         };
                     }
@@ -226,7 +282,11 @@ fn message(role: &str, map: &Map<String, Value>) -> String {
         parts.push(format!("tool_use {}", tools.join(",")));
     }
     if results > 0 {
-        let flag = if errors > 0 { format!(", {errors} failed") } else { String::new() };
+        let flag = if errors > 0 {
+            format!(", {errors} failed")
+        } else {
+            String::new()
+        };
         parts.push(format!("{results} tool_result ({bytes} bytes{flag})"));
     }
     if other > 0 {
@@ -236,7 +296,10 @@ fn message(role: &str, map: &Map<String, Value>) -> String {
     if let Some(model) = message.and_then(|m| m.get("model")).and_then(Value::as_str) {
         parts.push(format!("model {model}"));
     }
-    if let Some(stop) = message.and_then(|m| m.get("stop_reason")).and_then(Value::as_str) {
+    if let Some(stop) = message
+        .and_then(|m| m.get("stop_reason"))
+        .and_then(Value::as_str)
+    {
         parts.push(format!("stop {stop}"));
     }
     if role == "assistant" && !subagent(map) {
@@ -254,9 +317,17 @@ fn message(role: &str, map: &Map<String, Value>) -> String {
 /// error is operational, "Failed to authenticate" above all).
 fn result(map: &Map<String, Value>) -> String {
     let subtype = map.get("subtype").and_then(Value::as_str).unwrap_or("?");
-    let is_error = map.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+    let is_error = map
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let usage = map.get("usage");
-    let tokens = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64).unwrap_or(0);
+    let tokens = |key: &str| {
+        usage
+            .and_then(|u| u.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
     let mut line = format!(
         "result {subtype}{}: {} turns, {} ms (api {} ms), tokens in {} out {} cache read {} write {}, cost ${:.4}",
         if is_error { " ERROR" } else { "" },
@@ -272,7 +343,11 @@ fn result(map: &Map<String, Value>) -> String {
     if channel_origin(map) {
         line.push_str(", channel turn");
     }
-    if let Some(denials) = map.get("permission_denials").and_then(Value::as_array).filter(|d| !d.is_empty()) {
+    if let Some(denials) = map
+        .get("permission_denials")
+        .and_then(Value::as_array)
+        .filter(|d| !d.is_empty())
+    {
         line.push_str(&format!(", {} permission denials", denials.len()));
     }
     if is_error {
@@ -315,7 +390,13 @@ mod tests {
             summarize(line),
             "system init: session af92, model claude-opus-5, Claude Code 2.1.263, permission mode auto, 3 tools, 1 mcp servers, 0 plugins"
         );
-        assert_eq!(read(line).1, Event::Init { session_id: "af92".into(), version: "2.1.263".into() });
+        assert_eq!(
+            read(line).1,
+            Event::Init {
+                session_id: "af92".into(),
+                version: "2.1.263".into()
+            }
+        );
     }
 
     #[test]
@@ -327,10 +408,16 @@ mod tests {
         );
         assert_eq!(read(line).1, Event::Other);
         let task = r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"Agent finished: the private answer","session_id":"af92"}"#;
-        assert_eq!(summarize(task), "system task_notification: status=completed task_id=t1");
+        assert_eq!(
+            summarize(task),
+            "system task_notification: status=completed task_id=t1"
+        );
         assert_eq!(read(task).1, Event::Other);
         let compacted = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":167000},"session_id":"af92"}"#;
-        assert_eq!(summarize(compacted), "system compact_boundary: pre_tokens=167000 trigger=auto");
+        assert_eq!(
+            summarize(compacted),
+            "system compact_boundary: pre_tokens=167000 trigger=auto"
+        );
         assert_eq!(read(compacted).1, Event::Compacted { auto: true });
         let manual = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":19922,"post_tokens":884,"duration_ms":8574,"preserved_segment":{"head_uuid":"e8"}},"session_id":"af92","uuid":"c1"}"#;
         assert_eq!(summarize(manual), "system compact_boundary: duration_ms=8574 post_tokens=884 pre_tokens=19922 trigger=manual");
@@ -344,8 +431,16 @@ mod tests {
         assert_eq!(summarize(blocked), "system status: compact_result=failed");
         assert_eq!(read(blocked).1, Event::CompactionFailed);
         let changed = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"t1","task_type":"local_agent","description":"look things up"},{"task_id":"m1","task_type":"monitor_ws","description":"watch","ambient":true}],"session_id":"af92"}"#;
-        assert_eq!(summarize(changed), "system background_tasks_changed: tasks=2");
-        assert_eq!(read(changed).1, Event::BackgroundTasks { ids: vec!["t1".into()] });
+        assert_eq!(
+            summarize(changed),
+            "system background_tasks_changed: tasks=2"
+        );
+        assert_eq!(
+            read(changed).1,
+            Event::BackgroundTasks {
+                ids: vec!["t1".into()]
+            }
+        );
         let none = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"session_id":"af92"}"#;
         assert_eq!(read(none).1, Event::BackgroundTasks { ids: vec![] });
     }
@@ -356,13 +451,31 @@ mod tests {
         let (s, event) = read(assistant);
         assert_eq!(s, "assistant: 1 text (23 bytes), tool_use mcp__plugin_silta-claude_silta__reply, model claude-opus-5, stop tool_use, context 37250");
         assert!(!s.contains("secret"));
-        assert_eq!(event, Event::Assistant { subagent: false, context_tokens: Some(37250) });
+        assert_eq!(
+            event,
+            Event::Assistant {
+                subagent: false,
+                context_tokens: Some(37250)
+            }
+        );
         let subagent = r#"{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":0}},"parent_tool_use_id":"toolu_1"}"#;
         let (s, event) = read(subagent);
-        assert_eq!(event, Event::Assistant { subagent: true, context_tokens: Some(105) });
+        assert_eq!(
+            event,
+            Event::Assistant {
+                subagent: true,
+                context_tokens: Some(105)
+            }
+        );
         assert!(!s.contains("context"), "{s}");
         let no_usage = r#"{"type":"assistant","message":{"role":"assistant","content":[]},"parent_tool_use_id":null}"#;
-        assert_eq!(read(no_usage).1, Event::Assistant { subagent: false, context_tokens: None });
+        assert_eq!(
+            read(no_usage).1,
+            Event::Assistant {
+                subagent: false,
+                context_tokens: None
+            }
+        );
         let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"sent","is_error":false},{"type":"tool_result","tool_use_id":"y","content":[{"type":"text","text":"boom"}],"is_error":true}]}}"#;
         assert_eq!(summarize(user), "user: 2 tool_result (8 bytes, 1 failed)");
         assert_eq!(read(user).1, Event::User { person: false });
@@ -379,7 +492,13 @@ mod tests {
         let turn = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"usage":{},"origin":{"kind":"channel","server":"plugin:silta-claude:silta"}}"#;
         let (s, event) = read(turn);
         assert!(s.ends_with(", channel turn"), "{s}");
-        assert_eq!(event, Event::Result { is_error: false, person: true });
+        assert_eq!(
+            event,
+            Event::Result {
+                is_error: false,
+                person: true
+            }
+        );
         // A timer wakeup and the compaction's summary are user lines, not a person.
         let timer = r#"{"type":"user","message":{"role":"user","content":"Keep-warm: send nothing, answer ack."}}"#;
         assert_eq!(summarize(timer), "user: 1 text (36 bytes)");
@@ -392,20 +511,43 @@ mod tests {
         let (s, event) = read(ok);
         assert_eq!(s, "result success: 3 turns, 8123 ms (api 7000 ms), tokens in 12 out 345 cache read 250000 write 1000, cost $0.0421");
         assert!(!s.contains("private"));
-        assert_eq!(event, Event::Result { is_error: false, person: false });
+        assert_eq!(
+            event,
+            Event::Result {
+                is_error: false,
+                person: false
+            }
+        );
         let err = r#"{"type":"result","subtype":"success","is_error":true,"num_turns":1,"duration_ms":2000,"duration_api_ms":0,"result":"Failed to authenticate. API Error: 401 OAuth access token is invalid.","total_cost_usd":0,"usage":{},"permission_denials":[{"tool_name":"Bash"}]}"#;
         assert_eq!(
             summarize(err),
             "result success ERROR: 1 turns, 2000 ms (api 0 ms), tokens in 0 out 0 cache read 0 write 0, cost $0.0000, 1 permission denials; Failed to authenticate. API Error: 401 OAuth access token is invalid."
         );
-        assert_eq!(read(err).1, Event::Result { is_error: true, person: false });
+        assert_eq!(
+            read(err).1,
+            Event::Result {
+                is_error: true,
+                person: false
+            }
+        );
     }
 
     #[test]
     fn other_lines_pass_or_name_their_type() {
-        assert_eq!(summarize("Shell cwd was reset to /home"), "Shell cwd was reset to /home");
-        assert_eq!(summarize(r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"text":"x"}}}"#), "stream_event content_block_delta");
-        assert_eq!(summarize(r#"{"type":"control_response","subtype":"ack"}"#), "control_response ack");
+        assert_eq!(
+            summarize("Shell cwd was reset to /home"),
+            "Shell cwd was reset to /home"
+        );
+        assert_eq!(
+            summarize(
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"text":"x"}}}"#
+            ),
+            "stream_event content_block_delta"
+        );
+        assert_eq!(
+            summarize(r#"{"type":"control_response","subtype":"ack"}"#),
+            "control_response ack"
+        );
         assert_eq!(summarize("[1, 2]"), "[1, 2]");
     }
 }

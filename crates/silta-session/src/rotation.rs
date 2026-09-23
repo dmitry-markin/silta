@@ -1,20 +1,26 @@
-//! The rotation state machine (`docs/session-rotation-design.md`), pure: it is fed the
-//! events of the stream and the clock, and answers with what the supervisor should do.
+//! The rotation state machine, pure: it is fed the events of the stream and the clock,
+//! and answers with what the supervisor should do.
 //!
 //! A rotation is pending once the marker exists (written by the pre-compaction hook
-//! or by the supervisor's own threshold). It proceeds at the first quiet moment, no
-//! turn in progress and no background task (an agent, a command) outstanding, with a
-//! handoff request, and the handoff turn is the turn that wrote the handoff note (a
-//! turn a person's message started can end first, and does not count). The session is
-//! then compacted in place with `/compact` and keeps its id, timers and agents. Three
-//! caps bound the waits (for the quiet moment, the handoff turn and the compaction); a
-//! cap that expires cuts the turn and resumes the session for the handoff, and a
-//! handoff turn or a compaction that fails is retried after a
-//! pause, from the handoff again. One count of attempts covers cuts and failures
-//! alike and survives the restarts they cause: `HANDOFF_ATTEMPTS` of them in all end
-//! the rotation with a fresh session id, the last resort. The supervisor snapshots
-//! memory and transcript at two moments the machine names: before the handoff is
-//! first requested, and after each handoff turn.
+//! or by the supervisor's own threshold).
+//!
+//! It proceeds at the first quiet moment, no turn in progress and no background task
+//! (an agent, a command) outstanding, with a handoff request, and the handoff turn is
+//! the turn that wrote the handoff note (a turn a person's message started can end
+//! first, and does not count).
+//!
+//! The session is then compacted in place with `/compact` and keeps its id, timers and
+//! agents.
+//!
+//! Three caps bound the waits (for the quiet moment, the handoff turn and the
+//! compaction); a cap that expires cuts the turn and resumes the session for the handoff,
+//! and a handoff turn or a compaction that fails is retried after a pause, from the
+//! handoff again. One count of attempts covers cuts and failures alike and survives
+//! the restarts they cause: `HANDOFF_ATTEMPTS` of them in all end the rotation with
+//! a fresh session id, the last resort.
+//!
+//! The supervisor snapshots memory and transcript at two moments the machine names:
+//! before the handoff is first requested, and after each handoff turn.
 
 use std::{
     collections::BTreeSet,
@@ -104,26 +110,46 @@ pub enum Action {
     /// line, and wait for the handoff again. `step` is what was cut; after `Wait` the
     /// before-handoff snapshot is still due. `attempts` counts this one, and `handoff`
     /// says whether a handoff turn of the rotation has completed (the note written).
-    Retry { step: Step, attempts: u32, handoff: bool },
+    Retry {
+        step: Step,
+        attempts: u32,
+        handoff: bool,
+    },
     /// The handoff turn ended with an error, or the compaction failed, with an attempt
     /// left: stop, resume normally, and try again from the handoff after the pause.
     /// `attempts` and `handoff` as for `Retry`.
-    Postpone { step: Step, attempts: u32, handoff: bool },
+    Postpone {
+        step: Step,
+        attempts: u32,
+        handoff: bool,
+    },
     /// The attempts are spent: stop claude and start a fresh session. `step` is the
     /// last attempt's and `cut` whether its cap expired (else it failed); `handoff`
     /// says whether a handoff turn of the rotation completed, so that the fresh
     /// session is told whether the note in memory is the rotated session's.
-    GiveUp { step: Step, cut: bool, handoff: bool },
+    GiveUp {
+        step: Step,
+        cut: bool,
+        handoff: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Idle,
-    Waiting { deadline: Instant },
-    Handoff { deadline: Instant },
+    Waiting {
+        deadline: Instant,
+    },
+    Handoff {
+        deadline: Instant,
+    },
     /// `/compact` has been sent; `boundary` once the compaction boundary arrived,
     /// `failed` once Claude Code reported the compaction failed.
-    Compacting { deadline: Instant, boundary: bool, failed: bool },
+    Compacting {
+        deadline: Instant,
+        boundary: bool,
+        failed: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -171,7 +197,13 @@ impl Tracker {
     /// moment, once `not_before` (the pause after a failed attempt) has passed;
     /// `attempts` is the count spent so far and `handoff` whether one of them wrote
     /// the note.
-    pub fn pending(mut self, now: Instant, not_before: Option<Instant>, attempts: u32, handoff: bool) -> Self {
+    pub fn pending(
+        mut self,
+        now: Instant,
+        not_before: Option<Instant>,
+        attempts: u32,
+        handoff: bool,
+    ) -> Self {
         if !self.limits.enabled {
             return self;
         }
@@ -180,7 +212,9 @@ impl Tracker {
         self.attempts = attempts;
         self.handoff = handoff;
         let from = not_before.map_or(now, |t| t.max(now));
-        self.phase = Phase::Waiting { deadline: from + self.limits.quiet };
+        self.phase = Phase::Waiting {
+            deadline: from + self.limits.quiet,
+        };
         self
     }
 
@@ -191,7 +225,9 @@ impl Tracker {
         self.pending = true;
         self.attempts = attempts;
         self.handoff = handoff;
-        self.phase = Phase::Handoff { deadline: now + self.limits.handoff };
+        self.phase = Phase::Handoff {
+            deadline: now + self.limits.handoff,
+        };
         self
     }
 
@@ -254,7 +290,10 @@ impl Tracker {
 
     pub fn event(&mut self, event: &Event, now: Instant) -> Vec<Action> {
         match event {
-            Event::Assistant { subagent, context_tokens } => {
+            Event::Assistant {
+                subagent,
+                context_tokens,
+            } => {
                 self.turn = true;
                 if let (false, Some(n)) = (subagent, context_tokens) {
                     self.context = *n;
@@ -280,10 +319,16 @@ impl Tracker {
                             return self.failed(Step::Handoff, now);
                         }
                         self.handoff = true;
-                        self.phase = Phase::Compacting { deadline: now + self.limits.compact, boundary: false, failed: false };
+                        self.phase = Phase::Compacting {
+                            deadline: now + self.limits.compact,
+                            boundary: false,
+                            failed: false,
+                        };
                         return vec![Action::Snapshot(Moment::AfterHandoff), Action::Compact];
                     }
-                    Phase::Compacting { boundary, failed, .. } => {
+                    Phase::Compacting {
+                        boundary, failed, ..
+                    } => {
                         if boundary {
                             self.done();
                             return vec![Action::Compacted];
@@ -336,7 +381,9 @@ impl Tracker {
     fn set_pending(&mut self, now: Instant) {
         if !self.pending {
             self.pending = true;
-            self.phase = Phase::Waiting { deadline: now + self.limits.quiet };
+            self.phase = Phase::Waiting {
+                deadline: now + self.limits.quiet,
+            };
         }
     }
 
@@ -347,10 +394,15 @@ impl Tracker {
                 if self.not_before.is_some_and(|t| now < t) {
                     Vec::new()
                 } else if self.quiet() {
-                    self.phase = Phase::Handoff { deadline: now + self.limits.handoff };
+                    self.phase = Phase::Handoff {
+                        deadline: now + self.limits.handoff,
+                    };
                     // A retried handoff keeps the clean copy of the first attempt.
                     if self.attempts == 0 {
-                        vec![Action::Snapshot(Moment::BeforeHandoff), Action::RequestHandoff]
+                        vec![
+                            Action::Snapshot(Moment::BeforeHandoff),
+                            Action::RequestHandoff,
+                        ]
                     } else {
                         vec![Action::RequestHandoff]
                     }
@@ -382,9 +434,17 @@ impl Tracker {
         self.phase = Phase::Idle;
         self.attempts += 1;
         if self.attempts < HANDOFF_ATTEMPTS {
-            vec![Action::Retry { step, attempts: self.attempts, handoff: self.handoff }]
+            vec![Action::Retry {
+                step,
+                attempts: self.attempts,
+                handoff: self.handoff,
+            }]
         } else {
-            vec![Action::GiveUp { step, cut: true, handoff: self.handoff }]
+            vec![Action::GiveUp {
+                step,
+                cut: true,
+                handoff: self.handoff,
+            }]
         }
     }
 
@@ -395,9 +455,17 @@ impl Tracker {
         self.attempts += 1;
         if self.attempts < HANDOFF_ATTEMPTS {
             self.not_before = Some(now + self.limits.retry_pause);
-            vec![Action::Postpone { step, attempts: self.attempts, handoff: self.handoff }]
+            vec![Action::Postpone {
+                step,
+                attempts: self.attempts,
+                handoff: self.handoff,
+            }]
         } else {
-            vec![Action::GiveUp { step, cut: false, handoff: self.handoff }]
+            vec![Action::GiveUp {
+                step,
+                cut: false,
+                handoff: self.handoff,
+            }]
         }
     }
 }
@@ -419,15 +487,26 @@ mod tests {
     }
 
     fn assistant(context: u64) -> Event {
-        Event::Assistant { subagent: false, context_tokens: Some(context) }
+        Event::Assistant {
+            subagent: false,
+            context_tokens: Some(context),
+        }
     }
 
     fn tasks(ids: &[&str]) -> Event {
-        Event::BackgroundTasks { ids: ids.iter().map(|s| s.to_string()).collect() }
+        Event::BackgroundTasks {
+            ids: ids.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
-    const OK: Event = Event::Result { is_error: false, person: false };
-    const ERR: Event = Event::Result { is_error: true, person: false };
+    const OK: Event = Event::Result {
+        is_error: false,
+        person: false,
+    };
+    const ERR: Event = Event::Result {
+        is_error: true,
+        person: false,
+    };
     const PERSON: Event = Event::User { person: true };
     const TIMER: Event = Event::User { person: false };
     const BOUNDARY: Event = Event::Compacted { auto: false };
@@ -442,7 +521,10 @@ mod tests {
     fn requested(t0: Instant) -> Tracker {
         let mut tr = Tracker::new(limits(), t0);
         tr.event(&OK, t0);
-        assert_eq!(tr.marker_seen(t0 + secs(1)), vec![BEFORE, Action::RequestHandoff]);
+        assert_eq!(
+            tr.marker_seen(t0 + secs(1)),
+            vec![BEFORE, Action::RequestHandoff]
+        );
         tr
     }
 
@@ -501,7 +583,13 @@ mod tests {
         let t0 = Instant::now();
         let mut tr = Tracker::new(limits(), t0);
         tr.event(&assistant(310_000), t0 + secs(3 * 3600));
-        tr.event(&Event::Result { is_error: false, person: true }, t0 + secs(3 * 3600 + 2));
+        tr.event(
+            &Event::Result {
+                is_error: false,
+                person: true,
+            },
+            t0 + secs(3 * 3600 + 2),
+        );
         assert!(tr.tick(t0 + secs(7 * 3600)).is_empty());
         assert_eq!(tr.tick(t0 + secs(7 * 3600 + 2))[0], Action::MarkPending);
     }
@@ -514,7 +602,13 @@ mod tests {
         tr.event(&OK, t0);
         assert!(tr.tick(t0 + secs(10 * 3600)).is_empty());
         // A subagent's prompt does not count.
-        tr.event(&Event::Assistant { subagent: true, context_tokens: Some(900_000) }, t0);
+        tr.event(
+            &Event::Assistant {
+                subagent: true,
+                context_tokens: Some(900_000),
+            },
+            t0,
+        );
         tr.event(&OK, t0);
         assert!(tr.tick(t0 + secs(20 * 3600)).is_empty());
         // A turn that started 5 hours ago without a result: not idle.
@@ -536,7 +630,10 @@ mod tests {
         assert!(tr.event(&OK, t0 + secs(10)).is_empty());
         assert_eq!(tr.agents().len(), 1);
         // The set is empty again: quiet.
-        assert_eq!(tr.event(&tasks(&[]), t0 + secs(20)), vec![BEFORE, Action::RequestHandoff]);
+        assert_eq!(
+            tr.event(&tasks(&[]), t0 + secs(20)),
+            vec![BEFORE, Action::RequestHandoff]
+        );
         // A second marker sighting changes nothing.
         assert!(tr.marker_seen(t0 + secs(21)).is_empty());
     }
@@ -551,7 +648,10 @@ mod tests {
         assert_eq!(tr.agents().iter().collect::<Vec<_>>(), vec!["b"]);
         tr.event(&tasks(&[]), t0 + secs(2));
         assert!(tr.quiet());
-        assert_eq!(tr.marker_seen(t0 + secs(3)), vec![BEFORE, Action::RequestHandoff]);
+        assert_eq!(
+            tr.marker_seen(t0 + secs(3)),
+            vec![BEFORE, Action::RequestHandoff]
+        );
     }
 
     #[test]
@@ -570,8 +670,14 @@ mod tests {
         // own clean snapshot.
         tr.event(&assistant(900), t0 + secs(80));
         tr.event(&OK, t0 + secs(81));
-        assert!(tr.tick(t0 + secs(100 + 4 * 3600)).is_empty(), "the reset context does not trip the threshold");
-        assert_eq!(tr.marker_seen(t0 + secs(200 + 4 * 3600)), vec![BEFORE, Action::RequestHandoff]);
+        assert!(
+            tr.tick(t0 + secs(100 + 4 * 3600)).is_empty(),
+            "the reset context does not trip the threshold"
+        );
+        assert_eq!(
+            tr.marker_seen(t0 + secs(200 + 4 * 3600)),
+            vec![BEFORE, Action::RequestHandoff]
+        );
     }
 
     #[test]
@@ -582,7 +688,14 @@ mod tests {
         let mut tr = compacting(t0);
         assert!(tr.event(&Event::CompactionFailed, t0 + secs(61)).is_empty());
         tr.event(&assistant(50_000), t0 + secs(62));
-        assert_eq!(tr.event(&OK, t0 + secs(63)), vec![Action::Postpone { step: Step::Compaction, attempts: 1, handoff: true }]);
+        assert_eq!(
+            tr.event(&OK, t0 + secs(63)),
+            vec![Action::Postpone {
+                step: Step::Compaction,
+                attempts: 1,
+                handoff: true
+            }]
+        );
         assert!(tr.is_pending());
         // The resumed run after the pause: the handoff again, with no clean snapshot,
         // then the compaction again; a second failure ends the rotation with a fresh
@@ -593,17 +706,38 @@ mod tests {
         assert_eq!(tr.tick(t1 + secs(900)), vec![Action::RequestHandoff]);
         tr.event(&assistant(50_000), t1 + secs(901));
         assert_eq!(tr.event(&OK, t1 + secs(930)), vec![AFTER, Action::Compact]);
-        assert_eq!(tr.event(&ERR, t1 + secs(940)), vec![Action::GiveUp { step: Step::Compaction, cut: false, handoff: true }]);
+        assert_eq!(
+            tr.event(&ERR, t1 + secs(940)),
+            vec![Action::GiveUp {
+                step: Step::Compaction,
+                cut: false,
+                handoff: true
+            }]
+        );
         // An error result during the first compaction is postponed the same way.
         let mut tr = compacting(t0);
-        assert_eq!(tr.event(&ERR, t0 + secs(63)), vec![Action::Postpone { step: Step::Compaction, attempts: 1, handoff: true }]);
+        assert_eq!(
+            tr.event(&ERR, t0 + secs(63)),
+            vec![Action::Postpone {
+                step: Step::Compaction,
+                attempts: 1,
+                handoff: true
+            }]
+        );
         // A failed handoff turn and a failed compaction share the count: the second
         // attempt of either kind is the last. The note of the first attempt is this
         // rotation's, so the fresh session is still pointed at it.
         let mut tr = Tracker::new(limits(), t1).pending(t1, Some(t1 + secs(900)), 1, true);
         tr.event(&OK, t1 + secs(5));
         tr.tick(t1 + secs(900));
-        assert_eq!(tr.event(&ERR, t1 + secs(930)), vec![Action::GiveUp { step: Step::Handoff, cut: false, handoff: true }]);
+        assert_eq!(
+            tr.event(&ERR, t1 + secs(930)),
+            vec![Action::GiveUp {
+                step: Step::Handoff,
+                cut: false,
+                handoff: true
+            }]
+        );
     }
 
     #[test]
@@ -612,9 +746,19 @@ mod tests {
         // The compaction runs under its own cap, not the handoff's; past it, the one
         // cut-and-resume, which asks for the handoff again.
         let mut tr = compacting(t0);
-        assert!(tr.tick(t0 + secs(60 + 900)).is_empty(), "the handoff cap does not bound the compaction");
+        assert!(
+            tr.tick(t0 + secs(60 + 900)).is_empty(),
+            "the handoff cap does not bound the compaction"
+        );
         assert!(tr.tick(t0 + secs(60 + 2699)).is_empty());
-        assert_eq!(tr.tick(t0 + secs(60 + 2700)), vec![Action::Retry { step: Step::Compaction, attempts: 1, handoff: true }]);
+        assert_eq!(
+            tr.tick(t0 + secs(60 + 2700)),
+            vec![Action::Retry {
+                step: Step::Compaction,
+                attempts: 1,
+                handoff: true
+            }]
+        );
         assert!(tr.tick(t0 + secs(60 + 2701)).is_empty(), "said once");
         // The resumed run: handoff, compaction, and a second hang ends the rotation
         // with a fresh id and the handoff done, not the give-up line.
@@ -623,7 +767,14 @@ mod tests {
         tr.event(&assistant(50_000), t1 + secs(1));
         assert_eq!(tr.event(&OK, t1 + secs(120)), vec![AFTER, Action::Compact]);
         assert!(tr.tick(t1 + secs(120 + 2699)).is_empty());
-        assert_eq!(tr.tick(t1 + secs(120 + 2700)), vec![Action::GiveUp { step: Step::Compaction, cut: true, handoff: true }]);
+        assert_eq!(
+            tr.tick(t1 + secs(120 + 2700)),
+            vec![Action::GiveUp {
+                step: Step::Compaction,
+                cut: true,
+                handoff: true
+            }]
+        );
         // The retried compaction can also succeed.
         let mut tr = Tracker::new(limits(), t1).retrying(t1, 1, true);
         tr.event(&OK, t1 + secs(120));
@@ -658,13 +809,27 @@ mod tests {
         tr.marker_seen(t0 + secs(2));
         assert!(tr.tick(t0 + secs(2) + secs(1799)).is_empty());
         // Cut before the handoff went out: the clean snapshot is still due.
-        assert_eq!(tr.tick(t0 + secs(2) + secs(1800)), vec![Action::Retry { step: Step::Wait, attempts: 1, handoff: false }]);
+        assert_eq!(
+            tr.tick(t0 + secs(2) + secs(1800)),
+            vec![Action::Retry {
+                step: Step::Wait,
+                attempts: 1,
+                handoff: false
+            }]
+        );
         // The resumed run: the combined line is the handoff request.
         let t1 = t0 + secs(2000);
         let mut tr = Tracker::new(limits(), t1).retrying(t1, 1, false);
         tr.event(&assistant(50_000), t1 + secs(1));
         assert!(tr.tick(t1 + secs(899)).is_empty());
-        assert_eq!(tr.tick(t1 + secs(900)), vec![Action::GiveUp { step: Step::Handoff, cut: true, handoff: false }]);
+        assert_eq!(
+            tr.tick(t1 + secs(900)),
+            vec![Action::GiveUp {
+                step: Step::Handoff,
+                cut: true,
+                handoff: false
+            }]
+        );
     }
 
     #[test]
@@ -685,7 +850,14 @@ mod tests {
         // An error result ends the handoff turn whatever the disk says.
         let mut tr = requested(t0);
         tr.set_note_written(false);
-        assert_eq!(tr.event(&ERR, t0 + secs(2)), vec![Action::Postpone { step: Step::Handoff, attempts: 1, handoff: false }]);
+        assert_eq!(
+            tr.event(&ERR, t0 + secs(2)),
+            vec![Action::Postpone {
+                step: Step::Handoff,
+                attempts: 1,
+                handoff: false
+            }]
+        );
     }
 
     #[test]
@@ -701,10 +873,24 @@ mod tests {
         let t0 = Instant::now();
         let mut tr = requested(t0);
         tr.event(&assistant(50_000), t0 + secs(2));
-        assert_eq!(tr.tick(t0 + secs(1) + secs(900)), vec![Action::Retry { step: Step::Handoff, attempts: 1, handoff: false }]);
+        assert_eq!(
+            tr.tick(t0 + secs(1) + secs(900)),
+            vec![Action::Retry {
+                step: Step::Handoff,
+                attempts: 1,
+                handoff: false
+            }]
+        );
 
         let mut tr = requested(t0);
-        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::Postpone { step: Step::Handoff, attempts: 1, handoff: false }]);
+        assert_eq!(
+            tr.event(&ERR, t0 + secs(30)),
+            vec![Action::Postpone {
+                step: Step::Handoff,
+                attempts: 1,
+                handoff: false
+            }]
+        );
     }
 
     #[test]
@@ -715,7 +901,14 @@ mod tests {
         tr.event(&OK, t0 + secs(5));
         assert_eq!(tr.tick(t0 + secs(900)), vec![Action::RequestHandoff]);
         tr.event(&assistant(50_000), t0 + secs(901));
-        assert_eq!(tr.event(&ERR, t0 + secs(930)), vec![Action::GiveUp { step: Step::Handoff, cut: false, handoff: false }]);
+        assert_eq!(
+            tr.event(&ERR, t0 + secs(930)),
+            vec![Action::GiveUp {
+                step: Step::Handoff,
+                cut: false,
+                handoff: false
+            }]
+        );
     }
 
     #[test]
@@ -728,16 +921,37 @@ mod tests {
         tr.event(&OK, t0 + secs(5));
         assert_eq!(tr.tick(t0 + secs(900)), vec![Action::RequestHandoff]);
         tr.event(&assistant(50_000), t0 + secs(901));
-        assert_eq!(tr.tick(t0 + secs(900 + 900)), vec![Action::GiveUp { step: Step::Handoff, cut: true, handoff: false }]);
+        assert_eq!(
+            tr.tick(t0 + secs(900 + 900)),
+            vec![Action::GiveUp {
+                step: Step::Handoff,
+                cut: true,
+                handoff: false
+            }]
+        );
         // A turn was cut once (the count came back from disk); the handoff turn of the
         // resumed session fails: no pause and third attempt, the rotation ends.
         let mut tr = Tracker::new(limits(), t0).retrying(t0, 1, false);
-        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::GiveUp { step: Step::Handoff, cut: false, handoff: false }]);
+        assert_eq!(
+            tr.event(&ERR, t0 + secs(30)),
+            vec![Action::GiveUp {
+                step: Step::Handoff,
+                cut: false,
+                handoff: false
+            }]
+        );
         // The same after the compaction was cut: the note of the first attempt is this
         // rotation's, and the fresh session is pointed at it.
         let mut tr = Tracker::new(limits(), t0).retrying(t0, 1, true);
         tr.event(&assistant(50_000), t0 + secs(1));
-        assert_eq!(tr.event(&ERR, t0 + secs(30)), vec![Action::GiveUp { step: Step::Handoff, cut: false, handoff: true }]);
+        assert_eq!(
+            tr.event(&ERR, t0 + secs(30)),
+            vec![Action::GiveUp {
+                step: Step::Handoff,
+                cut: false,
+                handoff: true
+            }]
+        );
     }
 
     #[test]
@@ -753,7 +967,14 @@ mod tests {
         let mut tr = Tracker::new(limits(), t0).pending(t0, Some(pause_end), 0, false);
         tr.event(&assistant(1), t0 + secs(5));
         assert!(tr.tick(pause_end + secs(1799)).is_empty());
-        assert_eq!(tr.tick(pause_end + secs(1800)), vec![Action::Retry { step: Step::Wait, attempts: 1, handoff: false }]);
+        assert_eq!(
+            tr.tick(pause_end + secs(1800)),
+            vec![Action::Retry {
+                step: Step::Wait,
+                attempts: 1,
+                handoff: false
+            }]
+        );
     }
 
     #[test]
@@ -769,7 +990,10 @@ mod tests {
         assert!(tr.event(&OK, t0 + secs(2)).is_empty());
         assert!(tr.tick(t0 + secs(2 + 1800)).is_empty());
         // Once the handoff is requested it runs to its end.
-        assert_eq!(tr.marker_seen(t0 + secs(3)), vec![BEFORE, Action::RequestHandoff]);
+        assert_eq!(
+            tr.marker_seen(t0 + secs(3)),
+            vec![BEFORE, Action::RequestHandoff]
+        );
         assert!(!tr.cancel());
         assert_eq!(tr.event(&OK, t0 + secs(4)), vec![AFTER, Action::Compact]);
         assert!(!tr.cancel());
@@ -778,7 +1002,14 @@ mod tests {
     #[test]
     fn disabled_ignores_markers_and_thresholds() {
         let t0 = Instant::now();
-        let mut tr = Tracker::new(Limits { enabled: false, ..limits() }, t0).pending(t0, None, 0, false);
+        let mut tr = Tracker::new(
+            Limits {
+                enabled: false,
+                ..limits()
+            },
+            t0,
+        )
+        .pending(t0, None, 0, false);
         tr.event(&assistant(900_000), t0);
         tr.event(&OK, t0);
         assert!(tr.marker_seen(t0 + secs(1)).is_empty());

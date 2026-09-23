@@ -37,7 +37,6 @@ silta: next steps, as root
   6. for the md2pdf and research skills (PDF generation), otherwise they fail at use:
        apt install pandoc fonts-dejavu fonts-noto-core fonts-noto-color-emoji
      and typst by hand from https://github.com/typst/typst (packaged with cargo-deb).
-See /usr/share/doc/silta/README.md.
 NOTE
       fi
     fi

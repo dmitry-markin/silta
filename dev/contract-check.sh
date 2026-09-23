@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Checks a Claude Code version against what silta-session assumes of its stream-json
-# output (docs/claude-code-contract.md, section 1), with one real turn: run it after an
-# upgrade, before the version is pinned in the unit. One API call, a few cents.
+# output, with one real turn: run it after an upgrade, before the version is pinned
+# in the unit.
 #
 #   dev/contract-check.sh                 the claude on PATH
 #   CLAUDE_BIN=/opt/claude/.local/share/claude/versions/2.1.270 dev/contract-check.sh
@@ -9,14 +9,21 @@
 # Asserts: the init line names a version and it is in silta-session's TESTED_VERSIONS;
 # a main-line assistant line carries the three usage counts; the turn's prompt comes
 # back as a user line (the idle gap rests on that line for a channel delivery); the
-# result line carries is_error. Agents, compaction and the hook stay in the manual procedure of the doc's
-# last section. Exit 0 when every check passes, 1 otherwise; the failures are listed.
+# result line carries is_error. Agents, compaction and the hook stay in the manual
+# procedure. Exit 0 when every check passes, 1 otherwise; the failures are listed.
+#
+# TODO: this currently lacks at least the check for user message detection, that needs
+#       a fake channel plugin.
+
 set -uo pipefail
+
 repo=$(cd "$(dirname "$0")/.." && pwd)
 claude=${CLAUDE_BIN:-claude}
 tested=$(grep -o 'TESTED_VERSIONS: &\[&str\] = &\[[^]]*\]' "$repo/crates/silta-session/src/contract.rs" | grep -o '"[0-9.]*"' | tr -d '"' | tr '\n' ' ')
 out=$(mktemp "${TMPDIR:-/tmp}/contract-check.XXXXXX")
+
 trap 'rm -f "$out"' EXIT
+
 printf '%s\n' '{"type":"user","message":{"role":"user","content":"Reply with the single word ok and nothing else."}}' \
   | "$claude" -p --input-format stream-json --output-format stream-json --verbose \
       --replay-user-messages --permission-mode auto --permission-prompts none > "$out" 2>"$out.err"
@@ -26,6 +33,7 @@ if [ $status -ne 0 ]; then
   cat "$out.err" >&2
 fi
 rm -f "$out.err"
+
 python3 - "$out" "$tested" <<'PY'
 import json, sys
 lines = [json.loads(l) for l in open(sys.argv[1]) if l.strip().startswith("{")]
@@ -62,6 +70,6 @@ elif not isinstance(results[-1].get("is_error"), bool):
 print(f"Claude Code {version or '?'}: {len(lines)} lines, {len(main)} main-line assistant, {len(results)} result")
 for f in fails:
     print(f"FAIL {f}")
-print("contract holds" if not fails else "contract broken: re-check docs/claude-code-contract.md")
+print("contract holds" if not fails else "contract broken")
 sys.exit(1 if fails else 0)
 PY

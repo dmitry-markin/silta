@@ -149,7 +149,7 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
     // From here on one task writes the socket and this one reads it, so a file streaming
     // out never stops the reading side. Were both done in turn, a file crossing each way
     // at the same moment would fill both socket buffers with neither side reading, and
-    // the connection would hang for good.
+    // the connection would hang.
     let mut writer_task = tokio::spawn(write_loop(daemon.clone(), writer, session.clone(), outbound));
 
     // Files the session streams for `send_file`, spooled until the command names them.

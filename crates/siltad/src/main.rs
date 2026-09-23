@@ -16,8 +16,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_LOG_FILTER: &str =
-    "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn,matrix_sdk_crypto::backups=error,matrix_sdk::http_client=off";
+// The default filter, unless `RUST_LOG` says otherwise. `matrix_sdk_crypto::backups`
+// is at `error` because the SDK's backup upload task warns "no backup key was found"
+// at every new room key while server-side key backups are off, which they are on
+// purpose (the store is backed up as files instead).
+const DEFAULT_LOG_FILTER: &str = "info,\
+     matrix_sdk=warn,\
+     matrix_sdk_base=warn,\
+     matrix_sdk_crypto=warn,\
+     matrix_sdk_crypto::backups=error,\
+     matrix_sdk::http_client=off";
 
 /// silta daemon: one Matrix device for the family assistant, one Unix socket for its
 /// sessions.
@@ -46,12 +54,11 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // The default filter, unless RUST_LOG says otherwise. matrix_sdk_crypto::backups is
-    // at error because the SDK's backup upload task warns "no backup key was found"
-    // at every new room key while server-side key backups are off, which they are on
-    // purpose (the store is backed up as files instead).
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER)))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER)),
+        )
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .with_target(false)
@@ -106,7 +113,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         session::ensure_display_name(&client, name).await;
     }
 
-    let spool = Spool::new(&config.state_dir, config.attachment_max_mb.saturating_mul(1024 * 1024));
+    let spool = Spool::new(
+        &config.state_dir,
+        config.attachment_max_mb.saturating_mul(1024 * 1024),
+    );
     spool.prepare()?;
     let (silence_tx, silence_rx) = tokio::sync::mpsc::unbounded_channel();
     let settings = Settings {
@@ -114,7 +124,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
         inbox_max_age_days: config.inbox_max_age_days,
         alert_grace_secs: config.alert_grace_secs,
     };
-    let daemon = Arc::new(Daemon::new(client, routing, &config.state_dir, spool, users, settings, silence_tx));
+    let daemon = Arc::new(Daemon::new(
+        client,
+        routing,
+        &config.state_dir,
+        spool,
+        users,
+        settings,
+        silence_tx,
+    ));
     matrix::register_handlers(&daemon);
 
     let cancel = CancellationToken::new();
@@ -160,7 +178,11 @@ fn resolve_users(routing: &Routing) -> anyhow::Result<HashMap<String, u32>> {
     for (session, user) in routing.session_users() {
         let entry = nix::unistd::User::from_name(user)
             .with_context(|| format!("cannot look up user {user:?} of session {session:?}"))?
-            .with_context(|| format!("session {session:?} runs as user {user:?}, which does not exist on this host"))?;
+            .with_context(|| {
+                format!(
+                    "session {session:?} runs as user {user:?}, which does not exist on this host"
+                )
+            })?;
         users.insert(session.to_owned(), entry.uid.as_raw());
     }
     Ok(users)

@@ -1,7 +1,7 @@
-//! Watches for Claude Code output that no longer matches what the supervisor assumes
-//! (`docs/claude-code-contract.md`), so that a schema change after an upgrade shows in
-//! the journal as a `contract:` line instead of a silently blind supervisor. Pure: it
-//! answers with the line to print, if any.
+//! Watches for Claude Code output that no longer matches what the supervisor assumes,
+//! so that a schema change after an upgrade shows in the journal as a `contract:` line
+//! instead of a silently blind supervisor. Pure: it answers with the line to print,
+//! if any.
 
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ impl Contract {
     pub fn event(&mut self, event: &Event, rotation: bool, now: Instant) -> Option<String> {
         match event {
             Event::Init { version, .. } if !TESTED_VERSIONS.contains(&version.as_str()) => Some(format!(
-                "Claude Code {version} was not checked against this supervisor (checked: {}); re-check docs/claude-code-contract.md",
+                "Claude Code {version} was not checked against this supervisor (checked: {})",
                 TESTED_VERSIONS.join(", ")
             )),
             Event::Assistant { subagent: false, context_tokens } => {
@@ -65,14 +65,23 @@ mod tests {
     use super::*;
 
     const CAP: Duration = Duration::from_secs(1800);
-    const OK: Event = Event::Result { is_error: false, person: false };
+    const OK: Event = Event::Result {
+        is_error: false,
+        person: false,
+    };
 
     fn assistant() -> Event {
-        Event::Assistant { subagent: false, context_tokens: Some(10) }
+        Event::Assistant {
+            subagent: false,
+            context_tokens: Some(10),
+        }
     }
 
     fn init(version: &str) -> Event {
-        Event::Init { session_id: "s".into(), version: version.into() }
+        Event::Init {
+            session_id: "s".into(),
+            version: version.into(),
+        }
     }
 
     #[test]
@@ -81,7 +90,10 @@ mod tests {
         let t0 = Instant::now();
         assert!(c.event(&init(TESTED_VERSIONS[0]), true, t0).is_none());
         let line = c.event(&init("9.9.9"), true, t0).unwrap();
-        assert!(line.starts_with("Claude Code 9.9.9 was not checked"), "{line}");
+        assert!(
+            line.starts_with("Claude Code 9.9.9 was not checked"),
+            "{line}"
+        );
         assert!(c.event(&init("?"), true, t0).is_some());
     }
 
@@ -103,7 +115,14 @@ mod tests {
         c.event(&OK, true, t1 + CAP + Duration::from_secs(61));
         assert!(c.tick(t1 + 2 * CAP, CAP).is_none());
         // A subagent's line does not start a turn.
-        c.event(&Event::Assistant { subagent: true, context_tokens: Some(1) }, true, t1 + 2 * CAP);
+        c.event(
+            &Event::Assistant {
+                subagent: true,
+                context_tokens: Some(1),
+            },
+            true,
+            t1 + 2 * CAP,
+        );
         assert!(c.tick(t1 + 4 * CAP, CAP).is_none());
     }
 
@@ -111,12 +130,30 @@ mod tests {
     fn usage_missing_is_said_once_and_compaction_only_with_rotation_on() {
         let mut c = Contract::default();
         let t0 = Instant::now();
-        let no_usage = Event::Assistant { subagent: false, context_tokens: None };
+        let no_usage = Event::Assistant {
+            subagent: false,
+            context_tokens: None,
+        };
         assert!(c.event(&no_usage, true, t0).is_some());
         assert!(c.event(&no_usage, true, t0).is_none());
-        assert!(c.event(&Event::Assistant { subagent: true, context_tokens: None }, true, t0).is_none());
-        assert!(c.event(&Event::Compacted { auto: true }, false, t0).is_none());
-        assert!(c.event(&Event::Compacted { auto: false }, true, t0).is_none());
-        assert!(c.event(&Event::Compacted { auto: true }, true, t0).is_some());
+        assert!(c
+            .event(
+                &Event::Assistant {
+                    subagent: true,
+                    context_tokens: None
+                },
+                true,
+                t0
+            )
+            .is_none());
+        assert!(c
+            .event(&Event::Compacted { auto: true }, false, t0)
+            .is_none());
+        assert!(c
+            .event(&Event::Compacted { auto: false }, true, t0)
+            .is_none());
+        assert!(c
+            .event(&Event::Compacted { auto: true }, true, t0)
+            .is_some());
     }
 }

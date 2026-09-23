@@ -1,9 +1,11 @@
-# One Silta session (a "mind") per instance: silta-session@alice.service runs as the
-# Unix user silta-alice with /var/lib/silta/alice as its home and state, and announces
-# itself to the daemon as session "alice". Instances are created with
-# silta-session-add and hang off silta-session.target, the handle for all minds at
-# once. Per-instance overrides (a model, a version pin, another gateway) go in a drop-in:
-# systemctl edit silta-session@alice.
+# One Silta session (a "mind") per instance: silta-session@user-1.service runs as the
+# Unix user `silta-user-1` with `/var/lib/silta/user-1` as its home and state, and
+# announces itself to the daemon as session "user-1". Instances are created with
+# `silta-session-add` and are part of `silta-session.target`, the handle for all minds at
+# once.
+#
+# Per-instance overrides (a model, rotation threshold, etc.) go in a drop-in:
+# `systemctl edit silta-session@user-1`.
 [Unit]
 Description=Silta session %i (Claude Code with the silta channel)
 After=network-online.target siltad.service
@@ -24,17 +26,16 @@ Environment=SILTA_SOCKET=/run/siltad/siltad.sock
 Environment=SILTA_PERSONA=/etc/silta/persona.md
 Environment=SILTA_CLAUDE_BIN=/usr/bin/silta-claude
 # How long silta-session waits for claude to finish its turn and exit after stdin is
-# closed, before killing it. Kept below TimeoutStopSec so the supervisor, not systemd,
+# closed, before killing it. Kept below `TimeoutStopSec` so the supervisor, not systemd,
 # is the one that ends the session.
 Environment=SILTA_STOP_GRACE=120
-# Session rotation (docs/session-rotation-design.md): a session whose context has
-# reached ROTATE_CONTEXT_TOKENS and to which no person has written for
-# ROTATE_IDLE_SECONDS (timer wakeups and the mind's own work do not count), or whose
-# Claude Code wanted to compact, is asked for a handoff and then compacted in place
-# (replaced by a fresh session only after two failed or cut attempts). The three caps
-# bound the wait for a quiet moment, the handoff turn and the compaction;
-# RETRY is the pause after a handoff turn that failed. SILTA_ROTATE=0 switches it off
-# for one mind.
+# Session rotation: a session whose context has reached ROTATE_CONTEXT_TOKENS and to
+# which no person has written for ROTATE_IDLE_SECONDS (timer wakeups and the mind's
+# own work do not count), or whose Claude Code wanted to compact, is asked for a handoff
+# and then compacted in place (replaced by a fresh session only after two failed or cut
+# attempts). The three caps bound the wait for a quiet moment, the handoff turn and the
+# compaction; RETRY is the pause after a handoff turn that failed.
+# SILTA_ROTATE=0 switches it off for one mind.
 Environment=SILTA_ROTATE=1
 Environment=SILTA_ROTATE_CONTEXT_TOKENS=300000
 Environment=SILTA_ROTATE_IDLE_SECONDS=14400
@@ -46,13 +47,13 @@ Environment=SILTA_ROTATE_RETRY_SECONDS=900
 # kept under backups/.
 Environment=SILTA_BACKUPS_KEEP=10
 # The window Claude Code uses to decide an automatic compaction (accepted: 100000 to
-# 1000000; the model's own window, one million, otherwise). The backstop for a session
-# no person leaves alone for ROTATE_IDLE_SECONDS: the hook fires at about 467000
-# tokens (the window minus a 20000-token output reserve minus 13000), and the rotation
-# follows at the next quiet moment.
+# 1000000; the model's own window otherwise). The backstop for a session no person leaves
+# alone for ROTATE_IDLE_SECONDS: the hook fires at about 467000 tokens (the window minus
+# a 20000-token output reserve minus 13000), and the rotation follows at the next quiet
+# moment.
 Environment=CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000
 # Claude Code: the install owned by the claude user, read-only here, never updating
-# itself. CLAUDE_BIN may name /opt/claude/.local/share/claude/versions/<n> to pin one.
+# itself. `CLAUDE_BIN` may name `/opt/claude/.local/share/claude/versions/<n>` to pin one.
 Environment=CLAUDE_BIN=/opt/claude/.local/bin/claude
 Environment=DISABLE_AUTOUPDATER=1
 # Pinned by full name so nothing follows a moving alias.
@@ -61,14 +62,15 @@ Environment=SILTA_EFFORT=high
 Environment=SILTA_FALLBACK_MODEL=claude-opus-5
 # Subagents a mind spawns: read by Claude Code itself, not by silta-session.
 Environment=CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-5
-# The mind's own credential (design.md, section 6): /etc/silta/auth/%i holds exactly one
-# file: oauth-token (the person's subscription token, from claude setup-token), api-key
-# (their Claude Console API key) or gateway-token (their token for the gateway below;
-# Claude Code offers no channels there, so such a mind receives nothing). systemd hands each file over as
-# auth_<file>; a missing directory fails the start. silta-session sets the variables
-# Claude Code reads and drops every other credential variable from its environment.
+# The mind's own credential: `/etc/silta/auth/%i` holds exactly one file:
+# - `oauth-token` (the person's subscription token, from claude setup-token)
+# - `api-key` (their Claude Console API key)
+# - `gateway-token` (their token for the gateway below; Claude Code offers no channels there, so such a mind receives nothing).
+# systemd hands each file over as `auth_<file>`; a missing directory fails the start.
+# `silta-session` sets the variables Claude Code reads and drops every other credential
+# variable from its environment.
 LoadCredential=auth:/etc/silta/auth/%i
-# The Anthropic-compatible endpoint of a mind with a gateway-token.
+# The Anthropic-compatible endpoint of a mind with a `gateway-token`.
 Environment=SILTA_GATEWAY_URL=https://openrouter.ai/api
 ExecStart=/usr/lib/silta/silta-session
 Restart=always
@@ -80,21 +82,28 @@ TimeoutStopSec=150
 MemoryMax=2G
 TasksMax=512
 
-# Hardening. What a mind needs: its state directory (HOME and the workspace, writable
-# through StateDirectory), a private /tmp, the daemon's socket (connecting works on a
-# read-only /run), the persona and the allowlist under /etc, the Claude Code install
-# under /opt/claude, the network for the model and for research, the credential, and
-# what Claude Code's Bash sandbox needs (bubblewrap, switched on for every mind in
-# /etc/claude-code/managed-settings.json): the user, mnt, pid and net namespaces it asks
-# for, and the mount syscalls inside its user namespace, hence no @mount in the
-# denylist. Four hardenings we would otherwise set break that sandbox (bisected on the
-# dev host 2026-09-07); each is kept commented-out below with its reason so it can be
-# restored when the blocker is gone. All four are harmless to drop here: the mind has an
-# empty CapabilityBoundingSet and NoNewPrivileges, so it holds none of the privileges
-# they guard against. No MemoryDenyWriteExecute: the Claude Code binary is a JavaScript
-# runtime with a JIT. A denylist of privileged syscall groups rather than an allowlist,
-# because a mind runs arbitrary developer tools. PrivateTmp keeps Claude Code's messaging
-# socket (/tmp/cc-socks-<uid>) private to the mind. ProtectProc=invisible keeps minds
+# Hardening. What a mind needs:
+#
+#  - its state directory (HOME and the workspace, writable through StateDirectory)
+#  - a private `/tmp`
+#  - the daemon's socket (connecting works on a read-only /run)
+#  - the persona and the allowlist under `/etc`
+#  - the Claude Code install under `/opt/claude`
+#  - the network for the model and for research
+#  - the credential
+#  - what Claude Code's Bash sandbox needs (bubblewrap, switched on for every mind in
+# `/etc/claude-code/managed-settings.json`): the `user`, `mnt`, `pid` and `net`
+# namespaces it asks for, and the mount syscalls inside its user namespace, hence no
+# `@mount` in the denylist.
+#
+# Four hardenings we would otherwise set break that sandbox; each is kept commented-out
+# below with its reason so it can be restored when the blocker is gone. All four are
+# harmless to drop here: the mind has an empty `CapabilityBoundingSet` and
+# `NoNewPrivileges`, so it holds none of the privileges they guard against.
+# No `MemoryDenyWriteExecute`: the Claude Code binary is a JavaScript runtime with a JIT.
+# A denylist of privileged syscall groups rather than an allowlist, because a mind runs
+# arbitrary developer tools. `PrivateTmp` keeps Claude Code's messaging socket
+# (`/tmp/cc-socks-<uid>`) private to the mind. `ProtectProc=invisible` keeps minds
 # from seeing each other's processes.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
@@ -106,13 +115,22 @@ PrivateDevices=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ProtectClock=yes
-# ProtectKernelTunables=yes   # off: ro bind-mount over /proc/sys is locked in the mind's namespace and blocks the sandbox's fresh /proc ("Can't mount proc"). A mind cannot write these anyway.
-# ProtectKernelLogs=yes       # off: same, its bind-mount over /proc/kmsg blocks the sandbox's /proc.
-# ProtectHostname=yes         # off: same, ro bind-mounts over /proc/sys/kernel/{host,domain}name. Replace with ProtectHostname=private (a UTS namespace, no bind mount) once on systemd 258; changing the hostname needs CAP_SYS_ADMIN the mind lacks.
+# Off: ro bind-mount over `/proc/sys` is locked in the mind's namespace and blocks the
+# sandbox's fresh `/proc` ("Can't mount proc"). A mind cannot write these anyway.
+#ProtectKernelTunables=yes
+# Off: same, its bind-mount over `/proc/kmsg blocks` the sandbox's `/proc`.
+#ProtectKernelLogs=yes
+# Off: same, ro bind-mounts over `/proc/sys/kernel/{host,domain}name.` Replace with
+# `ProtectHostname=private` (a UTS namespace, no bind mount) once on systemd 258;
+# changing the hostname needs `CAP_SYS_ADMIN` the mind lacks.
+#ProtectHostname=yes
 ProtectProc=invisible
 RestrictNamespaces=user mnt pid net
 RestrictRealtime=yes
-# RestrictSUIDSGID=yes        # off: it makes systemd block openat2 with ENOSYS, and bubblewrap opens its bind sources with openat2 and does not fall back ("Can't open source …: Function not implemented"). Empty caps + NoNewPrivileges already void any suid bit.
+# Off: it makes systemd block `openat2` with `ENOSYS`, and bubblewrap opens its bind
+# sources with `openat2` and does not fall back ("Can't open source …: Function not
+# implemented"). Empty caps + `NoNewPrivileges` already void any suid bit.
+# RestrictSUIDSGID=yes
 LockPersonality=yes
 RemoveIPC=yes
 UMask=0077
