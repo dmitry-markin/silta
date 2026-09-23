@@ -4,6 +4,12 @@
 
 Family AI assistant that runs on Claude Code and speaks Matrix. Keeps its memory and the thread of a conversation across context limits, so it always stays the same assistant.
 
+<p align="center">
+  <img src="docs/images/chat-element-x.webp" width="280" height="363" alt="Chat in Element X">
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/images/pdf-report-phone.webp" width="280" height="363" alt="PDF report">
+</p>
+
 ## Features
 
 1. Claude Code as the harness: one long-lived session per person, plus a shared session for the family rooms. Each person uses their own Claude subscription (via `claude setup-token`) or Anthropic API key.
