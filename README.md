@@ -46,23 +46,20 @@ Matrix clients ◀─────▶ Matrix homeserver
                                ▲
                                │  Matrix client-server API, E2EE
                                ▼
-                ┌────────────────────────────┐
-                │ siltad                     │
+                ┌─ siltad ───────────────────┐
                 │ the assistant's Matrix     │
                 │ device: login, keys, rooms │
                 └────────────────────────────┘
                       ▲               ▲
-                      │               └──────────┐   Unix sockets
-                      │                          │
-     ┌────────────────┴─────┐   ┌────────────────┴─────┐
-     │ silta-session (Alice)│   │ silta-session (hub)  │  One supervisor per
-     │ ┌──────────────┬───┐ │   │ ┌──────────────┬───┐ │  person and one for
-     │ │ Claude Code  ▼   │ │   │ │ Claude Code  ▼   │ │  the shared rooms.
-     │ │ + silta-claude   │ │   │ │ + silta-claude   │ │
-     │ │   channel plugin │ │   │ │   channel plugin │ │
-     │ └──────────────────┘ │   │ └──────────────────┘ │
-     │ memory, workspace    │   │ memory, workspace    │
-     └──────────────────────┘   └──────────────────────┘
+                      │               └─────────────┐   Unix sockets
+                      │                             │
+     ┌─ silta-session ┼ Alice ┐    ┌─ silta-session ┼ hub ──┐  One supervisor per
+     │ ┌─ Claude Code ▼─────┐ │    │ ┌─ Claude Code ▼─────┐ │  person and one for
+     │ │   silta-claude     │ │    │ │   silta-claude     │ │  the shared rooms.
+     │ │   channel plugin   │ │    │ │   channel plugin   │ │
+     │ └────────────────────┘ │    │ └────────────────────┘ │
+     │ memory, workspace      │    │ memory, workspace      │
+     └────────────────────────┘    └────────────────────────┘
 ```
 
 ## Context compaction and continuity
@@ -79,6 +76,7 @@ This allows the assistant to continue from the point where it was before the com
 
 1. Implementing yet another harness.
 2. Giving the assistant access to personal services and files on the user's main PC. The idea is that it is a conversation partner that helps with everyday questions and decisions, conducts web research, and can monitor or research something on schedule.
+3. Supporting other messengers or model providers. Silta speaks Matrix and runs on Claude Code. Both are design choices, not gaps.
 
 ## Project status
 
