@@ -59,9 +59,9 @@ Environment=DISABLE_AUTOUPDATER=1
 # Pinned by full name so nothing follows a moving alias.
 Environment=SILTA_MODEL=claude-fable-5-1
 Environment=SILTA_EFFORT=high
-Environment=SILTA_FALLBACK_MODEL=claude-opus-5
+Environment=SILTA_FALLBACK_MODEL=claude-opus-5-5
 # Subagents a mind spawns: read by Claude Code itself, not by silta-session.
-Environment=CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-5
+Environment=CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-5-5
 # The mind's own credential: `/etc/silta/auth/%i` holds exactly one file:
 # - `oauth-token` (the person's subscription token, from claude setup-token)
 # - `api-key` (their Claude Console API key)
