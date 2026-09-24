@@ -84,7 +84,7 @@ This allows the assistant to continue from the point where it was before the com
 
 Used daily by the author, his family, and friends since 7 September 2026. Built with Claude Code and the assistant itself. Expect things to break (and get fixed).
 
-The Claude Code version checked to work is 2.1.273. Newer versions may break the integration. API contract checker is coming.
+The Claude Code version checked to work is 2.1.281. Newer versions may break the integration. API contract checker is coming.
 
 ## Known issues
 
