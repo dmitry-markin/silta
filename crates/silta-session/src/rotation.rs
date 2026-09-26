@@ -293,6 +293,7 @@ impl Tracker {
             Event::Assistant {
                 subagent,
                 context_tokens,
+                ..
             } => {
                 self.turn = true;
                 if let (false, Some(n)) = (subagent, context_tokens) {
@@ -493,6 +494,7 @@ mod tests {
         Event::Assistant {
             subagent: false,
             context_tokens: Some(context),
+            synthetic: false,
         }
     }
 
@@ -609,6 +611,7 @@ mod tests {
             &Event::Assistant {
                 subagent: true,
                 context_tokens: Some(900_000),
+                synthetic: false,
             },
             t0,
         );

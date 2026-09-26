@@ -11,6 +11,18 @@ use crate::stream::Event;
 /// version gets a line at every start until the list is extended.
 pub const TESTED_VERSIONS: &[&str] = &["2.1.281"];
 
+/// The `model_fallback` triggers of the checked versions. The supervisor ends the
+/// session on the ones that point at the model (`FALLBACK_FATAL` in `lib.rs`) and lets
+/// the rest through; a trigger outside this list is let through with a line.
+pub const FALLBACK_TRIGGERS: &[&str] = &[
+    "model_not_found",
+    "permission_denied",
+    "last_resort",
+    "overloaded",
+    "server_error",
+    "model_blocked",
+];
+
 #[derive(Debug, Default)]
 pub struct Contract {
     /// When the main line first spoke in the turn in progress.
@@ -28,7 +40,11 @@ impl Contract {
                 "Claude Code {version} was not checked against this supervisor (checked: {})",
                 TESTED_VERSIONS.join(", ")
             )),
-            Event::Assistant { subagent: false, context_tokens } => {
+            Event::Assistant {
+                subagent: false,
+                context_tokens,
+                ..
+            } => {
                 self.spoke_at.get_or_insert(now);
                 if context_tokens.is_none() && !self.warned_usage {
                     self.warned_usage = true;
@@ -40,6 +56,9 @@ impl Contract {
                 self.spoke_at = None;
                 self.warned_turn = false;
                 None
+            }
+            Event::ModelFallback { trigger } if !FALLBACK_TRIGGERS.contains(&trigger.as_str()) => {
+                Some(format!("a model_fallback with the trigger {trigger:?}, which this supervisor does not know; the turn runs on the fallback model"))
             }
             Event::Compacted { auto: true } if rotation => {
                 Some("Claude Code compacted the conversation on its own; the PreCompact hook did not block it".to_owned())
@@ -74,6 +93,7 @@ mod tests {
         Event::Assistant {
             subagent: false,
             context_tokens: Some(10),
+            synthetic: false,
         }
     }
 
@@ -119,11 +139,25 @@ mod tests {
             &Event::Assistant {
                 subagent: true,
                 context_tokens: Some(1),
+                synthetic: false,
             },
             true,
             t1 + 2 * CAP,
         );
         assert!(c.tick(t1 + 4 * CAP, CAP).is_none());
+    }
+
+    #[test]
+    fn an_unknown_fallback_trigger_is_said() {
+        let mut c = Contract::default();
+        let now = Instant::now();
+        let fallback = |trigger: &str| Event::ModelFallback {
+            trigger: trigger.into(),
+        };
+        assert!(c.event(&fallback("last_resort"), true, now).is_none());
+        assert!(c.event(&fallback("overloaded"), true, now).is_none());
+        assert!(c.event(&fallback("rate_limited"), true, now).is_some());
+        assert!(c.event(&fallback("?"), true, now).is_some());
     }
 
     #[test]
@@ -133,6 +167,7 @@ mod tests {
         let no_usage = Event::Assistant {
             subagent: false,
             context_tokens: None,
+            synthetic: false,
         };
         assert!(c.event(&no_usage, true, t0).is_some());
         assert!(c.event(&no_usage, true, t0).is_none());
@@ -140,7 +175,8 @@ mod tests {
             .event(
                 &Event::Assistant {
                     subagent: true,
-                    context_tokens: None
+                    context_tokens: None,
+                    synthetic: false
                 },
                 true,
                 t0

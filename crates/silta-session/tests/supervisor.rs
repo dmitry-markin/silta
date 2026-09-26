@@ -137,12 +137,15 @@ async fn fresh_start_resume_and_graceful_stop() {
         let stop = stop.clone();
         async move { silta_session::run(&cfg, stop).await }
     });
+    // The fake looks for the ready file after its first answer to the start line.
     let log = fx
-        .until(10, |l| l.contains("line Session test started"))
+        .until(10, |l| {
+            l.contains("line Session test started") && l.contains("ready ")
+        })
         .await;
     assert!(
-        log.contains("ready after init") && !log.contains("ready before init"),
-        "the ready file is cleared at the start and written at the init line:\n{log}"
+        log.contains("ready after answer") && !log.contains("ready before answer"),
+        "the ready file is cleared at the start and written at the first answer:\n{log}"
     );
     let id = fx.id();
     assert_eq!(starts(&log), vec![format!("start {id} ").as_str()]);
@@ -162,12 +165,14 @@ async fn fresh_start_resume_and_graceful_stop() {
     });
     let log = fx
         .until(10, |l| {
-            l.contains("restarted at") && l.contains("resumed its history")
+            l.contains("restarted at")
+                && l.contains("resumed its history")
+                && l.matches("ready ").count() == 2
         })
         .await;
     assert_eq!(starts(&log)[1], format!("start {id} resumed"));
     assert!(
-        log.matches("ready after init").count() == 2 && !log.contains("ready before init"),
+        log.matches("ready after answer").count() == 2 && !log.contains("ready before answer"),
         "{log}"
     );
     stop.cancel();
@@ -805,15 +810,14 @@ async fn a_window_below_the_configured_one_ends_the_session_before_its_first_tur
     let log = fx.log();
     assert!(log.contains("control silta-window"), "{log}");
     assert!(!log.contains("\nline "), "no turn before the check: {log}");
+    assert!(!log.contains("ready after answer"), "no channel: {log}");
 
-    // An unanswered check ends it as well, after the wait.
+    // An unanswered check ends it too, after the wait, for a restart: it says nothing
+    // about the model.
     fx.set("fake-window", "500000");
     fx.set("fake-mode", "nowindow");
     let started = Instant::now();
-    assert_eq!(
-        silta_session::run(&cfg, CancellationToken::new()).await,
-        EXIT_MODEL
-    );
+    assert_eq!(silta_session::run(&cfg, CancellationToken::new()).await, 1);
     assert!(started.elapsed() >= cfg.window_wait);
     assert!(!fx.log().contains("\nline "), "{}", fx.log());
 
@@ -859,13 +863,22 @@ async fn a_fallback_runs_through_an_outage_and_ends_the_session_otherwise() {
     stop.cancel();
     assert_eq!(run.await.unwrap(), 0);
 
-    // A fallback that is not an outage ends the session, and it is not started again.
-    for trigger in [
-        "last_resort",
-        "model_not_found",
-        "permission_denied",
-        "unheard_of",
-    ] {
+    // A trigger this supervisor does not know is let through as well.
+    fx.set("fake-mode", "fallback-unheard_of");
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| l.matches("ready after answer").count() == 2)
+        .await;
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+
+    // A fallback that points at the model ends the session before the channel opens, so
+    // no message is taken, and the session is not started again.
+    for trigger in ["last_resort", "model_not_found", "permission_denied"] {
         fx.set("fake-mode", &format!("fallback-{trigger}"));
         let runs = starts(&fx.log()).len();
         assert_eq!(
@@ -873,8 +886,34 @@ async fn a_fallback_runs_through_an_outage_and_ends_the_session_otherwise() {
             EXIT_MODEL,
             "{trigger}"
         );
-        assert_eq!(starts(&fx.log()).len(), runs + 1, "{trigger}");
+        let log = fx.log();
+        assert_eq!(starts(&log).len(), runs + 1, "{trigger}");
+        assert_eq!(
+            log.matches("ready after answer").count(),
+            2,
+            "{trigger}: {log}"
+        );
     }
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
+async fn a_first_turn_without_an_answer_keeps_the_channel_closed_and_restarts() {
+    let fx = Fixture::new("noanswer");
+    let cfg = Config {
+        limits: Limits {
+            enabled: false,
+            ..fx.config().limits
+        },
+        ..fx.config()
+    };
+    // As with an expired token: Claude Code answers the turn itself, with an error.
+    fx.set("fake-mode", "synthetic");
+    assert_eq!(silta_session::run(&cfg, CancellationToken::new()).await, 1);
+    let log = fx.log();
+    assert!(log.contains("line Session test started"), "{log}");
+    assert!(!log.contains("ready"), "the channel stays closed: {log}");
+    assert!(!fx.home.join("channel-ready").exists());
     fs::remove_dir_all(&fx.home).unwrap();
 }
 
@@ -890,7 +929,7 @@ async fn auth_line(name: &str, auth: Auth) -> String {
         let stop = stop.clone();
         async move { silta_session::run(&cfg, stop).await }
     });
-    let log = fx.until(10, |l| l.contains("ready after init")).await;
+    let log = fx.until(10, |l| l.contains("ready after answer")).await;
     stop.cancel();
     run.await.unwrap();
     log.lines()

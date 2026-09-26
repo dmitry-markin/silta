@@ -19,9 +19,12 @@ pub enum Event {
     /// `parent_tool_use_id`). `context_tokens` is the size of the prompt of the API call
     /// that produced it (input plus cache read plus cache creation); `None` on a
     /// main-line message means the usage is missing, which the contract check reports.
+    /// `synthetic` marks a message Claude Code wrote itself (`model` `<synthetic>`, an
+    /// API error shown as a message) rather than one a model produced.
     Assistant {
         subagent: bool,
         context_tokens: Option<u64>,
+        synthetic: bool,
     },
     /// A user message: a tool result, a timer wakeup, the compaction's own lines or a
     /// delivered message; a turn is in progress. `person` marks a delivery through the
@@ -67,6 +70,11 @@ pub fn read(line: &str) -> (String, Event) {
             Event::Assistant {
                 subagent: subagent(&map),
                 context_tokens: context_of(&map),
+                synthetic: map
+                    .get("message")
+                    .and_then(|m| m.get("model"))
+                    .and_then(Value::as_str)
+                    == Some("<synthetic>"),
             },
         ),
         "user" => (
@@ -541,7 +549,8 @@ mod tests {
             event,
             Event::Assistant {
                 subagent: false,
-                context_tokens: Some(37250)
+                context_tokens: Some(37250),
+                synthetic: false
             }
         );
         let subagent = r#"{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":0}},"parent_tool_use_id":"toolu_1"}"#;
@@ -550,7 +559,8 @@ mod tests {
             event,
             Event::Assistant {
                 subagent: true,
-                context_tokens: Some(105)
+                context_tokens: Some(105),
+                synthetic: false
             }
         );
         assert!(!s.contains("context"), "{s}");
@@ -559,7 +569,17 @@ mod tests {
             read(no_usage).1,
             Event::Assistant {
                 subagent: false,
-                context_tokens: None
+                context_tokens: None,
+                synthetic: false
+            }
+        );
+        let synthetic = r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Failed to authenticate"}],"usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"parent_tool_use_id":null}"#;
+        assert_eq!(
+            read(synthetic).1,
+            Event::Assistant {
+                subagent: false,
+                context_tokens: Some(0),
+                synthetic: true
             }
         );
         let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"sent","is_error":false},{"type":"tool_result","tool_use_id":"y","content":[{"type":"text","text":"boom"}],"is_error":true}]}}"#;

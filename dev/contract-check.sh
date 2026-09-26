@@ -9,9 +9,10 @@
 # Asserts: the init line names a version and it is in silta-session's TESTED_VERSIONS;
 # a main-line assistant line carries the three usage counts; the turn's prompt comes
 # back as a user line (the idle gap rests on that line for a channel delivery); the
-# result line carries is_error; a get_context_usage control request is answered with an
-# integer maxTokens (the window check at every start). Agents, compaction and the hook
-# stay in the manual procedure. Exit 0 when every check passes, 1 otherwise; the failures are listed.
+# result line carries is_error; with the unit's SILTA_MODEL and
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW, a get_context_usage control request is answered with a
+# maxTokens of at least that window (the window check at every start, which ends the
+# session otherwise). Agents, compaction and the hook stay in the manual procedure. Exit 0 when every check passes, 1 otherwise; the failures are listed.
 #
 # TODO: this currently lacks at least the check for user message detection, that needs
 #       a fake channel plugin.
@@ -22,12 +23,15 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 claude=${CLAUDE_BIN:-claude}
 tested=$(grep -o 'TESTED_VERSIONS: &\[&str\] = &\[[^]]*\]' "$repo/crates/silta-session/src/contract.rs" | grep -o '"[0-9.]*"' | tr -d '"' | tr '\n' ' ')
 out=$(mktemp "${TMPDIR:-/tmp}/contract-check.XXXXXX")
+unit="$repo/deploy/silta-session@.service"
+model=$(sed -n 's/^Environment=SILTA_MODEL=//p' "$unit")
+window=$(sed -n 's/^Environment=CLAUDE_CODE_AUTO_COMPACT_WINDOW=//p' "$unit")
 
 trap 'rm -f "$out"' EXIT
 
 printf '%s\n' '{"type":"control_request","request_id":"silta-window","request":{"subtype":"get_context_usage","detail":"summary"}}' \
   '{"type":"user","message":{"role":"user","content":"Reply with the single word ok and nothing else."}}' \
-  | "$claude" -p --input-format stream-json --output-format stream-json --verbose \
+  | CLAUDE_CODE_AUTO_COMPACT_WINDOW=$window "$claude" --model "$model" -p --input-format stream-json --output-format stream-json --verbose \
       --replay-user-messages --permission-mode auto --permission-prompts none > "$out" 2>"$out.err"
 status=$?
 if [ $status -ne 0 ]; then
@@ -36,7 +40,7 @@ if [ $status -ne 0 ]; then
 fi
 rm -f "$out.err"
 
-python3 - "$out" "$tested" <<'PY'
+python3 - "$out" "$tested" "$window" <<'PY'
 import json, sys
 lines = [json.loads(l) for l in open(sys.argv[1]) if l.strip().startswith("{")]
 tested = sys.argv[2].split()
@@ -75,6 +79,8 @@ if usage is None:
     fails.append("no control_response to get_context_usage; silta-session ends every start at the window check")
 elif usage.get("subtype") != "success" or not isinstance(usage.get("response", {}).get("maxTokens"), int):
     fails.append(f"get_context_usage answered without an integer response.maxTokens: {usage.get('error') or usage.get('subtype')}")
+elif usage["response"]["maxTokens"] < int(sys.argv[3]):
+    fails.append(f"get_context_usage gives maxTokens {usage['response']['maxTokens']}, below the unit's window {sys.argv[3]}: every start would end with exit 79")
 print(f"Claude Code {version or '?'}: {len(lines)} lines, {len(main)} main-line assistant, {len(results)} result")
 for f in fails:
     print(f"FAIL {f}")

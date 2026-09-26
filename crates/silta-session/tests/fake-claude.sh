@@ -12,8 +12,9 @@
 # compacthang (a /compact never ends), compacthangonce (the same, once: the mode is
 # reset to ok first) or busycompact (an unrelated turn ends before the compaction, as
 # if a person's message had been queued ahead of the command), fallback-<trigger> (every
-# turn reports a model_fallback with that trigger first) or nowindow (a control request
-# is never answered).
+# turn reports a model_fallback with that trigger first), nowindow (a control request
+# is never answered) or synthetic (every turn fails before a model answers, as with an
+# expired token: a <synthetic> message and an error result).
 # HOME/fake-context is the context size reported in every assistant line; a compaction
 # sets it to 100, as the real one shrinks the context. HOME/fake-window is the maxTokens
 # of the answer to a get_context_usage control request (default 500000).
@@ -40,13 +41,19 @@ echo "start $id ${resume:+resumed}" >> "$HOME/fake.log"
 echo "auth oauth=${CLAUDE_CODE_OAUTH_TOKEN-unset} base=${ANTHROPIC_BASE_URL-unset} token=${ANTHROPIC_AUTH_TOKEN-unset} key=${ANTHROPIC_API_KEY-unset} discovery=${CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY-unset}" >> "$HOME/fake.log"
 context=$(cat "$HOME/fake-context" 2>/dev/null || echo 1000)
 # What the plugin relies on: SILTA_READY_FILE is gone at the start and appears once the
-# supervisor has read the init line.
-[ -e "${SILTA_READY_FILE:-}" ] && echo "ready before init" >> "$HOME/fake.log"
+# supervisor has read the first answer of a model.
+[ -e "${SILTA_READY_FILE:-}" ] && echo "ready before answer" >> "$HOME/fake.log"
+answered=""
+answer() {
+  assistant "$1"
+  [ -n "$answered" ] && return
+  answered=1
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -e "${SILTA_READY_FILE:-}" ] && { echo "ready after answer" >> "$HOME/fake.log"; return; }
+    sleep 0.2
+  done
+}
 init
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  [ -e "${SILTA_READY_FILE:-}" ] && { echo "ready after init" >> "$HOME/fake.log"; break; }
-  sleep 0.2
-done
 touch "$proj/$id.jsonl"
 while IFS= read -r line; do
   case "$line" in *'"type":"control_request"'*)
@@ -98,7 +105,12 @@ while IFS= read -r line; do
     echo "fallback $id" >> "$HOME/fake.log"
     ;;
   esac
-  assistant ok
+  if [ "$(mode)" = synthetic ]; then
+    echo '{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Failed to authenticate"}],"usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"parent_tool_use_id":null}'
+    echo '{"type":"result","subtype":"success","is_error":true,"num_turns":1,"result":"Failed to authenticate. API Error: 401","usage":{}}'
+    continue
+  fi
+  answer ok
   case "$(mode)" in
     hang) sleep 30; exit 0 ;;
     hangonce) echo ok > "$HOME/fake-mode"; sleep 30; exit 0 ;;
