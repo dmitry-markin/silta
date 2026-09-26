@@ -22,19 +22,6 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  fmt:
-    name: cargo fmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal --component rustfmt
-          rustup default stable
-
-      - run: cargo fmt --all --check
-
   check:
     name: cargo check
     runs-on: ubuntu-latest
@@ -56,6 +43,34 @@ jobs:
 
       - run: cargo check --workspace --all-targets --locked
 
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - run: cargo test --workspace --locked
+
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - run: cargo fmt --all --check
+
   clippy:
     name: cargo clippy
     runs-on: ubuntu-latest
@@ -72,21 +87,6 @@ jobs:
           shared-key: check
 
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  test:
-    name: cargo test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      - run: cargo test --workspace --locked
 
   deb:
     name: build-deb.sh (Debian 13)
