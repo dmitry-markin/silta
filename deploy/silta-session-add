@@ -23,6 +23,13 @@ if [ -z "$name" ] || ! [[ "$name" =~ ^[a-z][a-z0-9-]*$ ]]; then
   echo "usage: silta-session-add <name>    (lowercase letters, digits and hyphens: the session name in siltad.toml)" >&2
   exit 2
 fi
+# The contract checker runs as silta-check with /var/lib/silta/check and
+# /etc/silta/auth/check (silta-contract-check.service): a mind named check would share
+# its user, its state and its credential.
+if [ "$name" = check ]; then
+  echo "silta-session-add: the name check is reserved for the contract checker (silta-check)" >&2
+  exit 2
+fi
 [ "$(id -u)" = 0 ] || { echo "silta-session-add: run as root" >&2; exit 1; }
 user="silta-$name"
 home="/var/lib/silta/$name"

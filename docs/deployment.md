@@ -88,7 +88,7 @@ Claude Code is installed under the `claude` user and never updates itself (`DISA
    sudo systemctl start silta-contract-check
    sudo journalctl -u silta-contract-check -b
    ```
-   Every check prints one line; the last lines say whether the contract holds and whether the version is one the release was checked against (`TESTED_VERSIONS` in `crates/silta-session/src/contract.rs`). A run takes a few minutes and costs a few short turns on the configured model plus two turns on a cheap model.
+   Every check prints one line; the last lines say whether the contract holds and whether the version is one the release was checked against (`TESTED_VERSIONS` in `crates/silta-session/src/contract.rs`). A run takes several minutes and makes some fifteen short turns on the configured model plus two turns on a cheap model, about a dollar at list prices.
 3. Restart the sessions onto the new version at a quiet moment, since a restart rewrites each session's context:
    ```bash
    sudo systemctl restart silta-session.target

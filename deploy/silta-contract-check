@@ -15,18 +15,31 @@ organised by the piece of Silta that depends on it:
 
   the supervisor's launch     the command line of `silta-session` (lib.rs `run_once`), the
                               environment knobs Claude Code reads, stdin EOF as the graceful
-                              stop, `--resume` and its failure text, the transcript's path
+                              stop (in the middle of a turn, and with a background command
+                              running), `--resume` and its failure text, the transcript's path
   the supervisor's reading    every stream-json line `stream.rs` parses: `system init`,
-                              main-line `assistant` usage, `user` and `result` lines with
+                              main-line `assistant` usage and the `parent_tool_use_id` that
+                              sets a subagent's lines apart, `user` and `result` lines with
                               their channel `origin`, `background_tasks_changed`, the
                               `/compact` exchange, `model_fallback`, the `<synthetic>` marker
                               of an API failure, the `control_response` of the window check
-  the rotation's hook         the PreCompact hook blocking an automatic compaction and
-                              leaving the marker (deploy/silta-precompact-block)
+                              (at a fresh start and at a resume)
+  the rotation                the handoff note written into the memory directory, the
+                              PreCompact hook blocking an automatic compaction and leaving
+                              the marker (deploy/silta-precompact-block)
   the channel                 the plugin installed from the marketplace as `silta-session-add`
                               does it, registered through `--channels`, its tools in the
-                              session, a message from the daemon becoming a `<channel>` user
-                              message and a turn that answers it with the reply tool
+                              session, messages from the daemon becoming `<channel>` user
+                              messages with every attribute the plugin sets (a thread, a
+                              quote, a file, a reaction), whether they arrive between turns,
+                              during a turn or during `/compact`, and turns that answer them
+                              with the reply tool
+  the managed settings        the keys the deployment sets, and the effect of those a run can
+                              see: the channel allowlist and the hook. That the Bash sandbox
+                              hides the credential is not checked: a turn that looks for it
+                              is refused by auto mode's classifier as credential
+                              exploration, and gets the session flagged by the model's
+                              safeguards
 
 Two ways to run it:
 
@@ -63,10 +76,10 @@ carries the same words as the function's name, so a failure leads straight to it
 The script is formatted with black at 100 columns and checked with pycodestyle (E203 and
 W503 ignored, as black's style needs), both run by CI next to the replay.
 
-A full run makes a handful of short turns on the configured model and, for the hook,
+A full run makes some fifteen short turns on the configured model and, for the hook,
 two turns on a cheap model over a context of about 106 000 tokens, a public-domain novel sent
 whole (`--hook-model`; `--skip hook`
-leaves that run out); it takes a few minutes and costs well under a dollar. The report ends
+leaves that run out); it takes several minutes and costs about a dollar. The report ends
 with the run's cost as Claude Code counted it, at list prices, which is notional on a
 subscription.
 """
@@ -74,6 +87,7 @@ subscription.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import pwd
@@ -164,17 +178,31 @@ UNIT_KEYS = [
 ]
 
 # The keys of /etc/claude-code/managed-settings.json the deployment rests on
-# (assistant/managed-settings.json), each with what it does for Silta.
+# (assistant/managed-settings.json), each with what it does for Silta. Claude Code ignores
+# a key it does not know, so a key it renamed or dropped goes unnoticed unless a run
+# shows its effect: the runs show the effect of those in MANAGED_KEYS_SEEN (the channel
+# delivery, the hook run); the others are only checked to be present.
 MANAGED_KEYS = {
     "channelsEnabled": "without it Claude Code drops channel messages for organisation accounts",
     "allowedChannelPlugins": "the allowlist the channel plugin must be on",
     "hooks": "the PreCompact hook that turns an automatic compaction into a rotation",
+    "allowManagedHooksOnly": "only the managed hooks run, none a mind writes for itself",
     "allowManagedMcpServersOnly": "only the plugin binary may run as an MCP server",
     "allowedMcpServers": "the plugin binary's allowlist entry",
+    "disableSideloadFlags": "command-line flags cannot bring in settings or MCP servers",
     "strictKnownMarketplaces": "the packaged marketplace is the only one a mind may add",
     "sandbox": "the bubblewrap sandbox for Bash, which protects the credential",
     "permissions": "the Edit deny rules that keep the mind out of the harness's files",
+    "disableRemoteControl": "no remote control of a mind's session",
+    "disableSkillShellExecution": "skills run no shell commands of their own",
+    "disableClaudeAiConnectors": "no claude.ai connectors in a mind's session",
+    "syncClaudeAiSkills": "no skills synced from the account",
+    "syncClaudeAiPlugins": "no plugins synced from the account",
+    "autoUploadSessions": "a mind's transcripts stay on the host",
+    "crossSessionInbound": "other sessions cannot message a mind",
+    "isolatePeerMachines": "the account's sessions on other machines cannot reach a mind",
 }
+MANAGED_KEYS_SEEN = {"channelsEnabled", "allowedChannelPlugins", "hooks"}
 
 SYSTEM_PROMPT = """You are taking part in an automated test of the harness you run in. \
 Follow each instruction literally and briefly. Never ask questions, never add commentary; \
@@ -183,6 +211,57 @@ when told to answer with a single word, answer with exactly that word and nothin
 INTRO = (
     "Contract check started: this line comes from the host, not from a person. "
     "Reply with the single word ok and nothing else."
+)
+
+# The host lines of the main run's later turns; the checks find the turns by them.
+MIDTURN = (
+    "Use the Bash tool exactly once to run the command `sleep 15` in the foreground (not in the"
+    " background), then reply with the single word ok. Messages may arrive meanwhile: do what"
+    " each asks."
+)
+SUBAGENT = (
+    "Use the Agent tool exactly once, in the foreground (not in the background), with the"
+    " general-purpose subagent and the prompt `Reply with the single word ok.`; call no other"
+    " tool, wait for its answer, then reply with the single word ok."
+)
+BACKGROUND = (
+    "Use the Bash tool exactly once to run the command `sleep 4` with run_in_background set to"
+    " true, then reply with the single word ok and end your turn without waiting for the command."
+)
+# The rotation's handoff request (lib.rs `handoff`), word for word.
+HANDOFF = (
+    "Write your handoff now: the context is about to be compacted, and the compaction step will"
+    " follow after this. This line comes from the host, not from a person. Rewrite the memory"
+    " note `handoff` (the file handoff.md in your memory directory) even if nothing is pending:"
+    " the host waits for that file to change and takes the turn that rewrites it as your"
+    " handoff turn. End your turn when it is written."
+)
+COMPACT = "/compact These instructions come from the host: write a summary of two sentences."
+STOP = (
+    "Use the Bash tool exactly once to run the command `sleep 8` in the foreground (not in the"
+    " background), then reply with the single word ok."
+)
+
+RESUME = (
+    "Session resumed by the host for a test. Use the Bash tool exactly once to run the command"
+    " `sleep 300` with run_in_background set to true, then reply with the single word ok and end"
+    " your turn without waiting for the command."
+)
+
+# The messages the fake daemon delivers in the main run: a plain one, one in a thread
+# quoting the first with a file (sent during a turn), a reaction (in the same turn), and
+# one during the compaction.
+ROOM = "!room:contract.check"
+THREAD = "$root-1"
+ATTACHMENT = ("note.txt", "text/plain", b"A note for the contract check.\n")
+REPLY_OK = (
+    "This is a test of the channel. Call the reply tool once with the single word ok as the"
+    " text, more set to false, and then end your turn."
+)
+REPLY_IN_THREAD = (
+    "This is a test of the channel in a thread. Call the reply tool once with the single word ok"
+    " as the text, the thread attribute of this message as thread, more set to false; do not"
+    " open the attached file."
 )
 
 
@@ -439,6 +518,106 @@ def content_text(line: dict) -> Optional[str]:
             if isinstance(block, dict) and isinstance(block.get("text"), str):
                 return block["text"]
     return None
+
+
+def all_text(line: dict) -> str:
+    """Every text of a `user` line, joined: messages Claude Code queued during a turn may
+    share one line."""
+    content = line.get("message", {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        )
+    return ""
+
+
+def channel_tags(line: dict) -> list[dict[str, str]]:
+    """The attributes of every `<channel ...>` tag in a `user` line."""
+    return [
+        dict(re.findall(r'([A-Za-z_][A-Za-z0-9_]*)="([^"]*)"', attrs))
+        for attrs in re.findall(r"<channel\s([^>]*)>", all_text(line))
+    ]
+
+
+def find_delivery(lines: list[dict], event_id: str) -> tuple[Optional[int], dict, dict]:
+    """The index of the `user` line that delivered the event, the line and its tag's
+    attributes; (None, {}, {}) when the event never arrived."""
+    for i, line in enumerate(lines):
+        if line.get("type") != "user":
+            continue
+        for tag in channel_tags(line):
+            if tag.get("event_id") == event_id:
+                return i, line, tag
+    return None, {}, {}
+
+
+def sent_at(trace: Trace, event_id: str) -> Optional[int]:
+    """The trace index at which the fake daemon sent the event."""
+    return next(
+        (
+            i
+            for i, line in enumerate(trace.lines)
+            if line["type"] == "_daemon"
+            and line.get("event") == "sent"
+            and line.get("line", {}).get("event", {}).get("event_id") == event_id
+        ),
+        None,
+    )
+
+
+def stdin_at(trace: Trace, text: str) -> Optional[int]:
+    """The trace index at which the host line `text` was written."""
+    return next(
+        (
+            i
+            for i, line in enumerate(trace.lines)
+            if line["type"] == "_stdin"
+            and line.get("line", {}).get("message", {}).get("content") == text
+        ),
+        None,
+    )
+
+
+def result_text(block: dict) -> str:
+    """The text of a `tool_result` block."""
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+def find_tool_result(lines: list[dict], tool_use_id: str) -> tuple[Optional[int], dict]:
+    """The index of the `user` line answering a tool call, and its `tool_result` block."""
+    for i, line in enumerate(lines):
+        if line.get("type") == "user":
+            for block in tool_results(line):
+                if block.get("tool_use_id") == tool_use_id:
+                    return i, block
+    return None, {}
+
+
+def main_tool_uses(lines: list[dict], names: tuple[str, ...]) -> list[tuple[int, dict]]:
+    """The main line's calls of the named tools, with the index of their line."""
+    return [
+        (i, use)
+        for i, line in enumerate(lines)
+        if line.get("type") == "assistant" and is_main(line)
+        for use in tool_uses(line)
+        if use.get("name") in names
+    ]
+
+
+def session_slug(path: Path) -> str:
+    """The directory name Claude Code files a workspace's transcripts and caches under."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
 
 
 def channel_origin(line: dict) -> bool:
@@ -795,25 +974,34 @@ class FakeDaemon:
             self.writer.write(json.dumps(obj, ensure_ascii=False) + "\n")
             self.writer.flush()
 
-    def event(self, event_id: str, text: str) -> None:
-        """A message from Alice in her DM room, as the daemon would deliver it."""
-        self.send(
-            {
-                "event": {
-                    "kind": "message",
-                    "person": "Alice",
-                    "role": "owner",
-                    "sender": "@alice:contract.check",
-                    "room_id": "!room:contract.check",
-                    "room": "dm",
-                    "event_id": event_id,
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "text": text,
-                    "transcribed": False,
-                    "attachments": [],
-                }
-            }
-        )
+    def event(self, event_id: str, text: str, **extra: Any) -> None:
+        """A message from Alice in her DM room, as the daemon would deliver it; `extra`
+        sets the optional fields (`kind`, `in_reply_to`, `thread`, `reacts_to`,
+        `attachments`)."""
+        event = {
+            "kind": "message",
+            "person": "Alice",
+            "role": "owner",
+            "sender": "@alice:contract.check",
+            "room_id": ROOM,
+            "room": "dm",
+            "event_id": event_id,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "text": text,
+            "transcribed": False,
+            "attachments": [],
+        }
+        event.update(extra)
+        self.send({"event": event})
+
+    def file(self, transfer: str, name: str, mime: str, data: bytes) -> dict:
+        """An attachment ahead of the event that names it (protocol.rs `FileHeader`, one
+        `chunk`, `file_end`); returns the event's attachment entry."""
+        header = {"transfer": transfer, "name": name, "mime": mime, "size": len(data)}
+        self.send({"file": header})
+        self.send({"chunk": {"transfer": transfer, "data": base64.b64encode(data).decode()}})
+        self.send({"file_end": {"transfer": transfer}})
+        return header
 
     def close(self) -> None:
         try:
@@ -1005,9 +1193,21 @@ class ClaudeRun:
         self.write({"type": "control_request", "request_id": request_id, "request": request})
 
     def touch_ready(self) -> None:
-        """What the supervisor does at the first answer of a model: the plugin may connect."""
-        self.ready_file.write_text("contract-check\n", encoding="utf-8")
+        """What the supervisor does at the first answer of a model: the plugin may connect.
+        Traced before the file appears, so that the plugin's connection can never be
+        traced ahead of it."""
         self.trace.add({"type": "_ready"})
+        self.ready_file.write_text("contract-check\n", encoding="utf-8")
+
+    def wait_tool_use(self, start: int, names: tuple[str, ...]) -> Optional[dict]:
+        """The main line's first call of one of the named tools from index `start` on."""
+        return self.trace.wait(
+            lambda line: line.get("type") == "assistant"
+            and is_main(line)
+            and any(use.get("name") in names for use in tool_uses(line)),
+            self.cfg.turn_timeout,
+            start,
+        )
 
     def wait_result(self, start: int, timeout: Optional[float] = None) -> Optional[dict]:
         return self.trace.wait(
@@ -1052,7 +1252,7 @@ class ClaudeRun:
             self.process.wait()
 
 
-def record_file(trace: Trace, name: str, path: Path) -> None:
+def record_file(trace: Trace, name: str, path: Path, **extra: Any) -> None:
     entry: dict[str, Any] = {
         "type": "_file",
         "name": name,
@@ -1061,9 +1261,11 @@ def record_file(trace: Trace, name: str, path: Path) -> None:
     }
     if path.is_file():
         try:
+            entry["mtime"] = path.stat().st_mtime
             entry["content"] = path.read_text(encoding="utf-8")[:4000]
         except OSError as e:
             entry["error"] = str(e)
+    entry.update(extra)
     trace.add(entry)
 
 
@@ -1241,7 +1443,7 @@ def check_managed_settings(report: Report, cfg: Config) -> None:
             "managed settings keys",
             not missing,
             f"{cfg.managed_settings} lacks {missing}",
-            f"all of {sorted(MANAGED_KEYS)}",
+            f"all {len(MANAGED_KEYS)} of MANAGED_KEYS",
         )
     elif missing:
         report.info(
@@ -1249,6 +1451,12 @@ def check_managed_settings(report: Report, cfg: Config) -> None:
             f"{cfg.managed_settings} lacks {missing} (the package installs them all; fine"
             " on a developer's machine)",
         )
+    report.info(
+        "managed settings effects",
+        f"seen in the runs: {', '.join(sorted(MANAGED_KEYS_SEEN))}; present only, a rename in"
+        " Claude Code would go unnoticed: "
+        + ", ".join(k for k in MANAGED_KEYS if k not in MANAGED_KEYS_SEEN),
+    )
     report.check(
         "channelsEnabled",
         managed.get("channelsEnabled") is True,
@@ -1263,22 +1471,21 @@ def check_managed_settings(report: Report, cfg: Config) -> None:
         if isinstance(p, dict)
     )
     report.check("allowedChannelPlugins", listed, f"{PLUGIN_ID} is not in {allowed}", PLUGIN_ID)
-    hooks = managed.get("hooks", {}).get("PreCompact") or []
-    commands = [
-        h.get("command")
-        for entry in hooks
-        if isinstance(entry, dict)
-        for h in entry.get("hooks", [])
-        if isinstance(h, dict)
-    ]
-    matchers = [entry.get("matcher") for entry in hooks if isinstance(entry, dict)]
+    matchers, commands = precompact_hook(managed)
+    runnable = any(c and Path(c).is_file() for c in commands)
     if cfg.service:
         report.check(
             "managed PreCompact hook",
-            "auto" in matchers and any(c and Path(c).is_file() for c in commands),
+            "auto" in matchers and runnable,
             f"matchers {matchers}, commands {commands}",
             f"matcher auto runs {commands}",
         )
+    elif "auto" in matchers and not runnable:
+        report.warn(
+            "managed PreCompact hook",
+            f"the managed hook runs {commands}, which do not exist here: the hook run is skipped",
+        )
+    if cfg.service:
         servers = managed.get("allowedMcpServers") or []
         allowed_bins = [s.get("serverCommand") for s in servers if isinstance(s, dict)]
         report.check(
@@ -1298,6 +1505,50 @@ def check_managed_settings(report: Report, cfg: Config) -> None:
             )
         ),
     )
+
+
+def read_managed(cfg: Config) -> Optional[dict]:
+    """The managed settings, None when there are none or they cannot be read (which
+    check_managed_settings reports)."""
+    try:
+        managed = json.loads(cfg.managed_settings.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return managed if isinstance(managed, dict) else None
+
+
+def precompact_hook(managed: dict) -> tuple[list, list]:
+    """The matchers and the commands of the managed PreCompact hooks."""
+    hooks = (managed.get("hooks") or {}).get("PreCompact") or []
+    matchers = [entry.get("matcher") for entry in hooks if isinstance(entry, dict)]
+    commands = [
+        h.get("command")
+        for entry in hooks
+        if isinstance(entry, dict)
+        for h in entry.get("hooks", [])
+        if isinstance(h, dict)
+    ]
+    return matchers, commands
+
+
+def hook_plan(cfg: Config) -> tuple[bool, Optional[str]]:
+    """How the hook run gets its hook: from the managed settings (true), or through
+    `--settings` (false); with the reason the run is skipped when neither works. A managed
+    hook whose command is missing here would never write the marker, and with
+    `allowManagedHooksOnly` Claude Code ignores the `--settings` one."""
+    managed = read_managed(cfg) or {}
+    matchers, commands = precompact_hook(managed)
+    if "auto" in matchers:
+        if any(c and Path(c).is_file() for c in commands):
+            return True, None
+        return True, f"the managed PreCompact hook runs {commands}, which do not exist here"
+    if managed.get("allowManagedHooksOnly") is True:
+        return False, (
+            f"{cfg.managed_settings} has no PreCompact hook and allowManagedHooksOnly, so the"
+            " script's own hook would be ignored"
+        )
+    return False, None
+
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1404,12 +1655,11 @@ class PluginInstall:
 
 
 def cleanup_traces(cfg: Config, session_ids: list[str]) -> None:
-    """On a developer's machine, Claude Code kept the runs' transcripts under
-    ~/.claude/projects/<workspace slug>/ and the plugin's logs under
-    ~/.cache/claude-cli-nodejs/<workspace slug>/; both go, so nothing of the check lingers
-    in the developer's own state."""
-    if cfg.service:
-        return
+    """Claude Code kept the runs' transcripts and the memory they wrote under
+    <HOME>/.claude/projects/<workspace slug>/ and the plugin's logs under
+    <HOME>/.cache/claude-cli-nodejs/<workspace slug>/; both go, the run's own traces keep
+    what the checks read. Nothing of the check lingers in a developer's own state, and the
+    service's next run starts without the memory of this one."""
     projects = cfg.home / ".claude/projects"
     slug_dirs = set()
     if projects.is_dir():
@@ -1422,6 +1672,16 @@ def cleanup_traces(cfg: Config, session_ids: list[str]) -> None:
         for d in cache.iterdir():
             if d.name in slug_dirs:
                 shutil.rmtree(d, ignore_errors=True)
+
+
+def clear_workspace_state(cfg: Config) -> None:
+    """The service's workspace is the same at every run: whatever an earlier run left under
+    its slug (a run cut short never reached cleanup_traces), memory above all, goes before
+    the first turn, so that it cannot steer this run's model."""
+    slug = session_slug(cfg.state / "workspace")
+    for d in (cfg.home / ".claude/projects" / slug, cfg.home / ".cache/claude-cli-nodejs" / slug):
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def record_mcp_logs(trace: Trace, home: Path, transcript: Optional[Path]) -> None:
@@ -1479,6 +1739,8 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
         "intro": INTRO,
         "fallback": cfg.fallback_model,
         "home": str(cfg.home),
+        "inbox": str(cfg.state / "workspace" / "inbox"),
+        "subagent_model": cfg.passthrough.get("CLAUDE_CODE_SUBAGENT_MODEL"),
     }
     trace.add({"type": "_meta", **meta})
     daemon = FakeDaemon(cfg.state / "siltad.sock", "contract-check", trace)
@@ -1515,17 +1777,14 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
         # it; then a message from Alice, whose turn should call the reply tool.
         if daemon.connected.wait(30):
             n = len(trace)
-            daemon.event(
-                "$alice-1",
-                "This is a test of the channel. Call the reply tool once with the single word ok as"
-                " the text, more set to false, and then end your turn.",
-            )
+            daemon.event("$alice-1", REPLY_OK)
             trace.wait(
                 lambda line: line.get("type") == "result" and channel_origin(line),
                 cfg.turn_timeout,
                 n,
             )
             trace.wait_quiet(3, 30)
+            drive_midturn(run, daemon)
         else:
             trace.add(
                 {
@@ -1535,13 +1794,14 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
                     ),
                 }
             )
+        # A subagent in the foreground, whose lines must be told from the main line's.
+        n = len(trace)
+        run.send_user(SUBAGENT)
+        run.wait_result(n)
+        trace.wait_quiet(3, 30)
         # A background task, for the level signal the rotation waits on.
         n = len(trace)
-        run.send_user(
-            "Use the Bash tool exactly once to run the command `sleep 4` with run_in_background set"
-            " to true, then reply with the single word ok and end your turn without waiting for the"
-            " command."
-        )
+        run.send_user(BACKGROUND)
         run.wait_result(n)
         trace.wait(
             lambda line: line.get("type") == "system"
@@ -1551,19 +1811,48 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
             n,
         )
         trace.wait_quiet(4, 60)
-        # The compaction in place (lib.rs `compact`), with short instructions.
+        # The rotation's handoff (lib.rs `handoff`): the note in the memory directory next
+        # to the transcript, which is where the supervisor watches for it.
+        transcript = find_transcript(cfg.home, session_id)
+        note = transcript.parent / "memory" / "handoff.md" if transcript else None
         n = len(trace)
-        run.send_user(
-            "/compact These instructions come from the host: write a summary of two sentences."
+        since = time.time()
+        run.send_user(HANDOFF)
+        run.wait_result(n)
+        trace.wait_quiet(3, 30)
+        if note is not None:
+            record_file(trace, "handoff", note, since=since)
+        else:
+            trace.add({"type": "_file", "name": "handoff", "path": None, "exists": False})
+        # The compaction in place (lib.rs `compact`), with short instructions, and a
+        # message from Alice while it runs.
+        n = len(trace)
+        run.send_user(COMPACT)
+        trace.wait(
+            lambda line: line.get("type") == "system"
+            and (line.get("subtype") == "compact_boundary" or line.get("status") == "compacting"),
+            cfg.turn_timeout,
+            n,
         )
+        if daemon.connected.is_set():
+            daemon.event("$alice-4", REPLY_OK)
         trace.wait(
             lambda line: line.get("type") == "system" and line.get("subtype") == "compact_boundary",
             cfg.turn_timeout,
             n,
         )
         trace.wait(lambda line: line.get("type") == "result", cfg.turn_timeout, n)
+        if daemon.connected.is_set():
+            trace.wait(
+                lambda line: line.get("type") == "result" and channel_origin(line),
+                cfg.turn_timeout,
+                n,
+            )
         trace.wait_quiet(3, 30)
-        # The graceful stop, then the files the supervisor relies on.
+        # The graceful stop in the middle of a turn: the turn ends, then Claude Code.
+        n = len(trace)
+        run.send_user(STOP)
+        run.wait_tool_use(n, ("Bash",))
         run.close_stdin()
         code = run.wait_exit(cfg.stop_grace)
         if code is not None:
@@ -1586,6 +1875,41 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
         trace.close()
 
 
+def drive_midturn(run: ClaudeRun, daemon: FakeDaemon) -> None:
+    """Two messages from Alice while a turn runs, as a person writes while the mind works:
+    one in a thread, quoting her first message, with a file; then a reaction to the mind's
+    first reply."""
+    trace = run.trace
+    n = len(trace)
+    run.send_user(MIDTURN)
+    if run.wait_tool_use(n, ("Bash",)) is None:
+        trace.add({"type": "_note", "text": "no Bash call in the mid-turn turn"})
+    name, mime, data = ATTACHMENT
+    attachment = daemon.file("contract-1", name, mime, data)
+    daemon.event(
+        "$alice-2",
+        REPLY_IN_THREAD,
+        in_reply_to="$alice-1",
+        thread=THREAD,
+        attachments=[attachment],
+    )
+    daemon.event("$alice-3", "👍", kind="reaction", reacts_to="$reply-1")
+    for event_id in ("$alice-2", "$alice-3"):
+        trace.wait(
+            lambda line: line.get("type") == "user"
+            and any(t.get("event_id") == event_id for t in channel_tags(line)),
+            run.cfg.turn_timeout,
+            n,
+        )
+    trace.wait(
+        lambda line: line["type"] == "_daemon"
+        and (line.get("line", {}).get("cmd", {}).get("reply") or {}).get("thread") == THREAD,
+        run.cfg.turn_timeout,
+        n,
+    )
+    trace.wait_quiet(5, run.cfg.turn_timeout)
+
+
 def check_main(report: Report, trace: Trace, meta: dict) -> Optional[str]:
     """The main run, from the session's start to its stop: one function per contract
     point, in the order the run produced the evidence. Returns the Claude Code version
@@ -1604,8 +1928,12 @@ def check_main(report: Report, trace: Trace, meta: dict) -> Optional[str]:
     check_no_fallback(report, lines)
     check_plugin_connection(report, trace)
     check_channel_delivery(report, lines)
+    check_midturn_delivery(report, trace, meta)
+    check_subagent(report, lines, meta)
     check_background_tasks(report, lines)
+    check_handoff(report, trace, lines, meta)
     check_compaction(report, trace)
+    check_compaction_delivery(report, trace)
     check_stop(report, trace)
     check_files(report, trace, meta)
     report_stderr(report, "main: ", trace)
@@ -1870,10 +2198,11 @@ def check_plugin_connection(report: Report, trace: Trace) -> None:
     """The plugin's side of the channel, seen by the fake daemon: it connects only after the
     ready file exists (SILTA_READY_FILE, written by the supervisor at the first answer of a
     model, lib.rs `open_channel`; a session whose model cannot serve must not take a
-    message), speaks protocol v4 with its session name in `hello` (protocol.rs), sends the
-    delivered event's `ack` once its notification reached Claude Code, forwards the model's
-    reply as a `cmd` with the room, the text and `more`, and closes its connection when
-    Claude Code exits (main.rs, PDEATHSIG)."""
+    message), speaks protocol v4 with its session name in `hello` (protocol.rs), sends each
+    delivered event's `ack` once it has written the event's notification to Claude Code
+    (whether Claude Code took it in is what the checks of the `user` lines below say),
+    forwards the model's reply as a `cmd` with the room, the text and `more`, and closes
+    its connection when Claude Code exits (main.rs, PDEATHSIG)."""
     daemon_events = [line for line in trace.lines if line["type"] == "_daemon"]
     if not daemon_events:
         report.skip("main: channel", "no daemon events in the trace")
@@ -1906,13 +2235,18 @@ def check_plugin_connection(report: Report, trace: Trace) -> None:
             f"hello {hello}",
             f"protocol {DAEMON_PROTOCOL}, session contract-check, client {hello.get('client')}",
         )
-    acks = [line["ack"] for line in received if "ack" in line]
+    acked = {line["ack"].get("event_id") for line in received if "ack" in line}
+    events = [
+        line["line"]["event"]["event_id"]
+        for line in daemon_events
+        if line.get("event") == "sent" and "event" in line.get("line", {})
+    ]
+    unacked = [e for e in events if e not in acked]
     report.check(
         "main: plugin ack",
-        any(a.get("event_id") == "$alice-1" for a in acks),
-        "the plugin did not acknowledge $alice-1 after handing it to Claude Code (acks:"
-        f" {acks})",
-        "acknowledged after the notification",
+        bool(events) and not unacked,
+        f"the plugin did not acknowledge {unacked or events} (acks: {sorted(acked)})",
+        f"{', '.join(events)} acknowledged once written to Claude Code",
     )
     cmds = [line["cmd"] for line in received if "cmd" in line]
     replies = [c["reply"] for c in cmds if "reply" in c]
@@ -1927,7 +2261,7 @@ def check_plugin_connection(report: Report, trace: Trace) -> None:
         # `more` is left out on the wire when false (protocol.rs `Reply`).
         report.check(
             "main: reply fields",
-            r.get("room_id") == "!room:contract.check"
+            r.get("room_id") == ROOM
             and isinstance(r.get("text"), str)
             and isinstance(r.get("more", False), bool),
             f"reply {shorten(r)}",
@@ -1965,7 +2299,8 @@ def check_channel_delivery(report: Report, lines: list[dict]) -> None:
         " channel (managed settings? plugin allowlist?) or dropped the notification",
     ):
         return
-    u = channel_users[0]
+    _, first, tag = find_delivery(lines, "$alice-1")
+    u = first or channel_users[0]
     text = (content_text(u) or "").lstrip()
     report.check(
         "main: channel origin",
@@ -1974,17 +2309,21 @@ def check_channel_delivery(report: Report, lines: list[dict]) -> None:
         " supervisor then relies on the <channel text alone",
         f"origin {u.get('origin')}",
     )
+    want = {
+        "source": CHANNEL_SOURCE,
+        "person": "Alice",
+        "role": "owner",
+        "room": "dm",
+        "room_id": ROOM,
+        "event_id": "$alice-1",
+    }
+    wrong = {k: tag.get(k) for k, v in want.items() if tag.get(k) != v}
     report.check(
         "main: channel tag",
-        text.startswith("<channel")
-        and f'source="{CHANNEL_SOURCE}"' in text
-        and 'person="Alice"' in text
-        and "room_id=" in text
-        and "event_id=" in text
-        and "ts=" in text,
-        f"the user text is {shorten(text, 300)!r}; expected a <channel"
-        f' source="{CHANNEL_SOURCE}" person="Alice" ... room_id event_id ts> tag',
-        f'<channel source="{CHANNEL_SOURCE}" person="Alice" ...>',
+        text.startswith("<channel") and not wrong and bool(tag.get("ts")),
+        f"the user text is {shorten(text, 300)!r}; wrong or missing attributes"
+        f" {wrong | ({} if tag.get('ts') else {'ts': None})}, expected {want} and ts",
+        f'<channel source="{CHANNEL_SOURCE}" person="Alice" role room room_id event_id ts>',
     )
     report.check(
         "main: channel result",
@@ -2001,13 +2340,256 @@ def check_channel_delivery(report: Report, lines: list[dict]) -> None:
         " trace)",
         REPLY_TOOL,
     )
-    errors = [b for line in users for b in tool_results(line) if b.get("is_error") is True]
+    # The plugin's tools must work; the model's other tools may fail on the way to what it
+    # was asked (a Bash write the sandbox refuses, a Read of a file not there yet), which
+    # the checks of each turn judge by the outcome.
+    plugin_calls = {
+        use.get("id")
+        for line in of_type(lines, "assistant")
+        for use in tool_uses(line)
+        if str(use.get("name", "")).startswith(TOOL_PREFIX)
+    }
+    failed = [b for line in users for b in tool_results(line) if b.get("is_error") is True]
+    errors = [b for b in failed if b.get("tool_use_id") in plugin_calls]
     report.check(
-        "main: tool results",
-        not errors,
-        f"{len(errors)} tool results are errors:"
-        f" {[shorten(b.get('content'), 150) for b in errors[:2]]}",
-        "none failed",
+        "main: plugin tool results",
+        bool(plugin_calls) and not errors,
+        f"{len(errors)} of the plugin's tool results are errors:"
+        f" {[shorten(result_text(b), 150) for b in errors[:2]]}",
+        f"{len(plugin_calls)} calls, none failed",
+    )
+    others = [b for b in failed if b.get("tool_use_id") not in plugin_calls]
+    if others:
+        report.info(
+            "main: other tool errors",
+            f"{len(others)}: " + " | ".join(shorten(result_text(b), 120) for b in others[:3]),
+        )
+
+
+def check_midturn_delivery(report: Report, trace: Trace, meta: dict) -> None:
+    """Messages that arrive while a turn runs, as a person writes while the mind works:
+    Claude Code keeps them and delivers each as a `user` line with the channel origin, in
+    that turn or the next (stream.rs `person_of`); the supervisor writes the ready file in
+    the middle of the first turn, so this is also what a session's first messages meet.
+    Their tags carry the optional attributes the plugin's instructions quote (mcp.rs
+    `channel_params`): `thread` and `in_reply_to`, the `attachment_<n>_*` of a file
+    already in the inbox, and `kind` with `reacts_to` for a reaction. The model answers
+    the one in the thread in the thread (model-dependent)."""
+    lines = trace.lines
+    host = stdin_at(trace, MIDTURN)
+    sent = sent_at(trace, "$alice-2")
+    if host is None or sent is None:
+        report.skip("main: mid-turn delivery", "the run did not get as far as the mid-turn turn")
+        return
+    ended = next(
+        (i for i in range(host, len(lines)) if lines[i].get("type") == "result"), len(lines)
+    )
+    if sent > ended:
+        report.warn(
+            "main: mid-turn delivery",
+            "the turn had ended before the messages were sent (did the model run the command"
+            " in the foreground?): not judged",
+        )
+    else:
+        at, line, _ = find_delivery(lines, "$alice-2")
+        report.check(
+            "main: mid-turn delivery",
+            at is not None and channel_origin(line),
+            (
+                "a message that arrived during a turn never appeared as a user line: Claude"
+                " Code dropped it, and a person writing to a busy mind is not heard"
+                if at is None
+                else f"its user line has no channel origin: {shorten(line.get('origin'))}"
+            ),
+            "delivered with the channel origin"
+            + (" within the turn" if at is not None and at < ended else " after the turn"),
+        )
+    _, _, tag = find_delivery(lines, "$alice-2")
+    name, mime, data = ATTACHMENT
+    want = {
+        "thread": THREAD,
+        "in_reply_to": "$alice-1",
+        "attachment_1_name": name,
+        "attachment_1_mime": mime,
+        "attachment_1_size": str(len(data)),
+    }
+    wrong = {k: tag.get(k) for k, v in want.items() if tag.get(k) != v}
+    path = tag.get("attachment_1_path", "")
+    if not path.startswith(meta.get("inbox", "") + "/"):
+        wrong["attachment_1_path"] = path or None
+    report.check(
+        "main: channel tag thread and file",
+        bool(tag) and not wrong,
+        f"$alice-2's tag lacks or changed {wrong} (tag: {tag}): the model would not see the"
+        " thread, the quote or the file",
+        f"thread, in_reply_to, attachment_1_* with {path}",
+    )
+    _, _, tag = find_delivery(lines, "$alice-3")
+    report.check(
+        "main: channel tag reaction",
+        tag.get("kind") == "reaction" and tag.get("reacts_to") == "$reply-1",
+        f"$alice-3's tag is {tag or 'missing'}; expected kind reaction, reacts_to $reply-1",
+        "kind reaction, reacts_to $reply-1",
+    )
+    replies = [
+        line["line"]["cmd"]["reply"]
+        for line in lines
+        if line["type"] == "_daemon"
+        and line.get("event") == "line"
+        and "reply" in line.get("line", {}).get("cmd", {})
+    ]
+    report.check(
+        "main: reply in thread",
+        any(r.get("thread") == THREAD for r in replies),
+        f"no reply with thread {THREAD} (replies: {[shorten(r, 80) for r in replies]};"
+        " model-dependent, check the trace)",
+        f"thread {THREAD}",
+    )
+
+
+def check_subagent(report: Report, lines: list[dict], meta: dict) -> None:
+    """A subagent's lines carry the `parent_tool_use_id` of the call that started it
+    (stream.rs `subagent`): the supervisor takes the context size from main-line
+    `assistant` lines alone, and a subagent line without the marker would stand for the
+    mind's context and trip or hold off the threshold rotation. Seen with a foreground
+    agent, during which the main line writes nothing: an unmarked `assistant` line inside
+    the call is the subagent's. The subagent runs on CLAUDE_CODE_SUBAGENT_MODEL, the unit's
+    knob."""
+    uses = main_tool_uses(lines, ("Agent", "Task"))
+    if not report.check(
+        "main: subagent call",
+        bool(uses),
+        "the model never called the Agent tool (model-dependent; check the trace)",
+        str(uses[0][1].get("name")) if uses else "",
+    ):
+        return
+    at, use = uses[0]
+    call = use.get("id")
+    done, block = find_tool_result(lines, call or "")
+    backgrounded = any(
+        line.get("subtype") == "task_started"
+        and line.get("tool_use_id") == call
+        and line.get("is_backgrounded")
+        for line in of_type(lines, "system")
+    )
+    if done is None or backgrounded:
+        report.warn(
+            "main: subagent lines marked",
+            "the agent ran in the background or never ended: its lines cannot be told apart",
+        )
+        return
+    message_id = lines[at].get("message", {}).get("id")
+    unmarked = [
+        line
+        for line in lines[at + 1 : done]
+        if line.get("type") == "assistant"
+        and is_main(line)
+        and line.get("message", {}).get("id") != message_id
+    ]
+    marked = [line for line in lines if line.get("parent_tool_use_id") == call]
+    report.check(
+        "main: subagent lines marked",
+        not unmarked,
+        f"{len(unmarked)} assistant lines without parent_tool_use_id while the agent ran"
+        f" (models {sorted({str(u.get('message', {}).get('model')) for u in unmarked})}): the"
+        " supervisor would take a subagent's context for the mind's",
+        (
+            f"{len(marked)} lines with parent_tool_use_id {call}"
+            if marked
+            else "Claude Code writes none of the subagent's lines"
+        ),
+    )
+    want = meta.get("subagent_model")
+    models = sorted(
+        {
+            str(line.get("message", {}).get("model"))
+            for line in marked
+            if line.get("type") == "assistant"
+        }
+        - {"<synthetic>"}
+    )
+    if not want:
+        report.info("main: subagent model", f"{models}; CLAUDE_CODE_SUBAGENT_MODEL is not set")
+    elif not models:
+        report.skip("main: subagent model", "no subagent lines to read the model from")
+    else:
+        report.check(
+            "main: subagent model",
+            models == [want],
+            f"the subagent ran on {models}, not CLAUDE_CODE_SUBAGENT_MODEL={want}",
+            want,
+        )
+    report.info("main: subagent result", shorten(result_text(block), 120))
+
+
+def check_handoff(report: Report, trace: Trace, lines: list[dict], meta: dict) -> None:
+    """The rotation's handoff turn (lib.rs `handoff`): asked for the memory note `handoff`,
+    the model writes handoff.md into its memory directory, `<HOME>/.claude/projects/<slug>/
+    memory`, next to the transcript, which is where the supervisor watches for the write
+    (state.rs `handoff_written`); in auto mode, with no permission prompt. Without it
+    every rotation waits out its cap and is given up."""
+    note = trace_file(trace, "handoff")
+    if note is None:
+        report.skip("main: handoff note", "the run did not get as far as the handoff")
+        return
+    written = note.get("exists") is True and note.get("mtime", 0) >= note.get("since", 0) - 1
+    host = stdin_at(trace, HANDOFF)
+    paths = [
+        str((use.get("input") or {}).get("file_path"))
+        for _, use in main_tool_uses(
+            [line for line in trace.lines[host or 0 :] if not line["type"].startswith("_")],
+            ("Write", "Edit"),
+        )
+    ]
+    report.check(
+        "main: handoff note",
+        written,
+        f"{note.get('path')} was not written by the handoff turn (the model wrote"
+        f" {paths or 'nothing'}): the supervisor would never see a handoff",
+        str(note.get("path")),
+    )
+
+
+def check_compaction_delivery(report: Report, trace: Trace) -> None:
+    """A message that arrives while `/compact` runs is kept and delivered after it, with
+    the channel origin, and its turn ends with a `result` of its own: the rotation takes a
+    `result` without a boundary for such a turn and goes on waiting for the compaction
+    (rotation.rs `Phase::Compacting`)."""
+    sent = sent_at(trace, "$alice-4")
+    if sent is None:
+        report.skip("main: delivery during /compact", "no message was sent during the compaction")
+        return
+    lines = trace.lines
+    boundary = next(
+        (
+            i
+            for i in range(sent, len(lines))
+            if lines[i].get("type") == "system" and lines[i].get("subtype") == "compact_boundary"
+        ),
+        None,
+    )
+    at, line, _ = find_delivery(lines, "$alice-4")
+    result = next(
+        (
+            i
+            for i in range(at or len(lines), len(lines))
+            if lines[i].get("type") == "result" and channel_origin(lines[i])
+        ),
+        None,
+    )
+    report.check(
+        "main: delivery during /compact",
+        at is not None and channel_origin(line) and result is not None,
+        (
+            "the message sent during the compaction never appeared as a user line: Claude Code"
+            " dropped it"
+            if at is None
+            else "its turn did not end with a result carrying the channel origin"
+        ),
+        "delivered "
+        + ("after the boundary" if None not in (at, boundary) and at > boundary else "as it came")
+        + ", its turn ended with a channel result"
+        + ("" if boundary is not None else " (sent after the compaction had ended)"),
     )
 
 
@@ -2030,12 +2612,13 @@ def check_background_tasks(report: Report, lines: list[dict]) -> None:
         " (model-dependent: did the Bash tool run in the background?)",
     ):
         return
-    ids = [t.get("task_id") for t in busy[0].get("tasks", [])]
+    live = live_tasks(busy[0])
+    ids = [t.get("task_id") for t in live]
     report.check(
         "main: background task ids",
         all(isinstance(i, str) and i for i in ids),
-        f"tasks without a string task_id: {busy[0].get('tasks')}",
-        f"tasks {ids}, types {[t.get('task_type') for t in busy[0].get('tasks', [])]}",
+        f"tasks without a string task_id: {live}",
+        f"tasks {ids}, types {[t.get('task_type') for t in live]}",
     )
     idle_after = any(not live_tasks(line) for line in changed[changed.index(busy[0]) + 1 :])
     report.check(
@@ -2110,12 +2693,36 @@ def check_compaction(report: Report, trace: Trace) -> None:
 
 
 def check_stop(report: Report, trace: Trace) -> None:
-    """EOF on stdin is the graceful stop (lib.rs `begin_stop`): Claude Code finishes the
-    turn in progress and exits 0 within the unit's SILTA_STOP_GRACE, after which the
-    supervisor would kill it."""
-    exits = [line for line in trace.lines if line["type"] == "_exit"]
-    if not exits:
+    """EOF on stdin is the graceful stop (lib.rs `begin_stop`), which the supervisor also
+    uses to cut a turn and to stop for a rotation step: Claude Code finishes the turn in
+    progress, writing its `result`, and exits 0 within the unit's SILTA_STOP_GRACE, after
+    which the supervisor would kill it. The run closes stdin while the last turn's Bash
+    command runs."""
+    lines = trace.lines
+    eof = next((i for i, line in enumerate(lines) if line["type"] == "_stdin_eof"), None)
+    exits = [line for line in lines if line["type"] == "_exit"]
+    if eof is None or not exits:
         return
+    host = stdin_at(trace, STOP)
+    ended_before = host is None or any(line.get("type") == "result" for line in lines[host:eof])
+    if ended_before:
+        report.warn(
+            "main: turn finishes after stdin EOF",
+            "the last turn had ended before stdin was closed (did the model run the command?):"
+            " not judged",
+        )
+    else:
+        results = of_type(lines[eof:], "result")
+        report.check(
+            "main: turn finishes after stdin EOF",
+            bool(results) and results[0].get("is_error") is False,
+            (
+                f"the turn in progress ended with {shorten(results[0].get('result'))!r}"
+                if results
+                else "no result after stdin EOF: the turn in progress was dropped"
+            ),
+            "its result followed the EOF",
+        )
     e = exits[-1]
     report.check(
         "main: exit on stdin EOF",
@@ -2184,19 +2791,35 @@ def check_files(report: Report, trace: Trace, meta: dict) -> None:
 
 
 def drive_resume(cfg: Config, trace: Trace, session_id: str) -> dict:
-    meta = {"run": "resume", "session_id": session_id, "bogus": str(uuid.uuid4())}
+    meta = {
+        "run": "resume",
+        "session_id": session_id,
+        "bogus": str(uuid.uuid4()),
+        "window": cfg.window,
+        "model": cfg.model,
+    }
     trace.add({"type": "_meta", **meta})
     daemon = FakeDaemon(cfg.state / "siltad.sock", "contract-check", trace)
     run = ClaudeRun(cfg, trace, "resume", model=cfg.model, session_id=None, resume=session_id)
     try:
-        run.send_user("Session resumed by the host for a test. Reply with the single word ok.")
+        # The supervisor checks the window at every start, a resume included.
+        run.control(WINDOW_REQUEST, {"subtype": "get_context_usage", "detail": "summary"})
+        trace.wait(lambda line: line.get("type") == "control_response", 60)
+        run.send_user(RESUME)
         run.wait_result(0)
+        # The stop with a background command still running, as a mind's often has.
+        trace.wait(
+            lambda line: line.get("type") == "system"
+            and line.get("subtype") == "background_tasks_changed"
+            and any(not t.get("ambient") for t in line.get("tasks", [])),
+            30,
+        )
+        trace.wait_quiet(3, 30)
         run.close_stdin()
         run.wait_exit(cfg.stop_grace)
     finally:
         run.kill()
         daemon.close()
-    trace.add({"type": "_start", "run": "resume-bogus"})
     bogus = ClaudeRun(
         cfg, trace, "resume-bogus", model=cfg.model, session_id=None, resume=meta["bogus"]
     )
@@ -2221,9 +2844,29 @@ def check_resume(report: Report, trace: Trace, meta: dict) -> None:
 
 
 def check_resumed_session(report: Report, first: list[dict], meta: dict) -> None:
-    """`--resume <id>` (lib.rs `run_once`) restores the session: the init line names the
-    same id, a turn runs to a result without an error, and stdin EOF still ends it."""
+    """`--resume <id>` (lib.rs `run_once`) restores the session: the window check is
+    answered as at a fresh start, the init line names the same id, and a turn runs to a
+    result without an error. Stdin EOF then ends it with a background command still
+    running: the supervisor kills a Claude Code that outlives SILTA_STOP_GRACE, which the
+    session survives (README, known issue 2), so a wait is a warning."""
     lines = [line for line in first if not line["type"].startswith("_")]
+    answers = [
+        line.get("response", {})
+        for line in of_type(lines, "control_response")
+        if line.get("response", {}).get("request_id") == WINDOW_REQUEST
+    ]
+    max_tokens = (answers[0].get("response") or {}).get("maxTokens") if answers else None
+    report.check(
+        "resume: window",
+        isinstance(max_tokens, int) and max_tokens >= meta.get("window", 0),
+        (
+            f"get_context_usage on --resume answered {shorten(answers[0])}"
+            if answers
+            else "no control_response to get_context_usage on --resume"
+        )
+        + f"; every restart of a mind would end (window {meta.get('window')})",
+        f"maxTokens {max_tokens} >= {meta.get('window')}",
+    )
     inits = of_type(lines, "system", "init")
     if report.check("resume: system init", bool(inits), "no init line on --resume"):
         report.check(
@@ -2241,12 +2884,33 @@ def check_resumed_session(report: Report, first: list[dict], meta: dict) -> None
         "the resumed turn answered",
     )
     exits = [line for line in first if line["type"] == "_exit"]
-    if exits:
+    if not exits:
+        return
+    # Running at the EOF: the last level signal before it (Claude Code stops the tasks
+    # after it, with a signal of its own).
+    eof = next((i for i, line in enumerate(first) if line["type"] == "_stdin_eof"), len(first))
+    changed = of_type(first[:eof], "system", "background_tasks_changed")
+    running = bool(changed) and any(not t.get("ambient") for t in changed[-1].get("tasks", []))
+    e = exits[-1]
+    if not running:
         report.check(
             "resume: exit on stdin EOF",
-            exits[-1].get("code") == 0,
-            f"exit {exits[-1].get('code')}",
-            f"exit 0 after {exits[-1].get('seconds')} s",
+            e.get("code") == 0,
+            f"exit {e.get('code')} (no background command was running; model-dependent)",
+            f"exit 0 after {e.get('seconds')} s, no background command running",
+        )
+    elif e.get("code") == 0:
+        report.ok(
+            "resume: exit on stdin EOF",
+            f"exit 0 after {e.get('seconds')} s with a background command running",
+        )
+    else:
+        report.warn(
+            "resume: exit on stdin EOF",
+            f"exit {e.get('code')} after {e.get('seconds')} s"
+            + (" (killed after the grace)" if e.get("killed") else "")
+            + ": Claude Code waits for a background command, and the supervisor kills it"
+            " after SILTA_STOP_GRACE",
         )
 
 
@@ -2673,17 +3337,9 @@ def live(report: Report, cfg: Config) -> Optional[str]:
     if report.failed():
         report.info("aborting", "the preconditions failed; no run")
         return version
-    managed_hook = False
-    if cfg.managed_settings.is_file():
-        try:
-            hooks = (
-                json.loads(cfg.managed_settings.read_text(encoding="utf-8"))
-                .get("hooks", {})
-                .get("PreCompact", [])
-            )
-            managed_hook = any(isinstance(h, dict) and h.get("matcher") == "auto" for h in hooks)
-        except (OSError, json.JSONDecodeError):
-            pass
+    managed_hook, hook_skip = hook_plan(cfg)
+    if cfg.service:
+        clear_workspace_state(cfg)
     install = PluginInstall(cfg, report)
     session_ids: list[str] = []
     try:
@@ -2704,8 +3360,8 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             trace = Trace(cfg.logs / "resume.jsonl")
             check_resume(report, trace, drive_resume(cfg, trace, main_id))
             note_cost(report, "resume", trace)
-        if "hook" in cfg.skip:
-            report.skip("hook", "--skip")
+        if "hook" in cfg.skip or hook_skip:
+            report.skip("hook", hook_skip or "--skip")
             report.costs["hook"] = None
         else:
             sid = str(uuid.uuid4())

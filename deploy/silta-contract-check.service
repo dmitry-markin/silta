@@ -10,8 +10,8 @@
 # so no mind and no admin login is touched. The credential comes from
 # /etc/silta/auth/check, laid out like a mind's: exactly one file, oauth-token (from
 # claude setup-token) or api-key. The model, window and the other knobs are read from the
-# installed silta-session@.service; a run costs a few short turns on that model and two
-# turns on a cheap model for the hook check. The traces of the last five runs stay under
+# installed silta-session@.service; a run makes some fifteen short turns on that model and
+# two turns on a cheap model for the hook check. The traces of the last five runs stay under
 # /var/lib/silta/check/logs for /usr/lib/silta/silta-contract-check --replay.
 #
 # The hardening is the mind's, so that the bubblewrap sandbox and the hook run under the
