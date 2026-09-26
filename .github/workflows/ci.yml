@@ -64,12 +64,23 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Two rustfmts: stable is what contributors run, and a pinned nightly adds the
+      # comment-width check, since `wrap_comments` is unstable. The nightly is the last one
+      # before the 1.98 beta branch, so its rustfmt is the source stable 1.98 shipped; it
+      # was verified to format this tree identically to stable. If the two ever disagree,
+      # this job goes red with a diff, and the pin needs moving to the current stable's
+      # branch point (the last nightly whose rustc still carries stable's version number).
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt
           rustup default stable
+          rustup toolchain install nightly-2026-07-05 --profile minimal --component rustfmt
 
-      - run: cargo fmt --all --check
+      - name: cargo fmt (stable)
+        run: cargo fmt --all --check
+
+      - name: cargo fmt (nightly, comment width)
+        run: cargo +nightly-2026-07-05 fmt --all --check -- --config wrap_comments=true,comment_width=100
 
   clippy:
     name: cargo clippy
