@@ -13,13 +13,19 @@ pub const TESTED_VERSIONS: &[&str] = &["2.1.281"];
 
 /// The `model_fallback` triggers of the checked versions that mean the primary cannot
 /// serve this Claude Code at all (a model it does not find, no access, an error no retry
-/// fixes), which a fallback would hide: the supervisor ends the session on them.
-pub const FALLBACK_FATAL: &[&str] = &["model_not_found", "permission_denied", "last_resort"];
+/// fixes, the model switched off by the feature flags Claude Code fetches at its start),
+/// which a fallback would hide: the supervisor ends the session on them.
+pub const FALLBACK_FATAL: &[&str] = &[
+    "model_not_found",
+    "permission_denied",
+    "last_resort",
+    "model_blocked",
+];
 
 /// The other `model_fallback` triggers of the checked versions, an outage: the turn runs
 /// on the `--fallback-model` and the next one tries the primary again. A trigger outside
 /// both lists is let through with a line.
-pub const FALLBACK_OUTAGE: &[&str] = &["overloaded", "server_error", "model_blocked"];
+pub const FALLBACK_OUTAGE: &[&str] = &["overloaded", "server_error"];
 
 #[derive(Debug, Default)]
 pub struct Contract {

@@ -887,7 +887,12 @@ async fn a_fallback_runs_through_an_outage_and_ends_the_session_otherwise() {
 
     // A fallback that points at the model ends the session before the channel opens, so
     // no message is taken, and the session is not started again.
-    for trigger in ["last_resort", "model_not_found", "permission_denied"] {
+    for trigger in [
+        "last_resort",
+        "model_not_found",
+        "permission_denied",
+        "model_blocked",
+    ] {
         fx.set("fake-mode", &format!("fallback-{trigger}"));
         let runs = starts(&fx.log()).len();
         assert_eq!(

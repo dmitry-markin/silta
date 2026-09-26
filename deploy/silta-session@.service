@@ -63,8 +63,8 @@ Environment=DISABLE_AUTOUPDATER=1
 Environment=SILTA_MODEL=claude-opus-5-5
 Environment=SILTA_EFFORT=high
 # A turn runs on the fallback model only through an outage of the primary (repeated 529s,
-# a 5xx, the primary switched off by Anthropic); any other switch (model not found, no
-# access, an error that cannot be retried) ends the session with exit 79 instead.
+# a 5xx); any other switch (model not found, no access, an error that cannot be retried,
+# the model switched off by a feature flag) ends the session with exit 79 instead.
 Environment=SILTA_FALLBACK_MODEL=claude-opus-5
 # No switch to another model after a refusal (cyber, bio): Claude Code would keep the
 # fallback for the rest of the session.
