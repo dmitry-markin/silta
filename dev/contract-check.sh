@@ -78,7 +78,7 @@ usage = next((l.get("response", {}) for l in lines if l.get("type") == "control_
 if usage is None:
     fails.append("no control_response to get_context_usage; silta-session ends every start at the window check")
 elif usage.get("subtype") != "success" or not isinstance(usage.get("response", {}).get("maxTokens"), int):
-    fails.append(f"get_context_usage answered without an integer response.maxTokens: {usage.get('error') or usage.get('subtype')}")
+    fails.append(f"get_context_usage answered without an integer response.maxTokens: {usage.get('error') or usage.get('subtype')}; every start would end with exit 79")
 elif usage["response"]["maxTokens"] < int(sys.argv[3]):
     fails.append(f"get_context_usage gives maxTokens {usage['response']['maxTokens']}, below the unit's window {sys.argv[3]}: every start would end with exit 79")
 print(f"Claude Code {version or '?'}: {len(lines)} lines, {len(main)} main-line assistant, {len(results)} result")

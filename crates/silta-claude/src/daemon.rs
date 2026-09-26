@@ -205,7 +205,8 @@ impl DaemonClient {
 /// a session's handshake never completes (one started while its predecessor was still
 /// shutting down). In `-p` mode Claude Code installs the channel's handler later still,
 /// when its command loop starts the first turn, and the daemon sends its backlog at
-/// once: the supervisor creates the ready file when that turn's `init` line appears.
+/// once: the supervisor creates the ready file when a model has answered that turn,
+/// so a session whose model cannot serve takes no message.
 async fn wait_until_ready(
     ready: oneshot::Receiver<()>,
     ready_file: Option<&Path>,

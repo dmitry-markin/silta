@@ -11,17 +11,15 @@ use crate::stream::Event;
 /// version gets a line at every start until the list is extended.
 pub const TESTED_VERSIONS: &[&str] = &["2.1.281"];
 
-/// The `model_fallback` triggers of the checked versions. The supervisor ends the
-/// session on the ones that point at the model (`FALLBACK_FATAL` in `lib.rs`) and lets
-/// the rest through; a trigger outside this list is let through with a line.
-pub const FALLBACK_TRIGGERS: &[&str] = &[
-    "model_not_found",
-    "permission_denied",
-    "last_resort",
-    "overloaded",
-    "server_error",
-    "model_blocked",
-];
+/// The `model_fallback` triggers of the checked versions that mean the primary cannot
+/// serve this Claude Code at all (a model it does not find, no access, an error no retry
+/// fixes), which a fallback would hide: the supervisor ends the session on them.
+pub const FALLBACK_FATAL: &[&str] = &["model_not_found", "permission_denied", "last_resort"];
+
+/// The other `model_fallback` triggers of the checked versions, an outage: the turn runs
+/// on the `--fallback-model` and the next one tries the primary again. A trigger outside
+/// both lists is let through with a line.
+pub const FALLBACK_OUTAGE: &[&str] = &["overloaded", "server_error", "model_blocked"];
 
 #[derive(Debug, Default)]
 pub struct Contract {
@@ -57,7 +55,10 @@ impl Contract {
                 self.warned_turn = false;
                 None
             }
-            Event::ModelFallback { trigger } if !FALLBACK_TRIGGERS.contains(&trigger.as_str()) => {
+            Event::ModelFallback { trigger }
+                if !FALLBACK_FATAL.contains(&trigger.as_str())
+                    && !FALLBACK_OUTAGE.contains(&trigger.as_str()) =>
+            {
                 Some(format!("a model_fallback with the trigger {trigger:?}, which this supervisor does not know; the turn runs on the fallback model"))
             }
             Event::Compacted { auto: true } if rotation => {

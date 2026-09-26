@@ -13,7 +13,8 @@
 # reset to ok first) or busycompact (an unrelated turn ends before the compaction, as
 # if a person's message had been queued ahead of the command), fallback-<trigger> (every
 # turn reports a model_fallback with that trigger first), nowindow (a control request
-# is never answered) or synthetic (every turn fails before a model answers, as with an
+# is never answered), refusewindow (a control request is answered with an error) or
+# synthetic (every turn fails before a model answers, as with an
 # expired token: a <synthetic> message and an error result).
 # HOME/fake-context is the context size reported in every assistant line; a compaction
 # sets it to 100, as the real one shrinks the context. HOME/fake-window is the maxTokens
@@ -60,6 +61,10 @@ while IFS= read -r line; do
     request=$(printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
     echo "control $request" >> "$HOME/fake.log"
     [ "$(mode)" = nowindow ] && continue
+    if [ "$(mode)" = refusewindow ]; then
+      echo "{\"type\":\"control_response\",\"response\":{\"subtype\":\"error\",\"request_id\":\"$request\",\"error\":\"get_context_usage is not supported in this context\"}}"
+      continue
+    fi
     window=$(cat "$HOME/fake-window" 2>/dev/null || echo 500000)
     echo "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$request\",\"response\":{\"totalTokens\":$context,\"maxTokens\":$window,\"rawMaxTokens\":$window,\"model\":\"fake\"}}}"
     continue

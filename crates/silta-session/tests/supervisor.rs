@@ -812,9 +812,18 @@ async fn a_window_below_the_configured_one_ends_the_session_before_its_first_tur
     assert!(!log.contains("\nline "), "no turn before the check: {log}");
     assert!(!log.contains("ready after answer"), "no channel: {log}");
 
-    // An unanswered check ends it too, after the wait, for a restart: it says nothing
-    // about the model.
+    // A refused check ends it the same way: this Claude Code cannot be held to a
+    // window either.
     fx.set("fake-window", "500000");
+    fx.set("fake-mode", "refusewindow");
+    assert_eq!(
+        silta_session::run(&cfg, CancellationToken::new()).await,
+        EXIT_MODEL
+    );
+    assert!(!fx.log().contains("\nline "), "{}", fx.log());
+
+    // An unanswered check ends it too, after the wait, but for a restart: it says
+    // nothing about the model.
     fx.set("fake-mode", "nowindow");
     let started = Instant::now();
     assert_eq!(silta_session::run(&cfg, CancellationToken::new()).await, 1);

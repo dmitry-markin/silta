@@ -58,8 +58,8 @@ Environment=CLAUDE_BIN=/opt/claude/.local/bin/claude
 Environment=DISABLE_AUTOUPDATER=1
 # Pinned by full name so nothing follows a moving alias. At every start silta-session asks
 # Claude Code for the window it measures the context against (`get_context_usage`) and
-# ends the session with exit 79 when it is below `CLAUDE_CODE_AUTO_COMPACT_WINDOW`: a Claude
-# Code too old to know the model assumes 200000 tokens.
+# ends the session with exit 79 when it is below `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or the
+# request is refused: a Claude Code too old to know the model assumes 200000 tokens.
 Environment=SILTA_MODEL=claude-opus-5-5
 Environment=SILTA_EFFORT=high
 # A turn runs on the fallback model only through an outage of the primary (repeated 529s,
