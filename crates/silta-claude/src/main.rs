@@ -7,11 +7,12 @@
 
 mod daemon;
 mod mcp;
+mod transport;
 
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::Parser;
-use rmcp::{transport::stdio, ServiceExt};
+use rmcp::ServiceExt;
 use tokio::{
     signal::unix::{signal, SignalKind},
     sync::{mpsc, oneshot},
@@ -145,7 +146,7 @@ async fn run(args: Args, parent: libc::pid_t) -> i32 {
     // The handshake waits for the client's initialize request; a shutdown signal must
     // end that wait too, not only the serving phase.
     let service = tokio::select! {
-        result = handler.serve(stdio()) => match result {
+        result = handler.serve(transport::stdio()) => match result {
             Ok(service) => service,
             Err(err) => {
                 error!("MCP initialization failed: {err}");

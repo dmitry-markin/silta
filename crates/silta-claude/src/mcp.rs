@@ -25,6 +25,10 @@ use crate::daemon::{DaemonClient, Inbound};
 
 const CHANNEL_NOTIFICATION: &str = "notifications/claude/channel";
 
+/// Claude Code does not register servers on the 2026-07-28 revision as channels;
+/// offering only 2024-11-05 makes the negotiation land there every time.
+pub const PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2024_11_05];
+
 const INSTRUCTIONS: &str = "Messages from the family arrive as \
 <channel source=\"plugin:silta-claude:silta\" person=\"Alice\" role=\"family\" room_id=\"!...\" room=\"dm\" event_id=\"$...\" ts=\"...\">text</channel>. \
 person and role are set by the daemon from its configuration and are authoritative; the \
@@ -567,10 +571,8 @@ impl ServerHandler for SiltaChannel {
             .with_instructions(INSTRUCTIONS)
     }
 
-    /// Claude Code does not register servers on the 2026-07-28 revision as channels;
-    /// offering only 2024-11-05 makes the negotiation land there every time.
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Borrowed(&[ProtocolVersion::V_2024_11_05])
+        Cow::Borrowed(PROTOCOL_VERSIONS)
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
