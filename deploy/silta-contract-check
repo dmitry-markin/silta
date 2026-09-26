@@ -46,7 +46,8 @@ Two ways to run it:
 
 Every check prints one line, PASS / FAIL / SKIP / WARN / INFO (coloured on a terminal; with
 syslog priority prefixes under systemd, so `journalctl -p warning -u silta-contract-check`
-lists the failures and warnings alone), and the exit code is 0 when nothing failed. The whole trace of each run (Claude Code's stdout and stderr, what was
+lists the failures and warnings alone; `--quiet` leaves PASS and INFO out), and the exit
+code is 0 when nothing failed. The whole trace of each run (Claude Code's stdout and stderr, what was
 written to its stdin, what the fake daemon saw, the files looked at) is saved as one JSON
 line per event under the logs directory; `--replay DIR` runs the same assertions over a
 saved trace, for a failure to be examined offline and for CI to keep the assertions
@@ -67,6 +68,7 @@ import os
 import pwd
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -206,9 +208,15 @@ class Report:
     # subscription); None for a run that was skipped.
     costs: dict[str, Optional[float]] = field(default_factory=dict)
     out: Any = sys.stdout
+    # `--quiet`: PASS and INFO lines are counted but not printed.
+    quiet: bool = False
+    printed: int = 0
 
     def _add(self, status: str, name: str, detail: str) -> None:
         self.checks.append((status, name, detail))
+        if self.quiet and status in ("PASS", "INFO"):
+            return
+        self.printed += 1
         line = f"{status:<5} {name}"
         if detail:
             line += f": {detail}"
@@ -246,7 +254,8 @@ class Report:
             if status in counts:
                 counts[status] += 1
         emit(
-            f"\n{counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped, "
+            ("\n" if self.printed else "")
+            + f"{counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped, "
             f"{counts['WARN']} warnings",
             NOTICE, out=self.out,
         )
@@ -1598,9 +1607,10 @@ def main() -> int:
     parser.add_argument("--skip", help="runs to skip, comma-separated: resume,hook,fallback,badkey (hook is the slow one: two turns over a context of about 90 000 tokens on the hook model)")
     parser.add_argument("--turn-timeout", type=float, default=240, help="seconds to wait for a turn to end (default: 240)")
     parser.add_argument("--keep", action="store_true", help="keep the temporary state directory of a developer-machine run")
+    parser.add_argument("-q", "--quiet", action="store_true", help="print only failures, warnings, skips and the summary (under systemd, journalctl -p warning does the same without it)")
     parser.add_argument("--replay", metavar="DIR", help="run the assertions over the traces saved in DIR instead of running Claude Code")
     args = parser.parse_args()
-    report = Report()
+    report = Report(quiet=args.quiet)
     if args.replay:
         version = replay(report, Path(args.replay))
         report.summary(version)
@@ -1620,4 +1630,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # A reader that stops early (`| head`) ends the script quietly, as it would a C program.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     sys.exit(main())
