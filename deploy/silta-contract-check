@@ -94,6 +94,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -710,6 +711,8 @@ class Config:
     turn_timeout: float
     skip: set[str]
     keep: bool
+    # Added to every run of Claude Code, with {logs} and {run} filled in (--claude-arg).
+    claude_args: list[str]
 
 
 def parse_unit(path: Path) -> dict[str, str]:
@@ -869,6 +872,11 @@ def configure(args: argparse.Namespace) -> Config:
         turn_timeout=args.turn_timeout,
         skip=set(filter(None, (args.skip or "").split(","))),
         keep=args.keep,
+        claude_args=(
+            args.claude_arg
+            if args.claude_arg is not None
+            else shlex.split(os.environ.get("SILTA_CHECK_CLAUDE_ARGS", ""))
+        ),
     )
 
 
@@ -1085,6 +1093,9 @@ class ClaudeRun:
         else:
             args += ["--session-id", session_id, "--name", "silta-contract-check"]
         args += extra_args or []
+        # The operator's own (--claude-arg), for a look inside Claude Code such as its
+        # debug log; `--channels` stays last.
+        args += [a.replace("{logs}", str(cfg.logs)).replace("{run}", name) for a in cfg.claude_args]
         args += ["--channels", CHANNEL]
         self.args = args
         # The environment the supervisor gives Claude Code and, through it, the plugin
@@ -3481,6 +3492,18 @@ def main() -> int:
         type=float,
         default=240,
         help="seconds to wait for a turn to end (default: 240)",
+    )
+    parser.add_argument(
+        "--claude-arg",
+        action="append",
+        metavar="ARG",
+        help=(
+            "an argument added to every run of Claude Code, repeatable; {logs} and {run} in it"
+            " become the logs directory and the run's name, so"
+            " --claude-arg=--debug-file={logs}/{run}-debug.log keeps Claude Code's debug log of"
+            " each run next to its trace (default: $SILTA_CHECK_CLAUDE_ARGS, split like a shell"
+            " command line)"
+        ),
     )
     parser.add_argument(
         "--keep",

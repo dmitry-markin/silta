@@ -32,6 +32,13 @@ Environment=HOME=/var/lib/silta/check
 Environment=CLAUDE_BIN=/opt/claude/.local/bin/claude
 Environment=SILTA_CLAUDE_BIN=/usr/bin/silta-claude
 Environment=DISABLE_AUTOUPDATER=1
+# Arguments added to every run of Claude Code, split like a shell command line, with
+# {logs} and {run} filled in (the checker's --claude-arg). Claude Code's own debug log of
+# each run, next to its trace, is a drop-in (systemctl edit silta-contract-check) with
+#   Environment="SILTA_CHECK_CLAUDE_ARGS=--debug-file {logs}/{run}-debug.log"
+# It may hold more of the conversation and the requests than the traces do; it stays in
+# the check's private state directory, pruned with the traces.
+Environment=SILTA_CHECK_CLAUDE_ARGS=
 LoadCredential=auth:/etc/silta/auth/check
 ExecStart=/usr/lib/silta/silta-contract-check
 TimeoutStartSec=40min
