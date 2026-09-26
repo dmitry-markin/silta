@@ -52,8 +52,9 @@ saved trace, for a failure to be examined offline and for CI to keep the asserti
 themselves working (dev/contract-fixtures).
 
 A full run makes a handful of short turns on the configured model and, for the hook,
-two turns on a cheap model over a context of about 90 000 tokens (`--hook-model`); it takes
-a few minutes and costs well under a dollar.
+two turns on a cheap model over a context of about 90 000 tokens (`--hook-model`; `--skip hook`
+leaves that run out); it takes a few minutes and costs well under a dollar, which the last
+line of the report states as Claude Code counted it.
 """
 
 from __future__ import annotations
@@ -172,6 +173,9 @@ INTRO = (
 @dataclass
 class Report:
     checks: list[tuple[str, str, str]] = field(default_factory=list)
+    # What each run cost, in dollars as Claude Code counts it (list prices; notional on a
+    # subscription).
+    costs: dict[str, float] = field(default_factory=dict)
     out: Any = sys.stdout
 
     def _add(self, status: str, name: str, detail: str) -> None:
@@ -217,6 +221,9 @@ class Report:
             f"{counts['WARN']} warnings",
             file=self.out,
         )
+        if self.costs:
+            parts = ", ".join(f"{run} ${usd:.2f}" for run, usd in self.costs.items())
+            print(f"cost as Claude Code counts it: ${sum(self.costs.values()):.2f} ({parts})", file=self.out)
         if self.failed():
             print("contract broken:", file=self.out)
             for status, name, detail in self.checks:
@@ -305,6 +312,19 @@ class Trace:
                 if line:
                     trace.lines.append(json.loads(line))
         return trace
+
+
+def session_cost(trace: Trace) -> float:
+    """What the session cost so far, from its last `result` line: `total_cost_usd` is
+    cumulative over the session, so a run that resumes one continues the count."""
+    return max((l.get("total_cost_usd", 0) for l in trace.lines if l.get("type") == "result" and isinstance(l.get("total_cost_usd"), (int, float))), default=0.0)
+
+
+def note_cost(report: Report, name: str, trace: Trace) -> None:
+    cost = session_cost(trace)
+    if name == "resume":
+        cost = max(cost - report.costs.get("main", 0.0), 0.0)
+    report.costs[name] = cost
 
 
 def stdout_lines(trace: Trace) -> list[dict]:
@@ -1459,6 +1479,7 @@ def replay(report: Report, directory: Path) -> Optional[str]:
         trace = Trace.load(path)
         meta = next((l for l in trace.lines if l["type"] == "_meta"), {})
         result = check(report, trace, meta)
+        note_cost(report, name, trace)
         if name == "main":
             version = result
     if not found:
@@ -1489,12 +1510,14 @@ def live(report: Report, cfg: Config) -> Optional[str]:
         report.info("logs", str(cfg.logs))
         trace = Trace(cfg.logs / "main.jsonl")
         seen = check_main(report, trace, drive_main(cfg, trace, main_id))
+        note_cost(report, "main", trace)
         version = seen or version
         if "resume" in cfg.skip:
             report.skip("resume", "--skip")
         else:
             trace = Trace(cfg.logs / "resume.jsonl")
             check_resume(report, trace, drive_resume(cfg, trace, main_id))
+            note_cost(report, "resume", trace)
         if "hook" in cfg.skip:
             report.skip("hook", "--skip")
         else:
@@ -1502,6 +1525,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             session_ids.append(sid)
             trace = Trace(cfg.logs / "hook.jsonl")
             check_hook(report, trace, drive_hook(cfg, trace, sid, managed_hook))
+            note_cost(report, "hook", trace)
         if "fallback" in cfg.skip:
             report.skip("fallback", "--skip")
         else:
@@ -1509,6 +1533,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             session_ids.append(sid)
             trace = Trace(cfg.logs / "fallback.jsonl")
             check_fallback(report, trace, drive_fallback(cfg, trace, sid))
+            note_cost(report, "fallback", trace)
         if "badkey" in cfg.skip:
             report.skip("bad key", "--skip")
         else:
@@ -1516,6 +1541,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             session_ids.append(sid)
             trace = Trace(cfg.logs / "badkey.jsonl")
             check_badkey(report, trace, drive_badkey(cfg, trace, sid))
+            note_cost(report, "badkey", trace)
     finally:
         install.cleanup()
         cleanup_traces(cfg, session_ids)
@@ -1537,7 +1563,7 @@ def main() -> int:
     parser.add_argument("--credentials", help="a directory laid out like the unit's credentials (auth_oauth-token or auth_api-key); default: $CREDENTIALS_DIRECTORY, else the login of the calling user")
     parser.add_argument("--home", help="with --credentials: the HOME Claude Code runs with (default: $HOME)")
     parser.add_argument("--logs", help="where the traces go (default: <state>/logs/<time>)")
-    parser.add_argument("--skip", help="runs to skip, comma-separated: resume,hook,fallback,badkey")
+    parser.add_argument("--skip", help="runs to skip, comma-separated: resume,hook,fallback,badkey (hook is the slow one: two turns over a context of about 90 000 tokens on the hook model)")
     parser.add_argument("--turn-timeout", type=float, default=240, help="seconds to wait for a turn to end (default: 240)")
     parser.add_argument("--keep", action="store_true", help="keep the temporary state directory of a developer-machine run")
     parser.add_argument("--replay", metavar="DIR", help="run the assertions over the traces saved in DIR instead of running Claude Code")
