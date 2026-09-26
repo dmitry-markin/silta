@@ -103,6 +103,14 @@ jobs:
     name: build-deb.sh (Debian 13)
     runs-on: ubuntu-latest
     container: debian:13
+    # The release profile's fat LTO with one codegen unit is a single-threaded link of
+    # several minutes per binary, which made this job take ten minutes against one for the
+    # rest. This job checks that the package builds and is assembled right, not the binary
+    # that gets deployed (docs/deployment.md builds that on the VM with the real profile),
+    # so the two settings are overridden here and the .deb artifact is not the shipped one.
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       # The same packages docs/deployment.md tells the operator to install, plus what the
       # actions need inside a bare container: git for checkout, curl and CA certificates
