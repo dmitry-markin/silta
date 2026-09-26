@@ -5,6 +5,7 @@
 #
 #   dev/contract-check.sh                 the claude on PATH
 #   CLAUDE_BIN=/opt/claude/.local/share/claude/versions/2.1.270 dev/contract-check.sh
+#   SILTA_CLAUDE_BIN=target/debug/silta-claude dev/contract-check.sh   (default: silta-claude on PATH)
 #
 # Asserts: the init line names a version and it is in silta-session's TESTED_VERSIONS;
 # a main-line assistant line carries the three usage counts; the turn's prompt comes
@@ -12,7 +13,10 @@
 # result line carries is_error; with the unit's SILTA_MODEL and
 # CLAUDE_CODE_AUTO_COMPACT_WINDOW, a get_context_usage control request is answered with a
 # maxTokens of at least that window (the window check at every start, which ends the
-# session otherwise). Agents, compaction and the hook stay in the manual procedure. Exit 0 when every check passes, 1 otherwise; the failures are listed.
+# session otherwise); silta-claude, run as an MCP server with no daemon, gets its reply
+# tool into the session (Claude Code's MCP handshake changes between versions). Whether
+# the channel registers and delivers needs the plugin installed and managed settings, so
+# it stays in the manual procedure, as do agents, compaction and the hook. Exit 0 when every check passes, 1 otherwise; the failures are listed.
 #
 # TODO: this currently lacks at least the check for user message detection, that needs
 #       a fake channel plugin.
@@ -22,17 +26,28 @@ set -uo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 claude=${CLAUDE_BIN:-claude}
 tested=$(grep -o 'TESTED_VERSIONS: &\[&str\] = &\[[^]]*\]' "$repo/crates/silta-session/src/contract.rs" | grep -o '"[0-9.]*"' | tr -d '"' | tr '\n' ' ')
+silta_claude=${SILTA_CLAUDE_BIN:-silta-claude}
 out=$(mktemp "${TMPDIR:-/tmp}/contract-check.XXXXXX")
+plugin=$(mktemp -d "${TMPDIR:-/tmp}/contract-check-plugin.XXXXXX")
 unit="$repo/deploy/silta-session@.service"
 model=$(sed -n 's/^Environment=SILTA_MODEL=//p' "$unit")
 window=$(sed -n 's/^Environment=CLAUDE_CODE_AUTO_COMPACT_WINDOW=//p' "$unit")
 
-trap 'rm -f "$out"' EXIT
+trap 'rm -rf "$out" "$plugin"' EXIT
+
+# The ready file never appears, so the plugin never contacts a daemon.
+python3 - "$silta_claude" "$plugin" > "$plugin/mcp.json" <<'PY'
+import json, sys
+command, dir = sys.argv[1], sys.argv[2]
+print(json.dumps({"mcpServers": {"silta": {"command": command, "env": {
+    "SILTA_SESSION": "contract-check", "SILTA_SOCKET": f"{dir}/none.sock",
+    "SILTA_READY_FILE": f"{dir}/never", "SILTA_INBOX": f"{dir}/inbox"}}}}))
+PY
 
 printf '%s\n' '{"type":"control_request","request_id":"silta-window","request":{"subtype":"get_context_usage","detail":"summary"}}' \
   '{"type":"user","message":{"role":"user","content":"Reply with the single word ok and nothing else."}}' \
   | CLAUDE_CODE_AUTO_COMPACT_WINDOW=$window "$claude" --model "$model" -p --input-format stream-json --output-format stream-json --verbose \
-      --replay-user-messages --permission-mode auto --permission-prompts none > "$out" 2>"$out.err"
+      --replay-user-messages --permission-mode auto --permission-prompts none --mcp-config "$plugin/mcp.json" > "$out" 2>"$out.err"
 status=$?
 if [ $status -ne 0 ]; then
   echo "claude exited with $status; stderr:" >&2
@@ -53,6 +68,9 @@ elif not isinstance(version, str) or not version:
     fails.append("system init has no claude_code_version")
 #elif version not in tested:
 #    fails.append(f"Claude Code {version} is not in TESTED_VERSIONS ({', '.join(tested)}); add it after the manual checks")
+if init and "mcp__silta__reply" not in init.get("tools", []):
+    servers = {s.get("name"): s.get("status") for s in init.get("mcp_servers", [])}
+    fails.append(f"silta-claude's reply tool is not in the session (MCP servers: {servers}); a mind could not answer")
 main = [l for l in lines if l.get("type") == "assistant" and l.get("parent_tool_use_id") is None]
 if not main:
     fails.append("no main-line assistant line (type assistant with parent_tool_use_id null)")
