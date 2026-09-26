@@ -86,3 +86,4 @@ sudo journalctl -u siltad
 sudo journalctl -u silta-session@user-1
 ```
 
+A `silta-session` unit that exited with status 79 (`sudo systemctl status silta-session@user-1`) stopped on purpose: Claude Code cannot run the configured model, e.g. because the installed version does not know the name or the account has no access to it. The reason is provided on the `model:` line in its journal. Fix the cause and start it again with `sudo systemctl start silta-session@user-1`.
