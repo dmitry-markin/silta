@@ -180,8 +180,9 @@ INTRO = (
 )
 
 
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 # The report: one line per check, the summary at the end.
+# --------------------------------------------------------------------------------------------------
 
 # syslog priorities, for the journal.
 ERR, WARNING, NOTICE, INFO = 3, 4, 5, 6
@@ -309,10 +310,11 @@ class Report:
                 )
 
 
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 # The trace: everything a run produced, in order, one dict per event. Claude Code's own
 # stdout lines keep their `type`; the checker's entries have a `type` starting with `_`.
 # Live runs write it and assert on it; `--replay` reads it back.
+# --------------------------------------------------------------------------------------------------
 
 
 class Trace:
@@ -458,8 +460,44 @@ def shorten(text: Any, n: int = 200) -> str:
     return flat if len(flat) <= n else flat[:n] + "…"
 
 
-# --------------------------------------------------------------------------------------
+def trace_file(trace: Trace, name: str) -> Optional[dict]:
+    """The `_file` entry the run recorded under `name`."""
+    return next(
+        (line for line in trace.lines if line["type"] == "_file" and line.get("name") == name),
+        None,
+    )
+
+
+def report_stderr(report: Report, pre: str, trace: Trace) -> None:
+    """For the record: what Claude Code wrote to stderr, which the supervisor passes to the
+    journal as it is."""
+    stderr = [
+        line["text"] for line in trace.lines if line["type"] == "_stderr" and line["text"].strip()
+    ]
+    if stderr:
+        report.info(
+            pre + "stderr",
+            " | ".join(shorten(s, 160) for s in stderr[:5])
+            + (f" (+{len(stderr) - 5})" if len(stderr) > 5 else ""),
+        )
+
+
+def report_line_kinds(report: Report, lines: list[dict]) -> None:
+    """For the record: every `type/subtype` the run produced, to diff between versions;
+    stream.rs summarises the unknown ones by name."""
+    kinds = sorted(
+        {
+            f"{line.get('type')}{'/' + str(line.get('subtype')) if line.get('subtype') else ''}"
+            for line in lines
+            if line.get("type") != "stream_event"
+        }
+    )
+    report.info("main: line kinds", ", ".join(kinds))
+
+
+# --------------------------------------------------------------------------------------------------
 # The configuration: where things are and the values of the unit.
+# --------------------------------------------------------------------------------------------------
 
 
 @dataclass
@@ -659,10 +697,11 @@ def base_env(cfg: Config) -> dict[str, str]:
     return env
 
 
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 # The fake daemon: the socket `siltad` would offer, enough of protocol v4 for one session.
 # It answers `hello` with `welcome`, records every line the plugin sends, delivers the
 # events the checker queues, and answers every command with a successful result.
+# --------------------------------------------------------------------------------------------------
 
 
 class FakeDaemon:
@@ -776,8 +815,9 @@ class FakeDaemon:
             self.path.unlink()
 
 
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 # One run of Claude Code, started the way the supervisor starts it.
+# --------------------------------------------------------------------------------------------------
 
 
 class ClaudeRun:
@@ -1012,8 +1052,9 @@ def record_file(trace: Trace, name: str, path: Path) -> None:
     trace.add(entry)
 
 
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 # Preconditions, without a model call.
+# --------------------------------------------------------------------------------------------------
 
 
 def check_static(report: Report, cfg: Config) -> Optional[str]:
@@ -1230,8 +1271,9 @@ def check_managed_settings(report: Report, cfg: Config) -> None:
     )
 
 
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 # The plugin's installation, the way `silta-session-add` does it for a mind.
+# --------------------------------------------------------------------------------------------------
 
 
 class PluginInstall:
@@ -1393,8 +1435,9 @@ def find_transcript(home: Path, session_id: str) -> Optional[Path]:
     return None
 
 
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 # The main run: a fresh session with the channel, driven the way the supervisor drives it.
+# --------------------------------------------------------------------------------------------------
 
 
 def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
@@ -1540,14 +1583,6 @@ def check_main(report: Report, trace: Trace, meta: dict) -> Optional[str]:
     report_line_kinds(report, lines)
     version = init.get("claude_code_version")
     return version if isinstance(version, str) else None
-
-
-def trace_file(trace: Trace, name: str) -> Optional[dict]:
-    """The `_file` entry the run recorded under `name`."""
-    return next(
-        (line for line in trace.lines if line["type"] == "_file" and line.get("name") == name),
-        None,
-    )
 
 
 def check_init(report: Report, lines: list[dict], meta: dict) -> Optional[dict]:
@@ -2113,36 +2148,10 @@ def check_files(report: Report, trace: Trace, meta: dict) -> None:
         )
 
 
-def report_stderr(report: Report, pre: str, trace: Trace) -> None:
-    """For the record: what Claude Code wrote to stderr, which the supervisor passes to the
-    journal as it is."""
-    stderr = [
-        line["text"] for line in trace.lines if line["type"] == "_stderr" and line["text"].strip()
-    ]
-    if stderr:
-        report.info(
-            pre + "stderr",
-            " | ".join(shorten(s, 160) for s in stderr[:5])
-            + (f" (+{len(stderr) - 5})" if len(stderr) > 5 else ""),
-        )
-
-
-def report_line_kinds(report: Report, lines: list[dict]) -> None:
-    """For the record: every `type/subtype` the run produced, to diff between versions;
-    stream.rs summarises the unknown ones by name."""
-    kinds = sorted(
-        {
-            f"{line.get('type')}{'/' + str(line.get('subtype')) if line.get('subtype') else ''}"
-            for line in lines
-            if line.get("type") != "stream_event"
-        }
-    )
-    report.info("main: line kinds", ", ".join(kinds))
-
-
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 # The resume run: the saved id comes back, and a bogus one fails the way the supervisor
 # expects.
+# --------------------------------------------------------------------------------------------------
 
 
 def drive_resume(cfg: Config, trace: Trace, session_id: str) -> dict:
@@ -2234,8 +2243,9 @@ def check_bogus_resume(report: Report, second: list[dict]) -> None:
     )
 
 
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 # The hook run: an automatic compaction, blocked by the PreCompact hook.
+# --------------------------------------------------------------------------------------------------
 
 
 def filler(words: int) -> str:
@@ -2451,8 +2461,9 @@ def check_marker(report: Report, trace: Trace, meta: dict) -> None:
     )
 
 
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 # The fault runs: a model Claude Code does not find, and a credential the API refuses.
+# --------------------------------------------------------------------------------------------------
 
 
 def drive_fallback(cfg: Config, trace: Trace, session_id: str) -> dict:
@@ -2602,8 +2613,9 @@ def check_badkey(report: Report, trace: Trace, meta: dict) -> None:
     )
 
 
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 # Putting it together.
+# --------------------------------------------------------------------------------------------------
 
 RUNS = {
     "main": (drive_main, check_main),
