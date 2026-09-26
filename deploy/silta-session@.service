@@ -56,10 +56,19 @@ Environment=CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000
 # itself. `CLAUDE_BIN` may name `/opt/claude/.local/share/claude/versions/<n>` to pin one.
 Environment=CLAUDE_BIN=/opt/claude/.local/bin/claude
 Environment=DISABLE_AUTOUPDATER=1
-# Pinned by full name so nothing follows a moving alias.
+# Pinned by full name so nothing follows a moving alias. At every start silta-session asks
+# Claude Code for the window it measures the context against (`get_context_usage`) and
+# ends the session with exit 79 when it is below `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or the
+# request is refused: a Claude Code too old to know the model assumes 200000 tokens.
 Environment=SILTA_MODEL=claude-opus-5-5
 Environment=SILTA_EFFORT=high
+# A turn runs on the fallback model only through an outage of the primary (repeated 529s,
+# a 5xx); any other switch (model not found, no access, an error that cannot be retried,
+# the model switched off by a feature flag) ends the session with exit 79 instead.
 Environment=SILTA_FALLBACK_MODEL=claude-opus-5
+# No switch to another model after a refusal (cyber, bio): Claude Code would keep the
+# fallback for the rest of the session.
+Environment=CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1
 # Subagents a mind spawns: read by Claude Code itself, not by silta-session.
 Environment=CLAUDE_CODE_SUBAGENT_MODEL=claude-opus-5-5
 # The mind's own credential: `/etc/silta/auth/%i` holds exactly one file:
@@ -74,6 +83,9 @@ LoadCredential=auth:/etc/silta/auth/%i
 Environment=SILTA_GATEWAY_URL=https://openrouter.ai/api
 ExecStart=/usr/lib/silta/silta-session
 Restart=always
+# The model is unfit for this Claude Code (above): the session stays down until fixed,
+# then `systemctl start` brings it back.
+RestartPreventExitStatus=79
 RestartSec=10
 RestartSteps=6
 RestartMaxDelaySec=10min

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use silta_session::{compact, handoff, rotation::Limits, Auth, Config};
+use silta_session::{compact, handoff, rotation::Limits, Auth, Config, EXIT_MODEL};
 use tokio_util::sync::CancellationToken;
 
 struct Fixture {
@@ -36,6 +36,9 @@ impl Fixture {
             model: None,
             effort: None,
             fallback_model: None,
+            // The fake answers the window check with 500 000 unless told otherwise.
+            window: Some(500_000),
+            window_wait: Duration::from_secs(3),
             auth: None,
             stop_grace: Duration::from_secs(2),
             limits: Limits {
@@ -134,12 +137,15 @@ async fn fresh_start_resume_and_graceful_stop() {
         let stop = stop.clone();
         async move { silta_session::run(&cfg, stop).await }
     });
+    // The fake looks for the ready file after its first answer to the start line.
     let log = fx
-        .until(10, |l| l.contains("line Session test started"))
+        .until(10, |l| {
+            l.contains("line Session test started") && l.contains("ready ")
+        })
         .await;
     assert!(
-        log.contains("ready after init") && !log.contains("ready before init"),
-        "the ready file is cleared at the start and written at the init line:\n{log}"
+        log.contains("ready after answer") && !log.contains("ready before answer"),
+        "the ready file is cleared at the start and written at the first answer:\n{log}"
     );
     let id = fx.id();
     assert_eq!(starts(&log), vec![format!("start {id} ").as_str()]);
@@ -159,12 +165,14 @@ async fn fresh_start_resume_and_graceful_stop() {
     });
     let log = fx
         .until(10, |l| {
-            l.contains("restarted at") && l.contains("resumed its history")
+            l.contains("restarted at")
+                && l.contains("resumed its history")
+                && l.matches("ready ").count() == 2
         })
         .await;
     assert_eq!(starts(&log)[1], format!("start {id} resumed"));
     assert!(
-        log.matches("ready after init").count() == 2 && !log.contains("ready before init"),
+        log.matches("ready after answer").count() == 2 && !log.contains("ready before answer"),
         "{log}"
     );
     stop.cancel();
@@ -783,6 +791,146 @@ async fn a_unit_stop_during_the_wait_keeps_the_rotation_pending() {
     fs::remove_dir_all(&fx.home).unwrap();
 }
 
+#[tokio::test]
+async fn a_window_below_the_configured_one_ends_the_session_before_its_first_turn() {
+    let fx = Fixture::new("window");
+    let cfg = Config {
+        limits: Limits {
+            enabled: false,
+            ..fx.config().limits
+        },
+        ..fx.config()
+    };
+    // Claude Code caps the window of a model it does not know at 200 000 tokens.
+    fx.set("fake-window", "200000");
+    assert_eq!(
+        silta_session::run(&cfg, CancellationToken::new()).await,
+        EXIT_MODEL
+    );
+    let log = fx.log();
+    assert!(log.contains("control silta-window"), "{log}");
+    assert!(!log.contains("\nline "), "no turn before the check: {log}");
+    assert!(!log.contains("ready after answer"), "no channel: {log}");
+
+    // A refused check ends it the same way: this Claude Code cannot be held to a
+    // window either.
+    fx.set("fake-window", "500000");
+    fx.set("fake-mode", "refusewindow");
+    assert_eq!(
+        silta_session::run(&cfg, CancellationToken::new()).await,
+        EXIT_MODEL
+    );
+    assert!(!fx.log().contains("\nline "), "{}", fx.log());
+
+    // An unanswered check ends it too, after the wait, but for a restart: it says
+    // nothing about the model.
+    fx.set("fake-mode", "nowindow");
+    let started = Instant::now();
+    assert_eq!(silta_session::run(&cfg, CancellationToken::new()).await, 1);
+    assert!(started.elapsed() >= cfg.window_wait);
+    assert!(!fx.log().contains("\nline "), "{}", fx.log());
+
+    // The configured window starts the turn.
+    fx.set("fake-mode", "ok");
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| l.contains("line Session test restarted"))
+        .await;
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
+async fn a_fallback_runs_through_an_outage_and_ends_the_session_otherwise() {
+    let fx = Fixture::new("fallback");
+    let cfg = Config {
+        fallback_model: Some("fake-fallback".into()),
+        limits: Limits {
+            enabled: false,
+            ..fx.config().limits
+        },
+        ..fx.config()
+    };
+    fx.set("fake-mode", "fallback-overloaded");
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| {
+        l.contains("fallback ") && l.contains("line Session test started")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!run.is_finished(), "an overload keeps the session");
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+
+    // A trigger this supervisor does not know is let through as well.
+    fx.set("fake-mode", "fallback-unheard_of");
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| l.matches("ready after answer").count() == 2)
+        .await;
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+
+    // A fallback that points at the model ends the session before the channel opens, so
+    // no message is taken, and the session is not started again.
+    for trigger in [
+        "last_resort",
+        "model_not_found",
+        "permission_denied",
+        "model_blocked",
+    ] {
+        fx.set("fake-mode", &format!("fallback-{trigger}"));
+        let runs = starts(&fx.log()).len();
+        assert_eq!(
+            silta_session::run(&cfg, CancellationToken::new()).await,
+            EXIT_MODEL,
+            "{trigger}"
+        );
+        let log = fx.log();
+        assert_eq!(starts(&log).len(), runs + 1, "{trigger}");
+        assert_eq!(
+            log.matches("ready after answer").count(),
+            2,
+            "{trigger}: {log}"
+        );
+    }
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
+async fn a_first_turn_without_an_answer_keeps_the_channel_closed_and_restarts() {
+    let fx = Fixture::new("noanswer");
+    let cfg = Config {
+        limits: Limits {
+            enabled: false,
+            ..fx.config().limits
+        },
+        ..fx.config()
+    };
+    // As with an expired token: Claude Code answers the turn itself, with an error.
+    fx.set("fake-mode", "synthetic");
+    assert_eq!(silta_session::run(&cfg, CancellationToken::new()).await, 1);
+    let log = fx.log();
+    assert!(log.contains("line Session test started"), "{log}");
+    assert!(!log.contains("ready"), "the channel stays closed: {log}");
+    assert!(!fx.home.join("channel-ready").exists());
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
 /// Starts a session with `auth` and returns the credential variables claude saw.
 async fn auth_line(name: &str, auth: Auth) -> String {
     let fx = Fixture::new(name);
@@ -795,7 +943,7 @@ async fn auth_line(name: &str, auth: Auth) -> String {
         let stop = stop.clone();
         async move { silta_session::run(&cfg, stop).await }
     });
-    let log = fx.until(10, |l| l.contains("ready after init")).await;
+    let log = fx.until(10, |l| l.contains("ready after answer")).await;
     stop.cancel();
     run.await.unwrap();
     log.lines()

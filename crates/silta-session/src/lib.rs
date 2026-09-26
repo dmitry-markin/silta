@@ -31,7 +31,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use contract::Contract;
+use contract::{Contract, FALLBACK_FATAL};
 use rotation::{Action, Limits, Moment, Step, Tracker, HANDOFF_ATTEMPTS};
 use state::{HandoffWatch, Next, Paths, HANDOFF_NOTE};
 
@@ -40,6 +40,15 @@ pub const CHANNEL: &str = "plugin:silta-claude@silta-local";
 
 /// The stderr line of a `--resume` whose transcript Claude Code does not know.
 const NO_CONVERSATION: &str = "No conversation found with session ID";
+
+/// The exit code of a session whose Claude Code cannot run the model as configured: a
+/// window below the configured one, a window check it refuses, or a fallback that
+/// points at the model rather than at an outage. The unit's `RestartPreventExitStatus`
+/// keeps it down until it is fixed.
+pub const EXIT_MODEL: i32 = 79;
+
+/// The `request_id` of the window check, a `get_context_usage` control request.
+const WINDOW_REQUEST: &str = "silta-window";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -54,6 +63,13 @@ pub struct Config {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub fallback_model: Option<String>,
+    /// The window Claude Code must measure the context against, the unit's
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW`: a Claude Code that does not know the model
+    /// assumes 200 000 tokens and caps the configured window at that. None skips the
+    /// check.
+    pub window: Option<u64>,
+    /// How long to wait for the window check's answer before giving the session up.
+    pub window_wait: Duration,
     /// None leaves claude without a credential (the tests).
     pub auth: Option<Auth>,
     /// How long to wait after closing stdin before killing claude.
@@ -154,6 +170,9 @@ struct Start {
 enum Outcome {
     /// The supervisor exits with this code; systemd decides about a restart.
     Exit(i32),
+    /// The supervisor ended the run and exits with this code for this reason:
+    /// [`EXIT_MODEL`] stays down, 1 is restarted by the unit.
+    Ended { code: i32, reason: String },
     /// Start claude again at once (a rotation step), with a pause before the next
     /// handoff attempt if the last one failed.
     Again { not_before: Option<Instant> },
@@ -189,6 +208,7 @@ async fn supervise(cfg: &Config, shutdown: &CancellationToken) -> (i32, String) 
         match run_once(cfg, &paths, &start, not_before, shutdown).await {
             Outcome::Exit(code) if shutdown.is_cancelled() => return (code, "stopped".to_owned()),
             Outcome::Exit(code) => return (code, format!("claude exited on its own with {code}")),
+            Outcome::Ended { code, reason } => return (code, reason),
             Outcome::Again { not_before: pause } => not_before = pause,
         }
     }
@@ -342,6 +362,10 @@ async fn run_once(
         .env("SILTA_INBOX", workspace.join("inbox"))
         .env("SILTA_READY_FILE", paths.channel_ready())
         .env("DISABLE_AUTOUPDATER", "1");
+    if let Some(window) = cfg.window {
+        // The window the check below holds Claude Code to, however it was given.
+        cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", window.to_string());
+    }
     // Exactly one way to authenticate: whatever else the unit's environment holds
     // (a drop-in, an override) is dropped, an API key above all.
     for var in AUTH_VARS {
@@ -367,9 +391,10 @@ async fn run_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // The plugin takes messages from the daemon only once this file exists: Claude Code
-    // drops channel notifications until its first turn starts, and that turn's `init`
-    // line is the sign (below).
+    // The plugin takes messages from the daemon only once this file exists, written at
+    // the first answer of a model (below): Claude Code drops channel notifications until
+    // its first turn has started, and a session whose model cannot serve must not take
+    // a message it would never answer.
     paths.clear_channel_ready();
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -397,6 +422,8 @@ async fn run_once(
         tracker: Tracker::new(cfg.limits.clone(), now),
         watch: None,
         contract: Contract::default(),
+        intro: None,
+        ready: false,
     };
     if start.kind == Kind::Retry {
         // The combined start line is the handoff request; the files are quiet now.
@@ -405,7 +432,6 @@ async fn run_once(
         }
         run.watch = Some(paths.watch_handoff());
     }
-    run.send(&intro(&cfg.session, start.kind)).await;
     match start.kind {
         Kind::Retry => run.tracker = run.tracker.retrying(now, start.attempts, start.handoff),
         _ if cfg.limits.enabled && paths.marker_exists() => {
@@ -431,17 +457,28 @@ async fn run_once(
         }
         _ => {}
     }
+    let line = intro(&cfg.session, start.kind);
+    if cfg.window.is_some() {
+        // No turn before the check: the host line waits for its answer.
+        run.control(
+            WINDOW_REQUEST,
+            serde_json::json!({"subtype": "get_context_usage", "detail": "summary"}),
+        )
+        .await;
+        run.intro = Some((line, now + cfg.window_wait));
+    } else {
+        run.send(&line).await;
+    }
 
     let mut readers_open = true;
     let mut no_conversation = false;
-    let mut channel_ready = false;
     let mut ticks: u64 = 0;
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut killed = false;
     let status = loop {
         tokio::select! {
-            _ = shutdown.cancelled(), if !matches!(run.after, Some(Outcome::Exit(_))) => {
+            _ = shutdown.cancelled(), if !matches!(run.after, Some(Outcome::Exit(_) | Outcome::Ended { .. })) => {
                 eprintln!("stopping: closing claude's stdin");
                 run.after = Some(Outcome::Exit(0));
                 run.begin_stop();
@@ -450,19 +487,27 @@ async fn run_once(
                 Some(Msg::Out(line)) => {
                     let (summary, event) = stream::read(&line);
                     println!("{summary}");
-                    // Claude Code prints `init` at the start of every turn, after it has
-                    // installed the channel's handler for that turn.
-                    if matches!(event, stream::Event::Init { .. }) && !channel_ready {
-                        channel_ready = true;
-                        match paths.write_channel_ready(&start.id) {
-                            Ok(()) => eprintln!("channel: registered by Claude Code; the plugin takes messages from now on"),
-                            Err(err) => eprintln!("channel: cannot write {}: {err}; the plugin will not connect", paths.channel_ready().display()),
-                        }
-                    }
                     if let Some(line) = run.contract.event(&event, cfg.limits.enabled, Instant::now()) {
                         eprintln!("contract: {line}");
                     }
-                    if run.stopping.is_none() {
+                    match &event {
+                        stream::Event::ContextUsage { request_id, max_tokens } if request_id == WINDOW_REQUEST => {
+                            run.window(*max_tokens).await;
+                        }
+                        stream::Event::ModelFallback { trigger } => run.fallback(trigger),
+                        // The handler for channel messages is in place from the first
+                        // turn's `init`; the first answer of a model shows that the model
+                        // serves.
+                        stream::Event::Assistant { subagent: false, synthetic: false, .. } if !run.ready => {
+                            run.open_channel();
+                        }
+                        stream::Event::Result { .. } if !run.ready => run.end(
+                            1,
+                            "the first turn ended without an answer from a model".to_owned(),
+                        ),
+                        _ => {}
+                    }
+                    if run.stopping.is_none() && run.intro.is_none() {
                         if matches!(event, stream::Event::Result { .. }) && run.tracker.awaiting_handoff() {
                             let written = run.watch.as_ref().is_some_and(|w| paths.handoff_written(w));
                             run.tracker.set_note_written(written);
@@ -495,6 +540,16 @@ async fn run_once(
                         let _ = child.kill().await;
                         killed = true;
                     }
+                } else if let Some((_, deadline)) = run.intro {
+                    if now >= deadline {
+                        run.end(
+                            1,
+                            format!(
+                                "Claude Code did not answer the window check (get_context_usage) within {} s",
+                                cfg.window_wait.as_secs()
+                            ),
+                        );
+                    }
                 } else {
                     ticks += 1;
                     if cfg.limits.enabled && ticks.is_multiple_of(5) {
@@ -515,6 +570,12 @@ async fn run_once(
                     }
                 }
             }
+        }
+        // An ended run is not given its turn to finish: that turn runs on the wrong
+        // model or window, or has nothing to do.
+        if run.ending() && !killed {
+            let _ = child.start_kill();
+            killed = true;
         }
     };
     // What the readers still hold after the exit.
@@ -576,15 +637,103 @@ struct Run<'a> {
     watch: Option<HandoffWatch>,
     /// The watch on Claude Code's output for what no longer matches the contract.
     contract: Contract,
+    /// The host line that starts the first turn and the deadline of the window check,
+    /// while the check's answer is awaited.
+    intro: Option<(String, Instant)>,
+    /// A model has answered and the channel-ready file is written.
+    ready: bool,
 }
 
 impl Run<'_> {
+    /// A control request to claude, answered by a `control_response` with `id`.
+    async fn control(&mut self, id: &str, request: serde_json::Value) {
+        let line =
+            serde_json::json!({"type": "control_request", "request_id": id, "request": request});
+        self.write(line).await;
+    }
+
+    /// The window check's answer: the first turn starts only on a window at least the
+    /// configured one.
+    async fn window(&mut self, max_tokens: Option<u64>) {
+        let (Some(want), Some((line, _))) = (self.cfg.window, self.intro.take()) else {
+            return;
+        };
+        let model = self.cfg.model.as_deref().unwrap_or("the default model");
+        match max_tokens {
+            Some(n) if n >= want => {
+                eprintln!("model: Claude Code measures the context of {model} against {n} tokens");
+                self.send(&line).await;
+            }
+            Some(n) => self.end(EXIT_MODEL, format!(
+                "Claude Code measures the context of {model} against {n} tokens, below CLAUDE_CODE_AUTO_COMPACT_WINDOW={want}: this version does not know the model's window or the configured window is above the model's"
+            )),
+            None => self.end(EXIT_MODEL, "Claude Code refused the window check (get_context_usage): this version cannot be held to a window".to_owned()),
+        }
+    }
+
+    /// A turn switched to the `--fallback-model`: a trigger that points at the model
+    /// ends the session, an outage is let through.
+    fn fallback(&mut self, trigger: &str) {
+        let fallback = self.cfg.fallback_model.as_deref().unwrap_or("?");
+        if FALLBACK_FATAL.contains(&trigger) {
+            self.end(EXIT_MODEL, format!(
+                "Claude Code switched the turn to {fallback} ({trigger}): the primary model cannot serve this Claude Code"
+            ));
+        } else {
+            eprintln!("model: this turn runs on {fallback} ({trigger}); the next one tries the primary again");
+        }
+    }
+
+    /// A model has answered: the plugin may take messages from the daemon, unless the
+    /// run is already ending (the answer of a fallback that ended it, or a stop).
+    fn open_channel(&mut self) {
+        if self.after.is_some() {
+            return;
+        }
+        self.ready = true;
+        match self.paths.write_channel_ready(self.id) {
+            Ok(()) => eprintln!("channel: a model answered; the plugin takes messages from now on"),
+            Err(err) => eprintln!(
+                "channel: cannot write {}: {err}; the plugin will not connect",
+                self.paths.channel_ready().display()
+            ),
+        }
+    }
+
+    /// Ends the run at once: claude is killed, and the supervisor exits with `code`
+    /// ([`EXIT_MODEL`] keeps the unit down, 1 has it restarted). A stop or a rotation
+    /// step already under way keeps its own course.
+    fn end(&mut self, code: i32, reason: String) {
+        if self.after.is_some() {
+            eprintln!("model: {reason}; the run is already ending");
+            return;
+        }
+        if code == EXIT_MODEL {
+            eprintln!("model: {reason}; ending the session, which is not restarted until fixed (exit {EXIT_MODEL})");
+        } else {
+            eprintln!("model: {reason}; ending the session for a restart");
+        }
+        self.after = Some(Outcome::Ended { code, reason });
+        self.intro = None;
+        self.stdin = None;
+        self.stopping.get_or_insert_with(Instant::now);
+    }
+
+    /// The run was ended by [`Run::end`] and claude is to be killed.
+    fn ending(&self) -> bool {
+        matches!(self.after, Some(Outcome::Ended { .. }))
+    }
+
     async fn send(&mut self, text: &str) {
+        let line =
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": text}});
+        self.write(line).await;
+    }
+
+    async fn write(&mut self, line: serde_json::Value) {
         let Some(stdin) = self.stdin.as_mut() else {
             return;
         };
-        let line =
-            serde_json::json!({"type": "user", "message": {"role": "user", "content": text}});
         let mut bytes = line.to_string().into_bytes();
         bytes.push(b'\n');
         if let Err(err) = async {

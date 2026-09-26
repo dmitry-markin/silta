@@ -293,9 +293,11 @@ impl Tracker {
             Event::Assistant {
                 subagent,
                 context_tokens,
+                synthetic,
             } => {
                 self.turn = true;
-                if let (false, Some(n)) = (subagent, context_tokens) {
+                // A message Claude Code wrote itself (an API error) has no prompt size.
+                if let (false, false, Some(n)) = (subagent, synthetic, context_tokens) {
                     self.context = *n;
                 }
             }
@@ -357,7 +359,10 @@ impl Tracker {
                     *failed = true;
                 }
             }
-            Event::Init { .. } | Event::Other => {}
+            Event::Init { .. }
+            | Event::ContextUsage { .. }
+            | Event::ModelFallback { .. }
+            | Event::Other => {}
         }
         self.advance(now)
     }
@@ -490,6 +495,7 @@ mod tests {
         Event::Assistant {
             subagent: false,
             context_tokens: Some(context),
+            synthetic: false,
         }
     }
 
@@ -606,9 +612,24 @@ mod tests {
             &Event::Assistant {
                 subagent: true,
                 context_tokens: Some(900_000),
+                synthetic: false,
             },
             t0,
         );
+        tr.event(&OK, t0);
+        assert!(tr.tick(t0 + secs(20 * 3600)).is_empty());
+        // A synthetic message (an API error) neither raises nor resets the size.
+        tr.event(&assistant(900_000), t0);
+        tr.event(
+            &Event::Assistant {
+                subagent: false,
+                context_tokens: Some(0),
+                synthetic: true,
+            },
+            t0,
+        );
+        assert_eq!(tr.context(), 900_000);
+        tr.event(&assistant(100_000), t0);
         tr.event(&OK, t0);
         assert!(tr.tick(t0 + secs(20 * 3600)).is_empty());
         // A turn that started 5 hours ago without a result: not idle.
