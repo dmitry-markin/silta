@@ -1,0 +1,1565 @@
+#!/usr/bin/env python3
+"""Checks a Claude Code build against the contract silta-session and silta-claude rely on.
+
+Claude Code has no stable API for a host like Silta: the supervisor speaks its stream-json
+protocol, the plugin speaks MCP with a Claude-specific channel extension, and the
+deployment rests on a set of flags, environment variables, managed settings and file
+locations. Every one of them can change between Claude Code releases, so before a
+release is pinned for the minds (`TESTED_VERSIONS` in crates/silta-session/src/contract.rs)
+this script runs it once against everything Silta assumes of it, with real turns.
+
+It replaces nothing in the deployment and touches no mind: it runs Claude Code with a
+state directory, a workspace and a credential of its own, plays the daemon itself on a
+private socket, and lets the real silta-claude plugin connect to that. What it checks is
+organised by the piece of Silta that depends on it:
+
+  the supervisor's launch     the command line of `silta-session` (lib.rs `run_once`), the
+                              environment knobs Claude Code reads, stdin EOF as the graceful
+                              stop, `--resume` and its failure text, the transcript's path
+  the supervisor's reading    every stream-json line `stream.rs` parses: `system init`,
+                              main-line `assistant` usage, `user` and `result` lines with
+                              their channel `origin`, `background_tasks_changed`, the
+                              `/compact` exchange, `model_fallback`, the `<synthetic>` marker
+                              of an API failure, the `control_response` of the window check
+  the rotation's hook         the PreCompact hook blocking an automatic compaction and
+                              leaving the marker (deploy/silta-precompact-block)
+  the channel                 the plugin installed from the marketplace as `silta-session-add`
+                              does it, registered through `--channels`, its tools in the
+                              session, a message from the daemon becoming a `<channel>` user
+                              message and a turn that answers it with the reply tool
+
+Two ways to run it:
+
+  on a VM with Silta deployed   `systemctl start silta-contract-check`, then
+                                `journalctl -u silta-contract-check`. The unit runs this
+                                script as the user silta-check with /var/lib/silta/check as
+                                HOME and the credential from /etc/silta/auth/check, laid out
+                                like a mind's (oauth-token or api-key). The model, window and
+                                the other knobs come from the installed
+                                silta-session@.service.
+  on a developer's machine      deploy/silta-contract-check from the repository, with the
+                                developer's own `claude` and login: the state lives in a
+                                temporary directory, the marketplace is registered under the
+                                developer's ~/.claude for the duration of the run and removed
+                                afterwards (unless it was there already), and the run's
+                                transcript and MCP logs are removed at the end.
+
+Every check prints one line, PASS / FAIL / SKIP / WARN / INFO, and the exit code is 0 when
+nothing failed. The whole trace of each run (Claude Code's stdout and stderr, what was
+written to its stdin, what the fake daemon saw, the files looked at) is saved as one JSON
+line per event under the logs directory; `--replay DIR` runs the same assertions over a
+saved trace, for a failure to be examined offline and for CI to keep the assertions
+themselves working (dev/contract-fixtures).
+
+A full run makes a handful of short turns on the configured model and, for the hook,
+two turns on a cheap model over a context of about 90 000 tokens (`--hook-model`); it takes
+a few minutes and costs well under a dollar.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+# The Claude Code versions the supervisor was checked against; the same list as
+# `TESTED_VERSIONS` in crates/silta-session/src/contract.rs, which a test there keeps in
+# step. A version outside it makes the supervisor print a `contract:` line at every turn.
+TESTED_VERSIONS = ["2.1.281", "2.1.283"]
+
+# The channel as the supervisor names it on the command line (lib.rs `CHANNEL`), the
+# marketplace and plugin behind it (assistant/marketplace), the MCP server's name in the
+# plugin's .mcp.json, and the name Claude Code gives the plugin's tools in the session.
+CHANNEL = "plugin:silta-claude@silta-local"
+MARKETPLACE_NAME = "silta-local"
+PLUGIN_NAME = "silta-claude"
+PLUGIN_ID = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
+SERVER_NAME = "silta"
+# The `source` attribute Claude Code puts on the `<channel>` tag, which the plugin's
+# instructions to the model quote verbatim (mcp.rs `INSTRUCTIONS`).
+CHANNEL_SOURCE = f"plugin:{PLUGIN_NAME}:{SERVER_NAME}"
+TOOL_PREFIX = f"mcp__plugin_{PLUGIN_NAME}_{SERVER_NAME}__"
+REPLY_TOOL = TOOL_PREFIX + "reply"
+
+# The daemon's socket protocol the plugin speaks (crates/silta/src/protocol.rs
+# `PROTOCOL_VERSION`), for the fake daemon.
+DAEMON_PROTOCOL = 4
+
+# The window check: the supervisor's control request and its id (lib.rs
+# `WINDOW_REQUEST`). Claude Code answers with `control_response`.
+WINDOW_REQUEST = "silta-window"
+
+# The stderr text of a `--resume` whose transcript Claude Code does not know (lib.rs
+# `NO_CONVERSATION`); the supervisor drops the saved id on it.
+NO_CONVERSATION = "No conversation found with session ID"
+
+# The `model_fallback` triggers the supervisor knows (contract.rs `FALLBACK_FATAL` and
+# `FALLBACK_OUTAGE`); the fault run provokes the first.
+FALLBACK_FATAL = ["model_not_found", "permission_denied", "last_resort", "model_blocked"]
+FALLBACK_OUTAGE = ["overloaded", "server_error"]
+
+# The smallest window Claude Code accepts for CLAUDE_CODE_AUTO_COMPACT_WINDOW, used by the
+# hook run so that a modest context trips the automatic compaction. Claude Code compacts
+# at about the window minus a 20 000-token output reserve minus 13 000 (see the unit's
+# comment on the window), 67 000 here; the filler aims above that and, with Claude Code's
+# own system prompt, below the window.
+HOOK_WINDOW = 100_000
+FILLER_WORDS = 58_000
+DEFAULT_HOOK_MODEL = "claude-haiku-4-5-20251001"
+
+# The variables that decide how Claude Code authenticates (lib.rs `AUTH_VARS`): the
+# supervisor drops every one of them from the environment and sets exactly one way.
+AUTH_VARS = [
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+]
+
+# The unit's knobs the checker takes over: the environment Claude Code itself reads, and
+# the values the supervisor passes on the command line.
+UNIT_KEYS = [
+    "SILTA_MODEL",
+    "SILTA_EFFORT",
+    "SILTA_FALLBACK_MODEL",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "SILTA_STOP_GRACE",
+]
+
+# The keys of /etc/claude-code/managed-settings.json the deployment rests on
+# (assistant/managed-settings.json), each with what it does for Silta.
+MANAGED_KEYS = {
+    "channelsEnabled": "without it Claude Code drops channel messages for organisation accounts",
+    "allowedChannelPlugins": "the allowlist the channel plugin must be on",
+    "hooks": "the PreCompact hook that turns an automatic compaction into a rotation",
+    "allowManagedMcpServersOnly": "only the plugin binary may run as an MCP server",
+    "allowedMcpServers": "the plugin binary's allowlist entry",
+    "strictKnownMarketplaces": "the packaged marketplace is the only one a mind may add",
+    "sandbox": "the bubblewrap sandbox for Bash, which protects the credential",
+    "permissions": "the Edit deny rules that keep the mind out of the harness's files",
+}
+
+SYSTEM_PROMPT = """You are taking part in an automated test of the harness you run in. \
+Follow each instruction literally and briefly. Never ask questions, never add commentary; \
+when told to answer with a single word, answer with exactly that word and nothing else."""
+
+INTRO = (
+    "Contract check started: this line comes from the host, not from a person. "
+    "Reply with the single word ok and nothing else."
+)
+
+
+# --------------------------------------------------------------------------------------
+# The report: one line per check, the summary at the end.
+
+
+@dataclass
+class Report:
+    checks: list[tuple[str, str, str]] = field(default_factory=list)
+    out: Any = sys.stdout
+
+    def _add(self, status: str, name: str, detail: str) -> None:
+        self.checks.append((status, name, detail))
+        line = f"{status:<5} {name}"
+        if detail:
+            line += f": {detail}"
+        print(line, file=self.out, flush=True)
+
+    def ok(self, name: str, detail: str = "") -> None:
+        self._add("PASS", name, detail)
+
+    def fail(self, name: str, detail: str) -> None:
+        self._add("FAIL", name, detail)
+
+    def skip(self, name: str, detail: str) -> None:
+        self._add("SKIP", name, detail)
+
+    def warn(self, name: str, detail: str) -> None:
+        self._add("WARN", name, detail)
+
+    def info(self, name: str, detail: str) -> None:
+        self._add("INFO", name, detail)
+
+    def check(self, name: str, condition: bool, detail: str, ok_detail: str = "") -> bool:
+        """A pass or a fail, with the detail of the failure."""
+        if condition:
+            self.ok(name, ok_detail)
+        else:
+            self.fail(name, detail)
+        return condition
+
+    def failed(self) -> int:
+        return sum(1 for status, _, _ in self.checks if status == "FAIL")
+
+    def summary(self, version: Optional[str]) -> None:
+        counts = {s: 0 for s in ("PASS", "FAIL", "SKIP", "WARN")}
+        for status, _, _ in self.checks:
+            if status in counts:
+                counts[status] += 1
+        print(
+            f"\n{counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped, "
+            f"{counts['WARN']} warnings",
+            file=self.out,
+        )
+        if self.failed():
+            print("contract broken:", file=self.out)
+            for status, name, detail in self.checks:
+                if status == "FAIL":
+                    print(f"  {name}: {detail}", file=self.out)
+        elif version:
+            if version in TESTED_VERSIONS:
+                print(f"contract holds for Claude Code {version}, which is in TESTED_VERSIONS", file=self.out)
+            else:
+                print(
+                    f"contract holds for Claude Code {version}: add it to TESTED_VERSIONS in "
+                    "crates/silta-session/src/contract.rs, to this script and to the README "
+                    "(the supervisor prints a contract line at every turn until then)",
+                    file=self.out,
+                )
+        self.out.flush()
+
+
+# --------------------------------------------------------------------------------------
+# The trace: everything a run produced, in order, one dict per event. Claude Code's own
+# stdout lines keep their `type`; the checker's entries have a `type` starting with `_`.
+# Live runs write it and assert on it; `--replay` reads it back.
+
+
+class Trace:
+    def __init__(self, path: Optional[Path] = None):
+        self.lines: list[dict] = []
+        self.lock = threading.Condition()
+        self.path = path
+        self.file = path.open("w", encoding="utf-8") if path else None
+        self.started = time.monotonic()
+
+    def add(self, entry: dict) -> None:
+        with self.lock:
+            entry.setdefault("_t", round(time.monotonic() - self.started, 3))
+            self.lines.append(entry)
+            if self.file:
+                self.file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                self.file.flush()
+            self.lock.notify_all()
+
+    def wait(self, pred: Callable[[dict], bool], timeout: float, start: int = 0) -> Optional[dict]:
+        """The first entry from index `start` on satisfying `pred`, waiting up to `timeout`."""
+        deadline = time.monotonic() + timeout
+        with self.lock:
+            i = start
+            while True:
+                while i < len(self.lines):
+                    if pred(self.lines[i]):
+                        return self.lines[i]
+                    i += 1
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self.lock.wait(left)
+
+    def wait_quiet(self, quiet: float, timeout: float) -> bool:
+        """Waits until no entry has arrived for `quiet` seconds and the last stdout line is
+        a `result`; false when `timeout` passes first."""
+        deadline = time.monotonic() + timeout
+        with self.lock:
+            while True:
+                n = len(self.lines)
+                last = next((l for l in reversed(self.lines) if not l["type"].startswith("_")), None)
+                self.lock.wait(quiet)
+                if len(self.lines) == n and last is not None and last["type"] == "result":
+                    return True
+                if time.monotonic() > deadline:
+                    return False
+
+    def __len__(self) -> int:
+        with self.lock:
+            return len(self.lines)
+
+    def close(self) -> None:
+        if self.file:
+            self.file.close()
+            self.file = None
+
+    @staticmethod
+    def load(path: Path) -> "Trace":
+        trace = Trace()
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    trace.lines.append(json.loads(line))
+        return trace
+
+
+def stdout_lines(trace: Trace) -> list[dict]:
+    return [l for l in trace.lines if not l["type"].startswith("_")]
+
+
+def of_type(lines: list[dict], kind: str, subtype: Optional[str] = None) -> list[dict]:
+    return [l for l in lines if l.get("type") == kind and (subtype is None or l.get("subtype") == subtype)]
+
+
+def is_main(line: dict) -> bool:
+    """A line of the main conversation rather than a subagent's (stream.rs `subagent`)."""
+    return line.get("parent_tool_use_id") is None
+
+
+def content_text(line: dict) -> Optional[str]:
+    """The text of a `user` line: a string, or the first text block (stream.rs `person_of`)."""
+    content = line.get("message", {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                return block["text"]
+    return None
+
+
+def channel_origin(line: dict) -> bool:
+    """The `origin` Claude Code puts on a channel delivery's replayed `user` line and on
+    the `result` of the turn it started (stream.rs `channel_origin`)."""
+    return isinstance(line.get("origin"), dict) and line["origin"].get("kind") == "channel"
+
+
+def tool_uses(line: dict) -> list[dict]:
+    content = line.get("message", {}).get("content")
+    if not isinstance(content, list):
+        return []
+    return [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+
+
+def tool_results(line: dict) -> list[dict]:
+    content = line.get("message", {}).get("content")
+    if not isinstance(content, list):
+        return []
+    return [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+
+
+def shorten(text: Any, n: int = 200) -> str:
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= n else flat[:n] + "…"
+
+
+# --------------------------------------------------------------------------------------
+# The configuration: where things are and the values of the unit.
+
+
+@dataclass
+class Config:
+    claude: Path
+    plugin_bin: Path
+    marketplace: Path
+    hook: Path
+    managed_settings: Path
+    home: Path
+    state: Path
+    logs: Path
+    service: bool
+    auth_env: dict[str, str]
+    model: str
+    effort: str
+    fallback_model: Optional[str]
+    window: int
+    stop_grace: int
+    passthrough: dict[str, str]
+    hook_model: str
+    turn_timeout: float
+    skip: set[str]
+    keep: bool
+
+
+def parse_unit(path: Path) -> dict[str, str]:
+    """The `Environment=KEY=VALUE` lines of the session unit: the knobs a mind runs with."""
+    env: dict[str, str] = {}
+    if not path.is_file():
+        return env
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^Environment=([A-Z_][A-Z0-9_]*)=(.*)$", line.strip())
+        if m and m.group(1) in UNIT_KEYS:
+            env[m.group(1)] = m.group(2).strip().strip('"')
+    return env
+
+
+def load_credential(directory: Path) -> dict[str, str]:
+    """The mind's credential layout (lib.rs `Auth::load`): exactly one of `auth_oauth-token`
+    and `auth_api-key` in the credentials directory systemd fills from
+    /etc/silta/auth/<name>. A gateway token is refused: Claude Code has no channels there."""
+    found = {}
+    for name in ("oauth-token", "api-key", "gateway-token"):
+        p = directory / f"auth_{name}"
+        if p.is_file():
+            token = "".join(p.read_text(encoding="utf-8").split())
+            if token:
+                found[name] = token
+    if not found:
+        raise SystemExit(f"no credential in {directory}: expected auth_oauth-token or auth_api-key")
+    if len(found) > 1:
+        raise SystemExit(f"more than one credential in {directory}: keep one of {sorted(found)}")
+    (name, token), = found.items()
+    if name == "oauth-token":
+        return {"CLAUDE_CODE_OAUTH_TOKEN": token}
+    if name == "api-key":
+        return {"ANTHROPIC_API_KEY": token}
+    raise SystemExit("a gateway-token: Claude Code offers no channels through a gateway, so there is nothing to check")
+
+
+def find_claude(explicit: Optional[str]) -> Path:
+    for candidate in [explicit, os.environ.get("CLAUDE_BIN"), shutil.which("claude"), "/opt/claude/.local/bin/claude"]:
+        if candidate and Path(candidate).exists():
+            return Path(candidate)
+    raise SystemExit("claude not found: pass --claude or set CLAUDE_BIN")
+
+
+def find_plugin_bin(explicit: Optional[str], repo: Optional[Path]) -> Path:
+    candidates = [explicit, os.environ.get("SILTA_CLAUDE_BIN")]
+    if repo:
+        candidates += [repo / "target/release/silta-claude", repo / "target/debug/silta-claude"]
+    candidates += [shutil.which("silta-claude"), "/usr/bin/silta-claude"]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return Path(candidate)
+    raise SystemExit("silta-claude not found: pass --plugin-bin, set SILTA_CLAUDE_BIN, or build it")
+
+
+def repo_root() -> Optional[Path]:
+    """The repository this script is run from, if it is (deploy/silta-contract-check)."""
+    here = Path(__file__).resolve().parent
+    if here.name == "deploy" and (here.parent / "Cargo.toml").is_file():
+        return here.parent
+    return None
+
+
+def configure(args: argparse.Namespace) -> Config:
+    if os.geteuid() == 0:
+        raise SystemExit("do not run as root: on a VM use `systemctl start silta-contract-check`, which runs it as silta-check")
+    repo = repo_root()
+    here = Path(__file__).resolve().parent
+    credentials = args.credentials or os.environ.get("CREDENTIALS_DIRECTORY")
+    service = credentials is not None
+    home = Path(args.home or os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
+    if service:
+        auth_env = load_credential(Path(credentials))
+        state = Path(os.environ.get("STATE_DIRECTORY") or home)
+        for sub in ("workspace",):
+            (state / sub).mkdir(parents=True, exist_ok=True)
+    else:
+        if args.home:
+            raise SystemExit("--home needs --credentials: an isolated HOME has no login of its own")
+        auth_env = {}
+        state = Path(tempfile.mkdtemp(prefix="silta-contract-check-"))
+    unit = Path(args.unit) if args.unit else (repo / "deploy/silta-session@.service" if repo else Path("/usr/lib/systemd/system/silta-session@.service"))
+    unit_env = parse_unit(unit)
+    model = args.model or unit_env.get("SILTA_MODEL")
+    if not model:
+        raise SystemExit(f"no model: pass --model or point --unit at a silta-session@.service with SILTA_MODEL ({unit} has none)")
+    window = int(args.window or unit_env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") or 0)
+    if not window:
+        raise SystemExit("no window: pass --window or point --unit at a unit with CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+    passthrough = {k: v for k, v in unit_env.items() if k in ("CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK", "CLAUDE_CODE_SUBAGENT_MODEL")}
+    marketplace = Path(args.marketplace) if args.marketplace else (repo / "assistant/marketplace" if repo else Path("/usr/share/silta/marketplace"))
+    logs = Path(args.logs) if args.logs else state / "logs" / time.strftime("%Y-%m-%dT%H-%M-%S")
+    logs.mkdir(parents=True, exist_ok=True)
+    # The service keeps the traces of the last few runs.
+    if service and not args.logs:
+        for old in sorted(logs.parent.iterdir())[:-5]:
+            shutil.rmtree(old, ignore_errors=True)
+    return Config(
+        claude=find_claude(args.claude),
+        plugin_bin=find_plugin_bin(args.plugin_bin, repo),
+        marketplace=marketplace,
+        hook=here / "silta-precompact-block",
+        managed_settings=Path("/etc/claude-code/managed-settings.json"),
+        home=home,
+        state=state,
+        logs=logs,
+        service=service,
+        auth_env=auth_env,
+        model=model,
+        effort=args.effort or "low",
+        fallback_model=args.fallback_model or unit_env.get("SILTA_FALLBACK_MODEL"),
+        window=window,
+        stop_grace=int(unit_env.get("SILTA_STOP_GRACE") or 120),
+        passthrough=passthrough,
+        hook_model=args.hook_model,
+        turn_timeout=args.turn_timeout,
+        skip=set(filter(None, (args.skip or "").split(","))),
+        keep=args.keep,
+    )
+
+
+def base_env(cfg: Config) -> dict[str, str]:
+    """The environment Claude Code and the plugin commands run with. Every `CLAUDE*`
+    variable of the calling shell goes (a run from inside another Claude Code session would
+    otherwise be nested), the credential variables go the way the supervisor drops them,
+    and exactly the configured credential comes back."""
+    env = {k: v for k, v in os.environ.items() if not (k.startswith("CLAUDE") and k not in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"))}
+    if cfg.service:
+        for var in AUTH_VARS:
+            env.pop(var, None)
+        env.update(cfg.auth_env)
+    env["HOME"] = str(cfg.home)
+    env["DISABLE_AUTOUPDATER"] = "1"
+    return env
+
+
+# --------------------------------------------------------------------------------------
+# The fake daemon: the socket `siltad` would offer, enough of protocol v4 for one session.
+# It answers `hello` with `welcome`, records every line the plugin sends, delivers the
+# events the checker queues, and answers every command with a successful result.
+
+
+class FakeDaemon:
+    def __init__(self, path: Path, session: str, trace: Trace):
+        self.path = path
+        self.session = session
+        self.trace = trace
+        if path.exists():
+            path.unlink()
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(str(path))
+        self.server.listen(4)
+        self.conn: Optional[socket.socket] = None
+        self.writer = None
+        self.lock = threading.Lock()
+        self.connected = threading.Event()
+        self.closed = threading.Event()
+        self.thread = threading.Thread(target=self._serve, name="fake-daemon", daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            self.trace.add({"type": "_daemon", "event": "connected"})
+            with self.lock:
+                self.conn = conn
+                self.writer = conn.makefile("w", encoding="utf-8")
+            self.closed.clear()
+            reader = conn.makefile("r", encoding="utf-8")
+            for raw in reader:
+                try:
+                    line = json.loads(raw)
+                except json.JSONDecodeError:
+                    self.trace.add({"type": "_daemon", "event": "garbage", "text": raw[:500]})
+                    continue
+                self.trace.add({"type": "_daemon", "event": "line", "line": line})
+                if "hello" in line:
+                    self.send({"welcome": {
+                        "protocol": DAEMON_PROTOCOL,
+                        "session": self.session,
+                        "user_id": "@silta:contract.check",
+                        "people": [{"name": "Alice", "role": "owner"}],
+                        "inbox_max_age_days": 30,
+                    }})
+                    self.connected.set()
+                elif "cmd" in line:
+                    # Every command succeeds: the model's reply gets an event id back.
+                    self.send({"result": {"id": line["cmd"]["id"], "ok": True, "event_id": f"$reply-{line['cmd']['id']}"}})
+            self.trace.add({"type": "_daemon", "event": "disconnected"})
+            with self.lock:
+                self.conn = None
+                self.writer = None
+            self.closed.set()
+
+    def send(self, obj: dict) -> None:
+        with self.lock:
+            if self.writer is None:
+                self.trace.add({"type": "_daemon", "event": "unsent", "line": obj})
+                return
+            self.trace.add({"type": "_daemon", "event": "sent", "line": obj})
+            self.writer.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            self.writer.flush()
+
+    def event(self, event_id: str, text: str) -> None:
+        """A message from Alice in her DM room, as the daemon would deliver it."""
+        self.send({"event": {
+            "kind": "message",
+            "person": "Alice",
+            "role": "owner",
+            "sender": "@alice:contract.check",
+            "room_id": "!room:contract.check",
+            "room": "dm",
+            "event_id": event_id,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "text": text,
+            "transcribed": False,
+            "attachments": [],
+        }})
+
+    def close(self) -> None:
+        try:
+            self.server.close()
+        except OSError:
+            pass
+        with self.lock:
+            if self.conn:
+                try:
+                    self.conn.close()
+                except OSError:
+                    pass
+        if self.path.exists():
+            self.path.unlink()
+
+
+# --------------------------------------------------------------------------------------
+# One run of Claude Code, started the way the supervisor starts it.
+
+
+class ClaudeRun:
+    def __init__(self, cfg: Config, trace: Trace, name: str, *, model: str, session_id: Optional[str],
+                 resume: Optional[str] = None, window: Optional[int] = None, env: Optional[dict] = None,
+                 drop: Optional[list[str]] = None, extra_args: Optional[list[str]] = None,
+                 fallback: Optional[str] = None):
+        self.cfg = cfg
+        self.trace = trace
+        self.name = name
+        self.workspace = cfg.state / "workspace"
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        (self.workspace / "inbox").mkdir(exist_ok=True)
+        self.ready_file = cfg.state / "channel-ready"
+        self.socket = cfg.state / "siltad.sock"
+        prompt = cfg.state / "system-prompt.md"
+        prompt.write_text(SYSTEM_PROMPT + "\n", encoding="utf-8")
+        # The supervisor's command line (lib.rs `run_once`): the prompt-less print mode,
+        # stream-json both ways, `--verbose` (mandatory with stream-json output),
+        # `--replay-user-messages` (without it a turn's prompt is not written back and a
+        # channel delivery would be invisible), permissions on auto with no prompts, the
+        # persona appended to the system prompt, the model knobs, either a fresh id with a
+        # name or a resume, and the channel last because `--channels` is variadic.
+        args = [
+            str(cfg.claude), "-p",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--replay-user-messages",
+            "--permission-mode", "auto",
+            "--permission-prompts", "none",
+            "--append-system-prompt-file", str(prompt),
+            "--model", model,
+            "--effort", cfg.effort,
+        ]
+        fallback = fallback if fallback is not None else cfg.fallback_model
+        if fallback:
+            args += ["--fallback-model", fallback]
+        if resume:
+            args += ["--resume", resume]
+        else:
+            args += ["--session-id", session_id, "--name", "silta-contract-check"]
+        args += extra_args or []
+        args += ["--channels", CHANNEL]
+        self.args = args
+        # The environment the supervisor gives Claude Code and, through it, the plugin
+        # (lib.rs `run_once`): the state directory as HOME, the plugin's binary for the
+        # marketplace's `${SILTA_CLAUDE_BIN}`, the daemon's socket, the inbox, the ready
+        # file the plugin waits for, the window, and the knobs Claude Code itself reads.
+        run_env = base_env(cfg)
+        run_env.update({
+            "SILTA_SESSION": "contract-check",
+            "SILTA_CLAUDE_BIN": str(cfg.plugin_bin),
+            "SILTA_SOCKET": str(self.socket),
+            "SILTA_INBOX": str(self.workspace / "inbox"),
+            "SILTA_READY_FILE": str(self.ready_file),
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(window or cfg.window),
+            # The hook writes the marker under STATE_DIRECTORY, or HOME without it.
+            "STATE_DIRECTORY": str(cfg.state),
+            "SILTA_ROTATE": "1",
+        })
+        run_env.update(cfg.passthrough)
+        for var in drop or []:
+            run_env.pop(var, None)
+        run_env.update(env or {})
+        self.env = run_env
+        if self.ready_file.exists():
+            self.ready_file.unlink()
+        self.marker = cfg.state / "rotate-requested"
+        if self.marker.exists():
+            self.marker.unlink()
+        self.trace.add({"type": "_start", "run": name, "args": args[1:], "env": {k: v for k, v in run_env.items() if k.startswith(("SILTA", "CLAUDE_CODE_AUTO", "CLAUDE_CODE_DIS", "CLAUDE_CODE_SUB", "CLAUDE_CODE_MAX", "STATE"))}})
+        self.process = subprocess.Popen(
+            args, cwd=str(self.workspace), env=run_env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.started = time.monotonic()
+        self.stdout_thread = threading.Thread(target=self._pump, args=(self.process.stdout, False), daemon=True)
+        self.stderr_thread = threading.Thread(target=self._pump, args=(self.process.stderr, True), daemon=True)
+        self.stdout_thread.start()
+        self.stderr_thread.start()
+
+    def _pump(self, stream, is_err: bool) -> None:
+        for raw in stream:
+            text = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if is_err:
+                self.trace.add({"type": "_stderr", "text": text})
+                continue
+            try:
+                line = json.loads(text)
+                if not isinstance(line, dict) or "type" not in line:
+                    raise ValueError
+            except (json.JSONDecodeError, ValueError):
+                self.trace.add({"type": "_stdout", "text": text})
+                continue
+            self.trace.add(line)
+
+    def write(self, obj: dict) -> None:
+        self.trace.add({"type": "_stdin", "line": obj if len(json.dumps(obj)) < 2000 else {"...": f"{len(json.dumps(obj))} bytes", "type": obj.get("type")}})
+        try:
+            self.process.stdin.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            self.trace.add({"type": "_stdin_error", "text": str(e)})
+
+    def send_user(self, text: str) -> None:
+        """A host line, as the supervisor writes it (lib.rs `Run::send`)."""
+        self.write({"type": "user", "message": {"role": "user", "content": text}})
+
+    def control(self, request_id: str, request: dict) -> None:
+        """A control request, as the supervisor writes it (lib.rs `Run::control`)."""
+        self.write({"type": "control_request", "request_id": request_id, "request": request})
+
+    def touch_ready(self) -> None:
+        """What the supervisor does at the first answer of a model: the plugin may connect."""
+        self.ready_file.write_text("contract-check\n", encoding="utf-8")
+        self.trace.add({"type": "_ready"})
+
+    def wait_result(self, start: int, timeout: Optional[float] = None) -> Optional[dict]:
+        return self.trace.wait(lambda l: l.get("type") == "result", timeout or self.cfg.turn_timeout, start)
+
+    def close_stdin(self) -> None:
+        """The graceful stop: EOF on stdin ends a -p session (lib.rs `begin_stop`)."""
+        self.trace.add({"type": "_stdin_eof"})
+        try:
+            self.process.stdin.close()
+        except OSError:
+            pass
+
+    def wait_exit(self, timeout: float) -> Optional[int]:
+        try:
+            code = self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.trace.add({"type": "_exit", "code": None, "seconds": round(time.monotonic() - self.started, 1), "killed": True})
+            self.process.kill()
+            self.process.wait()
+            self.stdout_thread.join(5)
+            self.stderr_thread.join(5)
+            return None
+        self.stdout_thread.join(5)
+        self.stderr_thread.join(5)
+        self.trace.add({"type": "_exit", "code": code, "seconds": round(time.monotonic() - self.started, 1)})
+        return code
+
+    def kill(self) -> None:
+        if self.process.poll() is None:
+            self.process.kill()
+            self.process.wait()
+
+
+def record_file(trace: Trace, name: str, path: Path) -> None:
+    entry: dict[str, Any] = {"type": "_file", "name": name, "path": str(path), "exists": path.exists()}
+    if path.is_file():
+        try:
+            entry["content"] = path.read_text(encoding="utf-8")[:4000]
+        except OSError as e:
+            entry["error"] = str(e)
+    trace.add(entry)
+
+
+# --------------------------------------------------------------------------------------
+# Preconditions, without a model call.
+
+
+def check_static(report: Report, cfg: Config) -> Optional[str]:
+    """The binaries and files, and what `claude --version` says."""
+    env = base_env(cfg)
+    try:
+        out = subprocess.run([str(cfg.claude), "--version"], env=env, capture_output=True, text=True, timeout=60)
+        m = re.search(r"(\d+\.\d+\.\d+)", out.stdout)
+        version = m.group(1) if m else None
+    except (OSError, subprocess.TimeoutExpired) as e:
+        report.fail("claude --version", f"{cfg.claude}: {e}")
+        return None
+    report.check("claude --version", version is not None, f"{cfg.claude} printed {out.stdout.strip()!r}", f"{cfg.claude} is Claude Code {version}")
+    if version:
+        if version in TESTED_VERSIONS:
+            report.info("tested versions", f"{version} is in TESTED_VERSIONS {TESTED_VERSIONS}")
+        else:
+            report.info("tested versions", f"{version} is not in TESTED_VERSIONS {TESTED_VERSIONS}; a pass below is what adding it takes")
+    try:
+        out = subprocess.run([str(cfg.plugin_bin), "--version"], capture_output=True, text=True, timeout=30)
+        m = re.search(r"silta-claude (\d+\.\d+\.\d+)", out.stdout)
+        plugin_version = m.group(1) if m and out.returncode == 0 else None
+        report.check("silta-claude --version", plugin_version is not None, f"{cfg.plugin_bin}: exit {out.returncode}, stdout {out.stdout.strip()!r}, stderr {shorten(out.stderr)!r}", f"{cfg.plugin_bin} is silta-claude {plugin_version}")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        report.fail("silta-claude --version", f"{cfg.plugin_bin}: {e}")
+        plugin_version = None
+    # The marketplace as the package ships it: the plugin's manifest and its .mcp.json,
+    # whose command is the binary through `${SILTA_CLAUDE_BIN:-silta-claude}`.
+    manifest = cfg.marketplace / ".claude-plugin/marketplace.json"
+    plugin_json = cfg.marketplace / PLUGIN_NAME / ".claude-plugin/plugin.json"
+    mcp_json = cfg.marketplace / PLUGIN_NAME / ".mcp.json"
+    ok = all(p.is_file() for p in (manifest, plugin_json, mcp_json))
+    if report.check("marketplace files", ok, f"missing under {cfg.marketplace}: {[str(p) for p in (manifest, plugin_json, mcp_json) if not p.is_file()]}", str(cfg.marketplace)):
+        try:
+            market = json.loads(manifest.read_text(encoding="utf-8"))
+            plugin = json.loads(plugin_json.read_text(encoding="utf-8"))
+            mcp = json.loads(mcp_json.read_text(encoding="utf-8"))
+            names = [p.get("name") for p in market.get("plugins", [])]
+            report.check("marketplace manifest", market.get("name") == MARKETPLACE_NAME and PLUGIN_NAME in names,
+                         f"name {market.get('name')!r}, plugins {names}", f"{MARKETPLACE_NAME} offers {PLUGIN_NAME}")
+            command = mcp.get("mcpServers", {}).get(SERVER_NAME, {}).get("command")
+            report.check(".mcp.json", command is not None and "SILTA_CLAUDE_BIN" in command,
+                         f"server {SERVER_NAME!r} command is {command!r}", f"server {SERVER_NAME} runs {command}")
+            if plugin_version:
+                report.check("plugin.json version", plugin.get("version") == plugin_version,
+                             f"plugin.json says {plugin.get('version')}, the binary {plugin_version}", f"{plugin_version}, as the binary")
+        except (json.JSONDecodeError, OSError) as e:
+            report.fail("marketplace files", f"cannot read: {e}")
+    report.check("hook script", cfg.hook.is_file() and os.access(cfg.hook, os.X_OK), f"{cfg.hook} is not an executable file", str(cfg.hook))
+    # Managed settings: mandatory on the VM, where they are the package's; on a
+    # developer's machine their absence is what most often breaks the channel.
+    if cfg.managed_settings.is_file():
+        try:
+            managed = json.loads(cfg.managed_settings.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            managed = None
+            report.fail("managed settings", f"{cfg.managed_settings}: {e}")
+        if managed is not None:
+            missing = [k for k in MANAGED_KEYS if k not in managed]
+            if cfg.service:
+                report.check("managed settings keys", not missing, f"{cfg.managed_settings} lacks {missing}", f"all of {sorted(MANAGED_KEYS)}")
+            elif missing:
+                report.info("managed settings keys", f"{cfg.managed_settings} lacks {missing} (the package installs them all; fine on a developer's machine)")
+            report.check("channelsEnabled", managed.get("channelsEnabled") is True, f"{cfg.managed_settings}: channelsEnabled is {managed.get('channelsEnabled')!r}: {MANAGED_KEYS['channelsEnabled']}", "true")
+            allowed = managed.get("allowedChannelPlugins") or []
+            listed = any(p.get("marketplace") == MARKETPLACE_NAME and p.get("plugin") == PLUGIN_NAME for p in allowed if isinstance(p, dict))
+            report.check("allowedChannelPlugins", listed, f"{PLUGIN_ID} is not in {allowed}", PLUGIN_ID)
+            hooks = managed.get("hooks", {}).get("PreCompact") or []
+            commands = [h.get("command") for entry in hooks if isinstance(entry, dict) for h in entry.get("hooks", []) if isinstance(h, dict)]
+            matchers = [entry.get("matcher") for entry in hooks if isinstance(entry, dict)]
+            if cfg.service:
+                report.check("managed PreCompact hook", "auto" in matchers and any(c and Path(c).is_file() for c in commands),
+                             f"matchers {matchers}, commands {commands}", f"matcher auto runs {commands}")
+                servers = managed.get("allowedMcpServers") or []
+                allowed_bins = [s.get("serverCommand") for s in servers if isinstance(s, dict)]
+                report.check("allowedMcpServers", any(str(cfg.plugin_bin) in (cmd or []) for cmd in allowed_bins),
+                             f"{cfg.plugin_bin} is not among {allowed_bins}", str(cfg.plugin_bin))
+            report.info("managed hook", f"PreCompact matchers {matchers}: the hook run relies on the managed hook" if "auto" in matchers else "no managed PreCompact hook: the hook run passes the script's own through --settings")
+    elif cfg.service:
+        report.fail("managed settings", f"{cfg.managed_settings} is missing; the package installs it")
+    else:
+        report.warn("managed settings", f"no {cfg.managed_settings}: an organisation account then receives no channel messages, and the channel checks below will fail; the hook run passes the hook through --settings")
+    return version
+
+
+# --------------------------------------------------------------------------------------
+# The plugin's installation, the way `silta-session-add` does it for a mind.
+
+
+class PluginInstall:
+    def __init__(self, cfg: Config, report: Report):
+        self.cfg = cfg
+        self.report = report
+        self.env = base_env(cfg)
+        self.workspace = cfg.state / "workspace"
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self.added_marketplace = False
+        self.installed = False
+
+    def _claude(self, *args: str, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
+        return subprocess.run([str(self.cfg.claude), *args], env=self.env, cwd=str(cwd or self.workspace), capture_output=True, text=True, timeout=300)
+
+    def known_marketplace_path(self) -> Optional[str]:
+        path = self.cfg.home / ".claude/plugins/known_marketplaces.json"
+        if not path.is_file():
+            return None
+        try:
+            known = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        entry = known.get(MARKETPLACE_NAME)
+        if not isinstance(entry, dict):
+            return None
+        return entry.get("source", {}).get("path") or entry.get("installLocation")
+
+    def install(self) -> bool:
+        """`claude plugin marketplace add <dir>` once, then `plugin install <plugin>@<marketplace>
+        --scope project` in the workspace: project scope, because a user-scope install would
+        start the plugin in every session of this user."""
+        known = self.known_marketplace_path()
+        if known and Path(known).resolve() != self.cfg.marketplace.resolve():
+            self.report.fail("marketplace add", f"{MARKETPLACE_NAME} is already registered for {known}; remove it or pass --marketplace {known}")
+            return False
+        if known:
+            self.report.info("marketplace add", f"{MARKETPLACE_NAME} was registered already for {known}; left as is")
+        else:
+            out = self._claude("plugin", "marketplace", "add", str(self.cfg.marketplace))
+            if not self.report.check("marketplace add", out.returncode == 0, f"exit {out.returncode}: {shorten(out.stderr or out.stdout, 400)}", f"{MARKETPLACE_NAME} from {self.cfg.marketplace}"):
+                return False
+            self.added_marketplace = True
+        self._claude("plugin", "uninstall", PLUGIN_ID, "--scope", "project")
+        out = self._claude("plugin", "install", PLUGIN_ID, "--scope", "project")
+        if not self.report.check("plugin install", out.returncode == 0, f"exit {out.returncode}: {shorten(out.stderr or out.stdout, 400)}", f"{PLUGIN_ID} at project scope in {self.workspace}"):
+            return False
+        self.installed = True
+        settings = self.workspace / ".claude/settings.json"
+        enabled = {}
+        try:
+            enabled = json.loads(settings.read_text(encoding="utf-8")).get("enabledPlugins", {})
+        except (OSError, json.JSONDecodeError):
+            pass
+        self.report.check("plugin enabled", enabled.get(PLUGIN_ID) is True, f"{settings} does not enable {PLUGIN_ID}: {enabled}", f"{settings} enables {PLUGIN_ID}")
+        return True
+
+    def cleanup(self) -> None:
+        """A developer's machine is left as it was found; the service's state directory
+        keeps its install (the next run reinstalls anyway, as `silta-session-add` does)."""
+        if self.cfg.service:
+            return
+        if self.installed:
+            self._claude("plugin", "uninstall", PLUGIN_ID, "--scope", "project")
+        if self.added_marketplace:
+            self._claude("plugin", "marketplace", "remove", MARKETPLACE_NAME)
+            cache = self.cfg.home / ".claude/plugins/cache" / MARKETPLACE_NAME
+            if cache.is_dir():
+                shutil.rmtree(cache, ignore_errors=True)
+
+
+def cleanup_traces(cfg: Config, session_ids: list[str]) -> None:
+    """On a developer's machine, Claude Code kept the runs' transcripts under
+    ~/.claude/projects/<workspace slug>/ and the plugin's logs under
+    ~/.cache/claude-cli-nodejs/<workspace slug>/; both go, so nothing of the check lingers
+    in the developer's own state."""
+    if cfg.service:
+        return
+    projects = cfg.home / ".claude/projects"
+    slug_dirs = set()
+    if projects.is_dir():
+        for d in projects.iterdir():
+            if any((d / f"{sid}.jsonl").is_file() for sid in session_ids):
+                slug_dirs.add(d.name)
+                shutil.rmtree(d, ignore_errors=True)
+    cache = cfg.home / ".cache/claude-cli-nodejs"
+    if cache.is_dir():
+        for d in cache.iterdir():
+            if d.name in slug_dirs:
+                shutil.rmtree(d, ignore_errors=True)
+
+
+def record_mcp_logs(trace: Trace, home: Path, transcript: Optional[Path]) -> None:
+    """Where Claude Code keeps the plugin's stderr: `<HOME>/.cache/claude-cli-nodejs/<slug>/
+    mcp-logs-plugin-<plugin>-<server>/`, one file per start (the plugin README; the
+    supervisor prunes the directory, state.rs `prune_cache`)."""
+    if transcript is None:
+        return
+    directory = home / ".cache/claude-cli-nodejs" / transcript.parent.name / f"mcp-logs-plugin-{PLUGIN_NAME}-{SERVER_NAME}"
+    entry: dict[str, Any] = {"type": "_file", "name": "mcp-logs", "path": str(directory), "exists": directory.is_dir()}
+    if directory.is_dir():
+        files = sorted(f for f in directory.iterdir() if f.is_file())
+        entry["files"] = [f.name for f in files]
+        entry["content"] = "".join(f.read_text(encoding="utf-8", errors="replace") for f in files)[:20000]
+    trace.add(entry)
+
+
+def find_transcript(home: Path, session_id: str) -> Optional[Path]:
+    """Where the supervisor looks for a session's transcript (state.rs `Paths::transcript`):
+    `<HOME>/.claude/projects/<any project>/<id>.jsonl`."""
+    projects = home / ".claude/projects"
+    if not projects.is_dir():
+        return None
+    for d in projects.iterdir():
+        p = d / f"{session_id}.jsonl"
+        if p.is_file():
+            return p
+    return None
+
+
+# --------------------------------------------------------------------------------------
+# The main run: a fresh session with the channel, driven the way the supervisor drives it.
+
+
+def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
+    """Runs the session and returns what the assertions need to know."""
+    meta: dict[str, Any] = {"run": "main", "session_id": session_id, "window": cfg.window, "model": cfg.model,
+                            "intro": INTRO, "fallback": cfg.fallback_model, "home": str(cfg.home)}
+    trace.add({"type": "_meta", **meta})
+    daemon = FakeDaemon(cfg.state / "siltad.sock", "contract-check", trace)
+    run = ClaudeRun(cfg, trace, "main", model=cfg.model, session_id=session_id)
+    try:
+        # The window check before any turn (lib.rs `run_once`): the host line waits for it.
+        run.control(WINDOW_REQUEST, {"subtype": "get_context_usage", "detail": "summary"})
+        answer = trace.wait(lambda l: l.get("type") == "control_response" and l.get("response", {}).get("request_id") == WINDOW_REQUEST, 60)
+        if answer is None:
+            trace.add({"type": "_note", "text": "no control_response within 60 s; sending the host line anyway"})
+        run.send_user(INTRO)
+        # The first answer of a model opens the channel (lib.rs `open_channel`).
+        first = trace.wait(lambda l: l.get("type") == "assistant" and is_main(l) and l.get("message", {}).get("model") != "<synthetic>", cfg.turn_timeout)
+        if first is not None:
+            run.touch_ready()
+        if run.wait_result(0) is None:
+            trace.add({"type": "_note", "text": "the first turn did not end; stopping"})
+            return meta
+        # The plugin connects once the ready file exists and Claude Code has initialised
+        # it; then a message from Alice, whose turn should call the reply tool.
+        if daemon.connected.wait(30):
+            n = len(trace)
+            daemon.event("$alice-1", "This is a test of the channel. Call the reply tool once with the single word ok as the text, more set to false, and then end your turn.")
+            trace.wait(lambda l: l.get("type") == "result" and channel_origin(l), cfg.turn_timeout, n)
+            trace.wait_quiet(3, 30)
+        else:
+            trace.add({"type": "_note", "text": "the plugin did not connect to the daemon within 30 s of the ready file"})
+        # A background task, for the level signal the rotation waits on.
+        n = len(trace)
+        run.send_user("Use the Bash tool exactly once to run the command `sleep 4` with run_in_background set to true, then reply with the single word ok and end your turn without waiting for the command.")
+        run.wait_result(n)
+        trace.wait(lambda l: l.get("type") == "system" and l.get("subtype") == "background_tasks_changed" and not [t for t in l.get("tasks", []) if not t.get("ambient")], 60, n)
+        trace.wait_quiet(4, 60)
+        # The compaction in place (lib.rs `compact`), with short instructions.
+        n = len(trace)
+        run.send_user("/compact These instructions come from the host: write a summary of two sentences.")
+        trace.wait(lambda l: l.get("type") == "system" and l.get("subtype") == "compact_boundary", cfg.turn_timeout, n)
+        trace.wait(lambda l: l.get("type") == "result", cfg.turn_timeout, n)
+        trace.wait_quiet(3, 30)
+        # The graceful stop, then the files the supervisor relies on.
+        run.close_stdin()
+        code = run.wait_exit(cfg.stop_grace)
+        if code is not None:
+            daemon.closed.wait(10)
+        transcript = find_transcript(cfg.home, session_id)
+        trace.add({"type": "_file", "name": "transcript", "path": str(transcript) if transcript else None, "exists": transcript is not None})
+        record_mcp_logs(trace, cfg.home, transcript)
+        record_file(trace, "marker", run.marker)
+        return meta
+    finally:
+        run.kill()
+        daemon.close()
+        trace.close()
+
+
+def check_main(report: Report, trace: Trace, meta: dict) -> Optional[str]:
+    """The assertions over the main run's trace; returns the Claude Code version seen."""
+    lines = stdout_lines(trace)
+    sid = meta["session_id"]
+    pre = "main: "
+    # system init (stream.rs `system_event`, `Event::Init`).
+    inits = of_type(lines, "system", "init")
+    if not report.check(pre + "system init", bool(inits), "no system init line; the supervisor never learns the session id or the version"):
+        return None
+    init = inits[0]
+    version = init.get("claude_code_version")
+    report.check(pre + "init claude_code_version", isinstance(version, str) and bool(version), f"claude_code_version is {version!r}", str(version))
+    report.check(pre + "init session_id", init.get("session_id") == sid, f"--session-id {sid} came back as {init.get('session_id')!r}", "the --session-id given")
+    report.check(pre + "init permissionMode", init.get("permissionMode") == "auto", f"permissionMode is {init.get('permissionMode')!r}", "auto")
+    tools = init.get("tools") or []
+    servers = {s.get("name"): s.get("status") for s in init.get("mcp_servers", []) if isinstance(s, dict)}
+    report.check(pre + "init reply tool", REPLY_TOOL in tools, f"{REPLY_TOOL} is not among the session's tools (MCP servers: {servers}); a mind could not answer", f"{REPLY_TOOL} among {len(tools)} tools")
+    plugin_tools = sorted(t[len(TOOL_PREFIX):] for t in tools if t.startswith(TOOL_PREFIX))
+    report.info(pre + "init plugin tools", ", ".join(plugin_tools) or "none")
+    server_status = [s for name, s in servers.items() if PLUGIN_NAME in str(name) or name == SERVER_NAME]
+    report.check(pre + "init mcp server", "connected" in server_status, f"the plugin's server is not connected: {servers}", f"{servers}")
+    plugins = init.get("plugins")
+    if isinstance(plugins, list):
+        names = [p.get("name") if isinstance(p, dict) else p for p in plugins]
+        report.check(pre + "init plugins", any(PLUGIN_NAME in str(n) for n in names), f"{PLUGIN_NAME} is not among the plugins: {names}", f"{names}")
+    # The memory directory, where the rotation looks for the handoff note (state.rs
+    # `memory_dirs`): `<HOME>/.claude/projects/<slug>/memory`, which 2.1.283's init names.
+    memory_paths = init.get("memory_paths")
+    if memory_paths is None:
+        report.info(pre + "init memory_paths", "absent from the init line")
+    else:
+        def strings(o: Any) -> list[str]:
+            if isinstance(o, str):
+                return [o]
+            if isinstance(o, dict):
+                return [x for v in o.values() for x in strings(v)]
+            if isinstance(o, list):
+                return [x for v in o for x in strings(v)]
+            return []
+        projects = str(Path(meta.get("home", "")) / ".claude/projects") + "/"
+        hits = [x for x in strings(memory_paths) if x.startswith(projects) and x.rstrip("/").endswith("/memory")]
+        report.check(pre + "init memory_paths", bool(hits), f"memory_paths {shorten(memory_paths, 300)} names no {projects}<slug>/memory: the handoff note would never be found", hits[0] if hits else "")
+    report.info(pre + "init fields", ", ".join(sorted(k for k in init.keys() if not k.startswith("_"))))
+    # 2.1.283 writes an init line at the start of every turn, not only at the start of
+    # the session; the supervisor reads each as `Event::Init`.
+    report.info(pre + "init lines", f"{len(inits)} for {len(of_type(lines, 'result'))} turns")
+    # The window check's answer (stream.rs `control_response`, lib.rs `Run::window`).
+    answers = [l for l in of_type(lines, "control_response") if l.get("response", {}).get("request_id") == WINDOW_REQUEST]
+    if report.check(pre + "control_response", bool(answers), "no control_response to get_context_usage; the supervisor ends every start after 60 s"):
+        response = answers[0]["response"]
+        max_tokens = response.get("response", {}).get("maxTokens") if isinstance(response.get("response"), dict) else None
+        if report.check(pre + "get_context_usage", response.get("subtype") == "success" and isinstance(max_tokens, int),
+                        f"answered {response.get('subtype')!r} without an integer response.maxTokens: {shorten(response.get('error') or response)}; every start would end with exit 79", f"maxTokens {max_tokens}"):
+            report.check(pre + "window", max_tokens >= meta["window"], f"maxTokens {max_tokens} is below CLAUDE_CODE_AUTO_COMPACT_WINDOW={meta['window']}: this Claude Code does not know {meta['model']}'s window, and every start would end with exit 79", f"{max_tokens} >= {meta['window']}")
+    # The replayed host line (stream.rs `Event::User`; the idle gap rests on it).
+    users = of_type(lines, "user")
+    replayed = [l for l in users if content_text(l) == meta["intro"]]
+    report.check(pre + "replayed user line", bool(replayed), "the host line did not come back as a user line with --replay-user-messages; a channel delivery would not be seen either")
+    # Every main-line assistant line carries the usage the context size is read from
+    # (stream.rs `context_of`; contract.rs warns when it is missing).
+    assistants = [l for l in of_type(lines, "assistant") if is_main(l) and l.get("message", {}).get("model") != "<synthetic>"]
+    if report.check(pre + "assistant lines", bool(assistants), "no main-line assistant line (type assistant with parent_tool_use_id null)"):
+        missing = []
+        for l in assistants:
+            usage = l.get("message", {}).get("usage")
+            keys = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+            if not isinstance(usage, dict) or not all(isinstance(usage.get(k), int) for k in keys):
+                missing.append(shorten(usage, 100))
+        report.check(pre + "assistant usage", not missing, f"{len(missing)} of {len(assistants)} main-line assistant lines lack integer usage counts: {missing[:2]}; the threshold rotation would be blind", f"{len(assistants)} lines, each with the three prompt counts")
+        report.info(pre + "models", ", ".join(sorted({str(l.get('message', {}).get('model')) for l in assistants})))
+    # Results (stream.rs `Event::Result`).
+    results = of_type(lines, "result")
+    if report.check(pre + "result lines", bool(results), "no result line; the supervisor never sees a turn end"):
+        bad = [l for l in results if not isinstance(l.get("is_error"), bool)]
+        report.check(pre + "result is_error", not bad, f"{len(bad)} result lines without a boolean is_error", f"{len(results)} results")
+        first = results[0]
+        report.check(pre + "first result", first.get("is_error") is False and not channel_origin(first), f"the first turn ended with is_error {first.get('is_error')!r}, origin {first.get('origin')!r}: {shorten(first.get('result'))}", "no error, no channel origin")
+    # No fallback in the main run: the model must serve as configured.
+    fallbacks = of_type(lines, "system", "model_fallback")
+    report.check(pre + "no model_fallback", not fallbacks, f"{[f.get('trigger') for f in fallbacks]}: the configured model cannot serve; the supervisor would end the session", "the configured model served every turn")
+    # The channel: the plugin's connection, the delivered message, the turn it started.
+    daemon_events = [l for l in trace.lines if l["type"] == "_daemon"]
+    ready_at = next((i for i, l in enumerate(trace.lines) if l["type"] == "_ready"), None)
+    connected_at = next((i for i, l in enumerate(trace.lines) if l["type"] == "_daemon" and l.get("event") == "connected"), None)
+    if daemon_events:
+        report.check(pre + "plugin connects after the ready file", connected_at is not None and ready_at is not None and connected_at > ready_at,
+                     f"connected at trace index {connected_at}, ready file at {ready_at}: the plugin must wait for the ready file (SILTA_READY_FILE), else a session whose model cannot serve takes messages", "SILTA_READY_FILE honoured")
+        hello = next((l["line"]["hello"] for l in daemon_events if l.get("event") == "line" and "hello" in l["line"]), None)
+        if report.check(pre + "plugin hello", hello is not None, "the plugin never sent hello to the daemon"):
+            report.check(pre + "plugin protocol", hello.get("protocol") == DAEMON_PROTOCOL and hello.get("session") == "contract-check", f"hello {hello}", f"protocol {DAEMON_PROTOCOL}, session contract-check, client {hello.get('client')}")
+        acks = [l["line"]["ack"] for l in daemon_events if l.get("event") == "line" and "ack" in l["line"]]
+        report.check(pre + "plugin ack", any(a.get("event_id") == "$alice-1" for a in acks), f"the plugin did not acknowledge $alice-1 after handing it to Claude Code (acks: {acks})", "acknowledged after the notification")
+        cmds = [l["line"]["cmd"] for l in daemon_events if l.get("event") == "line" and "cmd" in l["line"]]
+        replies = [c["reply"] for c in cmds if "reply" in c]
+        if report.check(pre + "reply reaches the daemon", bool(replies), f"no reply command reached the daemon (commands: {[list(k for k in c if k != 'id') for c in cmds]}); the model's answer never left the session"):
+            r = replies[0]
+            # `more` is left out on the wire when false (protocol.rs `Reply`).
+            report.check(pre + "reply fields", r.get("room_id") == "!room:contract.check" and isinstance(r.get("text"), str) and isinstance(r.get("more", False), bool),
+                         f"reply {shorten(r)}", f"room_id from the tag, text {shorten(r.get('text'), 40)!r}, more {r.get('more', False)}")
+        disconnected = [l for l in daemon_events if l.get("event") == "disconnected"]
+        report.check(pre + "plugin exits with the session", bool(disconnected),"the plugin's connection to the daemon stayed open after Claude Code exited", "the connection closed")
+    else:
+        report.skip(pre + "channel", "no daemon events in the trace")
+    channel_users = [l for l in users if channel_origin(l) or (content_text(l) or "").lstrip().startswith("<channel")]
+    if report.check(pre + "channel user line", bool(channel_users), "the delivered message never appeared as a user line: Claude Code did not register the channel (managed settings? plugin allowlist?) or dropped the notification"):
+        u = channel_users[0]
+        text = (content_text(u) or "").lstrip()
+        report.check(pre + "channel origin", channel_origin(u), f"the user line has no origin.kind == channel: {shorten(u.get('origin'))}; the supervisor then relies on the <channel text alone", f"origin {u.get('origin')}")
+        report.check(pre + "channel tag", text.startswith("<channel") and f'source="{CHANNEL_SOURCE}"' in text and 'person="Alice"' in text and "room_id=" in text and "event_id=" in text and "ts=" in text,
+                     f"the user text is {shorten(text, 300)!r}; expected a <channel source=\"{CHANNEL_SOURCE}\" person=\"Alice\" ... room_id event_id ts> tag", f"<channel source=\"{CHANNEL_SOURCE}\" person=\"Alice\" ...>")
+        report.check(pre + "channel result", any(channel_origin(r) for r in results), "no result line with origin.kind == channel: the turn a delivery starts is not marked as a person's", "the delivery's turn is marked")
+        used = [t.get("name") for l in of_type(lines, "assistant") for t in tool_uses(l)]
+        report.check(pre + "reply tool call", REPLY_TOOL in used, f"the model called {sorted(set(used))} but not {REPLY_TOOL} (model-dependent; check the trace)", REPLY_TOOL)
+        errors = [b for l in users for b in tool_results(l) if b.get("is_error") is True]
+        report.check(pre + "tool results", not errors, f"{len(errors)} tool results are errors: {[shorten(b.get('content'), 150) for b in errors[:2]]}", "none failed")
+    # The level signal of background tasks (stream.rs `Event::BackgroundTasks`).
+    changed = of_type(lines, "system", "background_tasks_changed")
+    busy = [l for l in changed if [t for t in l.get("tasks", []) if not t.get("ambient")]]
+    idle_after = any(not [t for t in l.get("tasks", []) if not t.get("ambient")] for l in changed[changed.index(busy[0]) + 1:]) if busy else False
+    if report.check(pre + "background_tasks_changed", bool(busy), "no background_tasks_changed line with a task: the rotation could not wait for agents (model-dependent: did the Bash tool run in the background?)"):
+        ids = [t.get("task_id") for t in busy[0].get("tasks", [])]
+        report.check(pre + "background task ids", all(isinstance(i, str) and i for i in ids), f"tasks without a string task_id: {busy[0].get('tasks')}", f"tasks {ids}, types {[t.get('task_type') for t in busy[0].get('tasks', [])]}")
+        report.check(pre + "background tasks end", idle_after, "no later background_tasks_changed with the task gone: the rotation would wait for its quiet moment until the cap", "a later line with no task")
+    # The compaction exchange (stream.rs `system_event`, rotation.rs `Phase::Compacting`):
+    # the `/compact` line itself is not replayed, so it is found among what was written.
+    compact_at = next((i for i, l in enumerate(trace.lines) if l["type"] == "_stdin" and str(l.get("line", {}).get("message", {}).get("content", "")).startswith("/compact")), None)
+    after = [l for l in trace.lines[compact_at:] if not l["type"].startswith("_")] if compact_at is not None else []
+    statuses = of_type(after, "system", "status")
+    boundaries = of_type(after, "system", "compact_boundary")
+    if report.check(pre + "compact_boundary", bool(boundaries), "no compact_boundary after /compact: the rotation would take the compaction as failed"):
+        b = boundaries[0]
+        md = b.get("compact_metadata") or {}
+        report.check(pre + "compact trigger", md.get("trigger") == "manual", f"compact_metadata.trigger is {md.get('trigger')!r}: an automatic trigger would be read as Claude Code compacting on its own", f"manual, pre_tokens {md.get('pre_tokens')}, post_tokens {md.get('post_tokens')}")
+        report.check(pre + "compact status", any(s.get("compact_result") == "success" for s in statuses), f"no status line with compact_result success: {[(s.get('status'), s.get('compact_result')) for s in statuses]}", f"{[(s.get('status'), s.get('compact_result')) for s in statuses]}")
+        report.check(pre + "compact result", any(l.get("type") == "result" for l in after[after.index(b):]), "no result line after the compaction boundary: the rotation waits for it", "a result follows the boundary")
+        report.info(pre + "compact lines", ", ".join(f"{l.get('type')}{'/' + str(l.get('subtype')) if l.get('subtype') else ''}" for l in after if l.get("type") not in ("stream_event", "rate_limit_event")))
+    # The graceful stop and the files.
+    exits = [l for l in trace.lines if l["type"] == "_exit"]
+    if exits:
+        e = exits[-1]
+        report.check(pre + "exit on stdin EOF", e.get("code") == 0, f"claude exited with {e.get('code')} {e.get('seconds')} s after the start" + (" (killed after the grace)" if e.get("killed") else ""), f"exit 0, {e.get('seconds')} s after the start")
+    transcript = next((l for l in trace.lines if l["type"] == "_file" and l.get("name") == "transcript"), None)
+    if transcript:
+        report.check(pre + "transcript path", transcript.get("exists") is True, f"no {sid}.jsonl under {meta.get('home', 'HOME')}/.claude/projects/*/: the supervisor could never resume", str(transcript.get("path")))
+    logs = next((l for l in trace.lines if l["type"] == "_file" and l.get("name") == "mcp-logs"), None)
+    if logs:
+        if logs.get("exists"):
+            report.ok(pre + "mcp log path", f"{logs.get('path')}: {len(logs.get('files', []))} files")
+            content = logs.get("content", "")
+            # The log quotes JSON inside JSON, hence the optional escapes.
+            era = re.search(r'protocolEra\\?":\s*\\?"(\w+)', content)
+            report.info(pre + "mcp log", f"protocolEra {era.group(1) if era else '?'}; " + ("channel notifications registered" if "Channel notifications" in content else "no 'Channel notifications' line"))
+        else:
+            report.warn(pre + "mcp log path", f"no {logs.get('path')}: the plugin's log is elsewhere or not written (nothing breaks; the README and the cache pruning point there)")
+    marker = next((l for l in trace.lines if l["type"] == "_file" and l.get("name") == "marker"), None)
+    if marker:
+        report.check(pre + "no marker", marker.get("exists") is False, f"the PreCompact hook wrote {marker.get('path')} during the main run: an automatic compaction fired at a context this small?", "no automatic compaction in the main run")
+    stderr = [l["text"] for l in trace.lines if l["type"] == "_stderr" and l["text"].strip()]
+    if stderr:
+        report.info(pre + "stderr", " | ".join(shorten(s, 160) for s in stderr[:5]) + (f" (+{len(stderr) - 5})" if len(stderr) > 5 else ""))
+    kinds = sorted({f"{l.get('type')}{'/' + str(l.get('subtype')) if l.get('subtype') else ''}" for l in lines if l.get("type") != "stream_event"})
+    report.info(pre + "line kinds", ", ".join(kinds))
+    return version if isinstance(version, str) else None
+
+
+# --------------------------------------------------------------------------------------
+# The resume run: the saved id comes back, and a bogus one fails the way the supervisor
+# expects.
+
+
+def drive_resume(cfg: Config, trace: Trace, session_id: str) -> dict:
+    meta = {"run": "resume", "session_id": session_id, "bogus": str(uuid.uuid4())}
+    trace.add({"type": "_meta", **meta})
+    daemon = FakeDaemon(cfg.state / "siltad.sock", "contract-check", trace)
+    run = ClaudeRun(cfg, trace, "resume", model=cfg.model, session_id=None, resume=session_id)
+    try:
+        run.send_user("Session resumed by the host for a test. Reply with the single word ok.")
+        run.wait_result(0)
+        run.close_stdin()
+        run.wait_exit(cfg.stop_grace)
+    finally:
+        run.kill()
+        daemon.close()
+    trace.add({"type": "_start", "run": "resume-bogus"})
+    bogus = ClaudeRun(cfg, trace, "resume-bogus", model=cfg.model, session_id=None, resume=meta["bogus"])
+    try:
+        bogus.send_user("Reply with the single word ok.")
+        bogus.wait_exit(60)
+    finally:
+        bogus.kill()
+        trace.close()
+    return meta
+
+
+def check_resume(report: Report, trace: Trace, meta: dict) -> None:
+    pre = "resume: "
+    starts = [i for i, l in enumerate(trace.lines) if l["type"] == "_start"]
+    first = trace.lines[starts[0]:starts[1]] if len(starts) > 1 else trace.lines
+    second = trace.lines[starts[1]:] if len(starts) > 1 else []
+    lines = [l for l in first if not l["type"].startswith("_")]
+    inits = of_type(lines, "system", "init")
+    if report.check(pre + "system init", bool(inits), "no init line on --resume"):
+        report.check(pre + "same session_id", inits[0].get("session_id") == meta["session_id"], f"--resume {meta['session_id']} started session {inits[0].get('session_id')!r}", "the resumed id")
+    results = of_type(lines, "result")
+    report.check(pre + "result", bool(results) and results[-1].get("is_error") is False, f"the resumed turn ended with {results[-1].get('is_error') if results else 'no result'}: {shorten(results[-1].get('result')) if results else ''}", "the resumed turn answered")
+    exits = [l for l in first if l["type"] == "_exit"]
+    if exits:
+        report.check(pre + "exit on stdin EOF", exits[-1].get("code") == 0, f"exit {exits[-1].get('code')}", f"exit 0 after {exits[-1].get('seconds')} s")
+    if second:
+        stderr = " ".join(l["text"] for l in second if l["type"] == "_stderr")
+        exits = [l for l in second if l["type"] == "_exit"]
+        code = exits[-1].get("code") if exits else None
+        report.check(pre + "bogus id refused", code not in (None, 0), f"--resume of an unknown id exited with {code}", f"exit {code}")
+        report.check(pre + "bogus id stderr", NO_CONVERSATION in stderr, f"stderr lacks {NO_CONVERSATION!r}: {shorten(stderr, 300)!r}; the supervisor would keep an id that cannot be resumed", f"{NO_CONVERSATION!r} on stderr")
+
+
+# --------------------------------------------------------------------------------------
+# The hook run: an automatic compaction, blocked by the PreCompact hook.
+
+
+def filler(words: int) -> str:
+    """Deterministic prose of about `words` words, roughly 1.3 tokens each."""
+    vocabulary = ("the family assistant keeps notes about plans meals weather travel and school while it waits for "
+                  "messages in quiet rooms during long evenings and early mornings across seasons of ordinary days").split()
+    out = []
+    n = 0
+    seed = 17
+    while n < words:
+        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+        length = 8 + seed % 9
+        sentence = []
+        for i in range(length):
+            seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+            sentence.append(vocabulary[seed % len(vocabulary)])
+        sentence[0] = sentence[0].capitalize()
+        out.append(" ".join(sentence) + ".")
+        n += length
+    return " ".join(out)
+
+
+def drive_hook(cfg: Config, trace: Trace, session_id: str, managed_hook: bool) -> dict:
+    meta = {"run": "hook", "session_id": session_id, "window": HOOK_WINDOW, "model": cfg.hook_model, "managed_hook": managed_hook}
+    trace.add({"type": "_meta", **meta})
+    extra = []
+    if not managed_hook:
+        # On a developer's machine the hook is not in the managed settings: it is passed
+        # as a settings overlay, with the matcher the deployment uses.
+        settings = {"hooks": {"PreCompact": [{"matcher": "auto", "hooks": [{"type": "command", "command": str(cfg.hook), "timeout": 30}]}]}}
+        extra = ["--settings", json.dumps(settings)]
+    daemon = FakeDaemon(cfg.state / "siltad.sock", "contract-check", trace)
+    run = ClaudeRun(cfg, trace, "hook", model=cfg.hook_model, session_id=session_id, window=HOOK_WINDOW, extra_args=extra, fallback="")
+    try:
+        text = filler(FILLER_WORDS)
+        trace.add({"type": "_note", "text": f"filler of {len(text.split())} words, {len(text)} bytes"})
+        run.send_user("The text below is filler for a test of the harness; do not summarise it. Reply with the single word ok.\n\n" + text)
+        first = run.wait_result(0, timeout=cfg.turn_timeout * 2)
+        if first is not None:
+            n = len(trace)
+            run.send_user("Reply with the single word ok again.")
+            run.wait_result(n, timeout=cfg.turn_timeout * 2)
+            trace.wait_quiet(3, 30)
+        run.close_stdin()
+        run.wait_exit(cfg.stop_grace)
+        record_file(trace, "marker", run.marker)
+        return meta
+    finally:
+        run.kill()
+        daemon.close()
+        trace.close()
+
+
+def check_hook(report: Report, trace: Trace, meta: dict) -> None:
+    pre = "hook: "
+    lines = stdout_lines(trace)
+    results = of_type(lines, "result")
+    assistants = [l for l in of_type(lines, "assistant") if is_main(l)]
+    if not report.check(pre + "filler turn", bool(results) and results[0].get("is_error") is False, f"the filler turn failed: {shorten(results[0].get('result')) if results else 'no result'}; a message of this size was refused, or the model ({meta['model']}) cannot serve"):
+        return
+    usage = assistants[0].get("message", {}).get("usage", {}) if assistants else {}
+    context = sum(usage.get(k, 0) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+    report.info(pre + "filler context", f"{context} tokens against a window of {meta['window']}")
+    report.check(pre + "second turn", len(results) >= 2, "the second turn never ended: the blocked compaction stalled the session")
+    statuses = of_type(lines, "system", "status")
+    boundaries = of_type(lines, "system", "compact_boundary")
+    auto = [b for b in boundaries if (b.get("compact_metadata") or {}).get("trigger") == "auto"]
+    marker = next((l for l in trace.lines if l["type"] == "_file" and l.get("name") == "marker"), None)
+    fired = marker is not None and marker.get("exists") is True
+    attempted = any(s.get("status") == "compacting" for s in statuses) or bool(boundaries) or fired
+    if not report.check(pre + "automatic compaction attempted", attempted, f"no compaction after a context of {context} tokens with CLAUDE_CODE_AUTO_COMPACT_WINDOW={meta['window']}: the window is not honoured or the threshold moved; the hook was never asked"):
+        return
+    # What the supervisor needs of a blocked compaction is that none happened (a
+    # `compact_boundary` with the trigger `auto` is what it would read as Claude Code
+    # compacting on its own, contract.rs) and that the marker is there. How Claude Code
+    # reports the block varies: 2.1.283 clears the `compacting` status without a
+    # `compact_result`; a blocked `/compact` gets `compact_result: failed` and a
+    # `compact_error` naming the hook (stream.rs `Event::CompactionFailed`).
+    report.check(pre + "no automatic compaction", not auto, f"compact_boundary with trigger auto: {[(b.get('compact_metadata') or {}) for b in auto]}; the hook did not block it, and the supervisor's rotation would be pre-empted", "no compact_boundary with the trigger auto")
+    report.info(pre + "compact statuses", ", ".join(f"status={s.get('status')} compact_result={s.get('compact_result')}" + (f" compact_error={shorten(s.get('compact_error'), 100)!r}" if s.get("compact_error") else "") for s in statuses) or "none")
+    if report.check(pre + "marker written", fired, f"the hook left no {marker.get('path') if marker else 'rotate-requested'}: the hook did not run (matcher auto, SILTA_SESSION, STATE_DIRECTORY?), so the rotation would never be asked for"):
+        try:
+            content = json.loads(marker.get("content", ""))
+        except json.JSONDecodeError:
+            content = None
+        report.check(pre + "marker content", isinstance(content, dict) and content.get("trigger") == "auto" and content.get("session_id") == meta["session_id"] and "transcript_path" in content,
+                     f"the hook's stdin was {shorten(marker.get('content'), 300)!r}; expected JSON with trigger auto, session_id and transcript_path", f"trigger auto, session_id, transcript_path {content.get('transcript_path')}" if isinstance(content, dict) else "")
+    stderr = [l["text"] for l in trace.lines if l["type"] == "_stderr" and l["text"].strip()]
+    if stderr:
+        report.info(pre + "stderr", " | ".join(shorten(s, 160) for s in stderr[:5]))
+
+
+# --------------------------------------------------------------------------------------
+# The fault runs: a model Claude Code does not find, and a credential the API refuses.
+
+
+def drive_fallback(cfg: Config, trace: Trace, session_id: str) -> dict:
+    bogus = "claude-contract-check-nonexistent"
+    meta = {"run": "fallback", "session_id": session_id, "bogus": bogus, "fallback": cfg.fallback_model}
+    trace.add({"type": "_meta", **meta})
+    daemon = FakeDaemon(cfg.state / "siltad.sock", "contract-check", trace)
+    # The window check is skipped: a model Claude Code does not know gets the 200 000
+    # default, which is the very thing the supervisor would refuse.
+    run = ClaudeRun(cfg, trace, "fallback", model=bogus, session_id=session_id, window=200_000)
+    try:
+        run.send_user("Reply with the single word ok.")
+        run.wait_result(0)
+        run.close_stdin()
+        run.wait_exit(60)
+        return meta
+    finally:
+        run.kill()
+        daemon.close()
+        trace.close()
+
+
+def check_fallback(report: Report, trace: Trace, meta: dict) -> None:
+    pre = "fallback: "
+    lines = stdout_lines(trace)
+    fallbacks = of_type(lines, "system", "model_fallback")
+    results = of_type(lines, "result")
+    if not meta.get("fallback"):
+        report.skip(pre + "model_fallback", "no fallback model configured (SILTA_FALLBACK_MODEL)")
+        return
+    if report.check(pre + "model_fallback line", bool(fallbacks), f"no system model_fallback line for the model {meta['bogus']!r}: results {[(r.get('is_error'), shorten(r.get('result'), 120)) for r in results]}; the supervisor would not learn that the primary model cannot serve"):
+        f = fallbacks[0]
+        report.check(pre + "trigger", f.get("trigger") == "model_not_found", f"trigger is {f.get('trigger')!r} (known fatal: {FALLBACK_FATAL}, outage: {FALLBACK_OUTAGE})", "model_not_found")
+        report.check(pre + "models named", f.get("original_model") == meta["bogus"] and f.get("fallback_model") == meta["fallback"], f"original_model {f.get('original_model')!r}, fallback_model {f.get('fallback_model')!r}", f"{f.get('original_model')} -> {f.get('fallback_model')}")
+        report.check(pre + "turn on the fallback", bool(results) and results[-1].get("is_error") is False, f"the turn ended with {results[-1].get('is_error') if results else 'no result'}: {shorten(results[-1].get('result')) if results else ''}", "the fallback model answered")
+
+
+def drive_badkey(cfg: Config, trace: Trace, session_id: str) -> dict:
+    meta = {"run": "badkey", "session_id": session_id}
+    trace.add({"type": "_meta", **meta})
+    daemon = FakeDaemon(cfg.state / "siltad.sock", "contract-check", trace)
+    # An invalid API key takes precedence over any login, and one retry keeps the run
+    # short (Claude Code retries a 401 ten times, about three minutes, by default).
+    env = {"ANTHROPIC_API_KEY": "sk-ant-api03-invalid-contract-check-key", "CLAUDE_CODE_MAX_RETRIES": "1"}
+    run = ClaudeRun(cfg, trace, "badkey", model=cfg.model, session_id=session_id, env=env, drop=AUTH_VARS)
+    try:
+        run.send_user("Reply with the single word ok.")
+        run.wait_result(0, timeout=300)
+        run.close_stdin()
+        run.wait_exit(60)
+        return meta
+    finally:
+        run.kill()
+        daemon.close()
+        trace.close()
+
+
+def check_badkey(report: Report, trace: Trace, meta: dict) -> None:
+    pre = "bad key: "
+    lines = stdout_lines(trace)
+    results = of_type(lines, "result")
+    if not report.check(pre + "result", bool(results), "no result line within the wait: an authentication failure does not end the turn"):
+        return
+    r = results[-1]
+    report.check(pre + "is_error", r.get("is_error") is True, f"the turn with an invalid key ended with is_error {r.get('is_error')!r}: {shorten(r.get('result'))}", f"is_error true: {shorten(r.get('result'), 120)}")
+    synthetic = [l for l in of_type(lines, "assistant") if is_main(l) and l.get("message", {}).get("model") == "<synthetic>"]
+    report.check(pre + "synthetic assistant", bool(synthetic), f"no main-line assistant line with message.model <synthetic> (models seen: {sorted({str(l.get('message', {}).get('model')) for l in of_type(lines, 'assistant')})}); the supervisor would take the API's error text for a model's answer and open the channel", "message.model <synthetic> marks the API's error")
+    retries = of_type(lines, "system", "api_retry")
+    report.info(pre + "api_retry lines", f"{len(retries)}" + (f", first: status {retries[0].get('error_status')} {retries[0].get('error')}" if retries else ""))
+
+
+# --------------------------------------------------------------------------------------
+# Putting it together.
+
+RUNS = {
+    "main": (drive_main, check_main),
+    "resume": (drive_resume, check_resume),
+    "hook": (drive_hook, check_hook),
+    "fallback": (drive_fallback, check_fallback),
+    "badkey": (drive_badkey, check_badkey),
+}
+
+
+def replay(report: Report, directory: Path) -> Optional[str]:
+    version = None
+    found = False
+    for name, (_, check) in RUNS.items():
+        path = directory / f"{name}.jsonl"
+        if not path.is_file():
+            continue
+        found = True
+        trace = Trace.load(path)
+        meta = next((l for l in trace.lines if l["type"] == "_meta"), {})
+        result = check(report, trace, meta)
+        if name == "main":
+            version = result
+    if not found:
+        raise SystemExit(f"no <run>.jsonl traces in {directory} (expected some of {', '.join(RUNS)})")
+    return version
+
+
+def live(report: Report, cfg: Config) -> Optional[str]:
+    version = check_static(report, cfg)
+    if report.failed():
+        report.info("aborting", "the preconditions failed; no run")
+        return version
+    managed_hook = False
+    if cfg.managed_settings.is_file():
+        try:
+            hooks = json.loads(cfg.managed_settings.read_text(encoding="utf-8")).get("hooks", {}).get("PreCompact", [])
+            managed_hook = any(isinstance(h, dict) and h.get("matcher") == "auto" for h in hooks)
+        except (OSError, json.JSONDecodeError):
+            pass
+    install = PluginInstall(cfg, report)
+    session_ids: list[str] = []
+    try:
+        if not install.install():
+            report.info("aborting", "the plugin is not installed; no run")
+            return version
+        main_id = str(uuid.uuid4())
+        session_ids.append(main_id)
+        report.info("logs", str(cfg.logs))
+        trace = Trace(cfg.logs / "main.jsonl")
+        seen = check_main(report, trace, drive_main(cfg, trace, main_id))
+        version = seen or version
+        if "resume" in cfg.skip:
+            report.skip("resume", "--skip")
+        else:
+            trace = Trace(cfg.logs / "resume.jsonl")
+            check_resume(report, trace, drive_resume(cfg, trace, main_id))
+        if "hook" in cfg.skip:
+            report.skip("hook", "--skip")
+        else:
+            sid = str(uuid.uuid4())
+            session_ids.append(sid)
+            trace = Trace(cfg.logs / "hook.jsonl")
+            check_hook(report, trace, drive_hook(cfg, trace, sid, managed_hook))
+        if "fallback" in cfg.skip:
+            report.skip("fallback", "--skip")
+        else:
+            sid = str(uuid.uuid4())
+            session_ids.append(sid)
+            trace = Trace(cfg.logs / "fallback.jsonl")
+            check_fallback(report, trace, drive_fallback(cfg, trace, sid))
+        if "badkey" in cfg.skip:
+            report.skip("bad key", "--skip")
+        else:
+            sid = str(uuid.uuid4())
+            session_ids.append(sid)
+            trace = Trace(cfg.logs / "badkey.jsonl")
+            check_badkey(report, trace, drive_badkey(cfg, trace, sid))
+    finally:
+        install.cleanup()
+        cleanup_traces(cfg, session_ids)
+    return version
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     epilog="The environment of a silta-session unit is honoured: CLAUDE_BIN, SILTA_CLAUDE_BIN, CREDENTIALS_DIRECTORY, STATE_DIRECTORY, HOME.")
+    parser.add_argument("--claude", help="the Claude Code binary (default: $CLAUDE_BIN, claude on PATH, /opt/claude/.local/bin/claude)")
+    parser.add_argument("--plugin-bin", help="the silta-claude binary (default: $SILTA_CLAUDE_BIN, the repository's target/, silta-claude on PATH)")
+    parser.add_argument("--marketplace", help="the marketplace directory (default: the repository's assistant/marketplace, else /usr/share/silta/marketplace)")
+    parser.add_argument("--unit", help="the silta-session@.service to read the model, window and knobs from (default: the repository's deploy/ copy, else the installed unit)")
+    parser.add_argument("--model", help="the main model (default: the unit's SILTA_MODEL)")
+    parser.add_argument("--effort", help="the effort for every run (default: low; the value is not part of the contract, the flag is)")
+    parser.add_argument("--fallback-model", help="the fallback model (default: the unit's SILTA_FALLBACK_MODEL)")
+    parser.add_argument("--window", type=int, help="the window the model must be measured against (default: the unit's CLAUDE_CODE_AUTO_COMPACT_WINDOW)")
+    parser.add_argument("--hook-model", default=DEFAULT_HOOK_MODEL, help=f"the model of the hook run, which reads about 90 000 tokens twice (default: {DEFAULT_HOOK_MODEL})")
+    parser.add_argument("--credentials", help="a directory laid out like the unit's credentials (auth_oauth-token or auth_api-key); default: $CREDENTIALS_DIRECTORY, else the login of the calling user")
+    parser.add_argument("--home", help="with --credentials: the HOME Claude Code runs with (default: $HOME)")
+    parser.add_argument("--logs", help="where the traces go (default: <state>/logs/<time>)")
+    parser.add_argument("--skip", help="runs to skip, comma-separated: resume,hook,fallback,badkey")
+    parser.add_argument("--turn-timeout", type=float, default=240, help="seconds to wait for a turn to end (default: 240)")
+    parser.add_argument("--keep", action="store_true", help="keep the temporary state directory of a developer-machine run")
+    parser.add_argument("--replay", metavar="DIR", help="run the assertions over the traces saved in DIR instead of running Claude Code")
+    args = parser.parse_args()
+    report = Report()
+    if args.replay:
+        version = replay(report, Path(args.replay))
+        report.summary(version)
+        return 1 if report.failed() else 0
+    cfg = configure(args)
+    print(f"contract check of {cfg.claude} with {cfg.plugin_bin}, model {cfg.model}, window {cfg.window}, "
+          f"{'the unit' if cfg.service else 'the developer'}'s login, state {cfg.state}", flush=True)
+    try:
+        version = live(report, cfg)
+    finally:
+        if not cfg.service and not cfg.keep and not report.failed():
+            shutil.rmtree(cfg.state, ignore_errors=True)
+        elif not cfg.service:
+            print(f"state and traces kept in {cfg.state}", flush=True)
+    report.summary(version)
+    return 1 if report.failed() else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

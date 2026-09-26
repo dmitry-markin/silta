@@ -99,6 +99,17 @@ jobs:
 
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  contract-check:
+    name: contract check replay
+    runs-on: ubuntu-latest
+    # The checker itself needs a Claude Code and a login, so CI runs its assertions over a
+    # recorded trace instead: this keeps the script's parsing and checks working, not the
+    # contract, which only a live run on the VM or a developer's machine can check.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - run: deploy/silta-contract-check --replay dev/contract-fixtures/2.1.283
+
   deb:
     name: build-deb.sh (Debian 13)
     runs-on: ubuntu-latest

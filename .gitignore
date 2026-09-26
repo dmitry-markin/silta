@@ -1,6 +1,9 @@
 # Rust
 target/
 
+# Python
+__pycache__/
+
 # Claude Code local state
 **/.claude/settings.local.json
 **/CLAUDE.local.md

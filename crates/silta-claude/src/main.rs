@@ -59,13 +59,14 @@ fn main() -> ExitCode {
 
     let args = match Args::try_parse() {
         Ok(args) => args,
-        Err(err) => {
+        // A missing SILTA_SESSION gets a hint; everything else (an error, `--help`,
+        // `--version`) is clap's to print and exit on, with its own code.
+        Err(err) if err.kind() == clap::error::ErrorKind::MissingRequiredArgument => {
             let _ = err.print();
-            if err.kind() == clap::error::ErrorKind::MissingRequiredArgument {
-                eprintln!("silta-claude: set SILTA_SESSION (and optionally SILTA_SOCKET) in the session's environment");
-            }
+            eprintln!("silta-claude: set SILTA_SESSION (and optionally SILTA_SOCKET) in the session's environment");
             return ExitCode::from(2);
         }
+        Err(err) => err.exit(),
     };
 
     // Die with the parent: SIGTERM when it exits, plus a poll in case the parent was

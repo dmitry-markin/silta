@@ -1,5 +1,7 @@
 # silta: the daemon's user; its group is the socket's group, and silta-session-add puts
 # every mind's user in it. claude: owns the Claude Code install under /opt/claude,
-# which the minds run read-only.
+# which the minds run read-only. silta-check: runs the contract check of Claude Code
+# (silta-contract-check.service) in a home of its own.
 u silta - "silta daemon" /var/lib/siltad /usr/sbin/nologin
 u claude - "Claude Code install" /opt/claude /usr/sbin/nologin
+u silta-check - "Silta contract check" /var/lib/silta/check /usr/sbin/nologin

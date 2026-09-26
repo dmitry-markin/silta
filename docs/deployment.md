@@ -78,6 +78,24 @@
     ```
 15. You can now message the assistant from `@bob:example.org`. It will automatically accept the invitation and answer you.
 
+## Updating Claude Code
+
+Claude Code is installed under the `claude` user and never updates itself (`DISABLE_AUTOUPDATER=1` in the units). To update it:
+
+1. Install the new version as the `claude` user with the same command as in step 9 above.
+2. Check it against the contract the assistant relies on, with real turns in a session of its own that touches no assistant session. The check runs as the `silta-check` user and needs a credential of its own, laid out like a session's, in `/etc/silta/auth/check` (your subscription token from `claude setup-token` as `oauth-token`, or an API key as `api-key`, root-owned, mode 0600). Then:
+   ```bash
+   sudo systemctl start silta-contract-check
+   sudo journalctl -u silta-contract-check -b
+   ```
+   Every check prints one line; the last lines say whether the contract holds and whether the version is one the release was checked against (`TESTED_VERSIONS` in `crates/silta-session/src/contract.rs`). A run takes a few minutes and costs a few short turns on the configured model plus two turns on a cheap model.
+3. Restart the sessions onto the new version at a quiet moment, since a restart rewrites each session's context:
+   ```bash
+   sudo systemctl restart silta-session.target
+   ```
+
+A failed check keeps its traces under `/var/lib/silta/check/logs/`; `/usr/lib/silta/silta-contract-check --replay <dir>` runs the assertions over them again. The same script runs on a developer's machine from the repository (`deploy/silta-contract-check`), with the developer's own `claude` and login.
+
 ## Troubleshooting
 
 Inspect `siltad` & `silta-session` logs for errors with:
