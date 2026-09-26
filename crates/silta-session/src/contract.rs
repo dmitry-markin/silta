@@ -9,7 +9,7 @@ use crate::stream::Event;
 
 /// The Claude Code versions whose output the supervisor was checked against; any other
 /// version gets a line at every start until the list is extended.
-pub const TESTED_VERSIONS: &[&str] = &["2.1.281"];
+pub const TESTED_VERSIONS: &[&str] = &["2.1.281", "2.1.283"];
 
 /// The `model_fallback` triggers of the checked versions that mean the primary cannot
 /// serve this Claude Code at all (a model it does not find, no access, an error no retry
