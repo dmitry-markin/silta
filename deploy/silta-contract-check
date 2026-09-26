@@ -44,8 +44,9 @@ Two ways to run it:
                                 afterwards (unless it was there already), and the run's
                                 transcript and MCP logs are removed at the end.
 
-Every check prints one line, PASS / FAIL / SKIP / WARN / INFO, and the exit code is 0 when
-nothing failed. The whole trace of each run (Claude Code's stdout and stderr, what was
+Every check prints one line, PASS / FAIL / SKIP / WARN / INFO (coloured on a terminal; with
+syslog priority prefixes under systemd, so `journalctl -p warning -u silta-contract-check`
+lists the failures and warnings alone), and the exit code is 0 when nothing failed. The whole trace of each run (Claude Code's stdout and stderr, what was
 written to its stdin, what the fake daemon saw, the files looked at) is saved as one JSON
 line per event under the logs directory; `--replay DIR` runs the same assertions over a
 saved trace, for a failure to be examined offline and for CI to keep the assertions
@@ -53,8 +54,9 @@ themselves working (dev/contract-fixtures).
 
 A full run makes a handful of short turns on the configured model and, for the hook,
 two turns on a cheap model over a context of about 90 000 tokens (`--hook-model`; `--skip hook`
-leaves that run out); it takes a few minutes and costs well under a dollar, which the last
-line of the report states as Claude Code counted it.
+leaves that run out); it takes a few minutes and costs well under a dollar. The report ends
+with the run's cost as Claude Code counted it, at list prices, which is notional on a
+subscription.
 """
 
 from __future__ import annotations
@@ -169,13 +171,40 @@ INTRO = (
 # --------------------------------------------------------------------------------------
 # The report: one line per check, the summary at the end.
 
+# syslog priorities, for the journal.
+ERR, WARNING, NOTICE, INFO = 3, 4, 5, 6
+# The terminal colour of each category of line (ANSI SGR codes: red, yellow, green, cyan).
+COLORS = {"FAIL": "31", "WARN": "33", "PASS": "32", "SKIP": "36"}
+PRIORITIES = {"FAIL": ERR, "WARN": WARNING}
+
+
+def emit(text: str, priority: int = INFO, category: Optional[str] = None, out: Any = None, words: int = 1) -> None:
+    """Prints one or more lines. On a terminal the first `words` words are coloured after
+    the `category` (a key of COLORS) unless NO_COLOR is set; under systemd, where stdout is the journal (JOURNAL_STREAM is set),
+    each line gets the `<priority>` prefix journald reads and strips, so that failures show
+    red in `journalctl` and `-p warning` lists them alone. An escape sequence in the
+    journal would instead hide the whole line as `[blob data]`."""
+    out = out or sys.stdout
+    tty = hasattr(out, "isatty") and out.isatty()
+    journal = not tty and "JOURNAL_STREAM" in os.environ
+    color = COLORS.get(category or "")
+    for line in text.split("\n"):
+        if journal:
+            if not line:
+                continue
+            line = f"<{priority}>{line}"
+        elif tty and color and line and not os.environ.get("NO_COLOR"):
+            head, rest = line.split(" ", words)[:words], line.split(" ", words)[words:]
+            line = f"\033[{color}m{' '.join(head)}\033[0m" + (f" {rest[0]}" if rest else "")
+        print(line, file=out, flush=True)
+
 
 @dataclass
 class Report:
     checks: list[tuple[str, str, str]] = field(default_factory=list)
     # What each run cost, in dollars as Claude Code counts it (list prices; notional on a
-    # subscription).
-    costs: dict[str, float] = field(default_factory=dict)
+    # subscription); None for a run that was skipped.
+    costs: dict[str, Optional[float]] = field(default_factory=dict)
     out: Any = sys.stdout
 
     def _add(self, status: str, name: str, detail: str) -> None:
@@ -183,7 +212,7 @@ class Report:
         line = f"{status:<5} {name}"
         if detail:
             line += f": {detail}"
-        print(line, file=self.out, flush=True)
+        emit(line, PRIORITIES.get(status, INFO), status, self.out)
 
     def ok(self, name: str, detail: str = "") -> None:
         self._add("PASS", name, detail)
@@ -216,30 +245,29 @@ class Report:
         for status, _, _ in self.checks:
             if status in counts:
                 counts[status] += 1
-        print(
+        emit(
             f"\n{counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped, "
             f"{counts['WARN']} warnings",
-            file=self.out,
+            NOTICE, out=self.out,
         )
         if self.costs:
-            parts = ", ".join(f"{run} ${usd:.2f}" for run, usd in self.costs.items())
-            print(f"cost as Claude Code counts it: ${sum(self.costs.values()):.2f} ({parts})", file=self.out)
+            parts = ", ".join(f"{run} {'skipped' if usd is None else f'${usd:.2f}'}" for run, usd in self.costs.items())
+            emit(f"run cost: ${sum(usd or 0.0 for usd in self.costs.values()):.2f} ({parts})", NOTICE, out=self.out)
         if self.failed():
-            print("contract broken:", file=self.out)
+            emit("contract broken:", ERR, "FAIL", self.out, words=2)
             for status, name, detail in self.checks:
                 if status == "FAIL":
-                    print(f"  {name}: {detail}", file=self.out)
+                    emit(f"  {name}: {detail}", ERR, out=self.out)
         elif version:
             if version in TESTED_VERSIONS:
-                print(f"contract holds for Claude Code {version}, which is in TESTED_VERSIONS", file=self.out)
+                emit(f"contract holds for Claude Code {version}, which is in TESTED_VERSIONS", NOTICE, "PASS", self.out, words=2)
             else:
-                print(
+                emit(
                     f"contract holds for Claude Code {version}: add it to TESTED_VERSIONS in "
                     "crates/silta-session/src/contract.rs, to this script and to the README "
                     "(the supervisor prints a contract line at every turn until then)",
-                    file=self.out,
+                    NOTICE, "PASS", self.out, words=2,
                 )
-        self.out.flush()
 
 
 # --------------------------------------------------------------------------------------
@@ -323,7 +351,7 @@ def session_cost(trace: Trace) -> float:
 def note_cost(report: Report, name: str, trace: Trace) -> None:
     cost = session_cost(trace)
     if name == "resume":
-        cost = max(cost - report.costs.get("main", 0.0), 0.0)
+        cost = max(cost - (report.costs.get("main") or 0.0), 0.0)
     report.costs[name] = cost
 
 
@@ -1514,12 +1542,14 @@ def live(report: Report, cfg: Config) -> Optional[str]:
         version = seen or version
         if "resume" in cfg.skip:
             report.skip("resume", "--skip")
+            report.costs["resume"] = None
         else:
             trace = Trace(cfg.logs / "resume.jsonl")
             check_resume(report, trace, drive_resume(cfg, trace, main_id))
             note_cost(report, "resume", trace)
         if "hook" in cfg.skip:
             report.skip("hook", "--skip")
+            report.costs["hook"] = None
         else:
             sid = str(uuid.uuid4())
             session_ids.append(sid)
@@ -1528,6 +1558,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             note_cost(report, "hook", trace)
         if "fallback" in cfg.skip:
             report.skip("fallback", "--skip")
+            report.costs["fallback"] = None
         else:
             sid = str(uuid.uuid4())
             session_ids.append(sid)
@@ -1536,6 +1567,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             note_cost(report, "fallback", trace)
         if "badkey" in cfg.skip:
             report.skip("bad key", "--skip")
+            report.costs["badkey"] = None
         else:
             sid = str(uuid.uuid4())
             session_ids.append(sid)
@@ -1574,15 +1606,15 @@ def main() -> int:
         report.summary(version)
         return 1 if report.failed() else 0
     cfg = configure(args)
-    print(f"contract check of {cfg.claude} with {cfg.plugin_bin}, model {cfg.model}, window {cfg.window}, "
-          f"{'the unit' if cfg.service else 'the developer'}'s login, state {cfg.state}", flush=True)
+    emit(f"contract check of {cfg.claude} with {cfg.plugin_bin}, model {cfg.model}, window {cfg.window}, "
+         f"{'the unit' if cfg.service else 'the developer'}'s login, state {cfg.state}")
     try:
         version = live(report, cfg)
     finally:
         if not cfg.service and not cfg.keep and not report.failed():
             shutil.rmtree(cfg.state, ignore_errors=True)
         elif not cfg.service:
-            print(f"state and traces kept in {cfg.state}", flush=True)
+            emit(f"state and traces kept in {cfg.state}")
     report.summary(version)
     return 1 if report.failed() else 0
 
