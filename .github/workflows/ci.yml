@@ -1,0 +1,117 @@
+# CI: formatting, lints and tests on every push and PR, plus the Debian package build
+# on the same Debian release the deployment guide recommends.
+#
+# `cargo check` is not a separate step: `cargo clippy` runs the same type-check pass and
+# adds the lints on top, so anything `check` would reject, `clippy` rejects first.
+# `--locked` everywhere makes a stale Cargo.lock fail instead of being silently rewritten.
+#
+# Third-party actions are pinned to commit SHAs, since tags can be moved; Dependabot
+# (.github/dependabot.yml) opens PRs to bump the pins.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      # Caches ~/.cargo (registry, git checkouts) and the dependency artifacts in target/
+      # across runs, keyed on Cargo.lock, the toolchain and the job. The workspace crates
+      # themselves are always rebuilt.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - run: cargo test --workspace --locked
+
+  deb:
+    name: build-deb.sh (Debian 13)
+    runs-on: ubuntu-latest
+    container: debian:13
+    steps:
+      # The same packages docs/deployment.md tells the operator to install, plus what the
+      # actions need inside a bare container: git for checkout, curl and CA certificates
+      # for rustup. build-essential brings dpkg-dev, which cargo-deb needs for `$auto`.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # A bare container has no Rust: install it the way docs/deployment.md tells the
+      # operator to, with the official rustup installer.
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.3 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # cache-bin (on by default) also keeps ~/.cargo/bin, so cargo-deb is only compiled
+      # again when the cache key changes.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install cargo-deb
+        run: command -v cargo-deb || cargo install --locked cargo-deb
+
+      - name: Build the package
+        run: ./build-deb.sh
+
+      - name: Inspect the package
+        run: |
+          deb=$(ls target/debian/silta_*_amd64.deb)
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: silta-deb
+          path: target/debian/silta_*_amd64.deb
+          retention-days: 7
+          if-no-files-found: error
