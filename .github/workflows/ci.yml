@@ -1,8 +1,6 @@
 # CI: formatting, lints and tests on every push and PR, plus the Debian package build
 # on the same Debian release the deployment guide recommends.
 #
-# `cargo check` is not a separate step: `cargo clippy` runs the same type-check pass and
-# adds the lints on top, so anything `check` would reject, `clippy` rejects first.
 # `--locked` everywhere makes a stale Cargo.lock fail instead of being silently rewritten.
 #
 # Third-party actions are pinned to commit SHAs, since tags can be moved; Dependabot
@@ -37,6 +35,27 @@ jobs:
 
       - run: cargo fmt --all --check
 
+  check:
+    name: cargo check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # Caches ~/.cargo (registry, git checkouts) and the dependency artifacts in target/
+      # across runs, keyed on Cargo.lock and the toolchain. The workspace crates themselves
+      # are always rebuilt. shared-key replaces the default per-job key so check and clippy
+      # restore and save the same entry.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: check
+
+      - run: cargo check --workspace --all-targets --locked
+
   clippy:
     name: cargo clippy
     runs-on: ubuntu-latest
@@ -48,10 +67,9 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
 
-      # Caches ~/.cargo (registry, git checkouts) and the dependency artifacts in target/
-      # across runs, keyed on Cargo.lock, the toolchain and the job. The workspace crates
-      # themselves are always rebuilt.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: check
 
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
