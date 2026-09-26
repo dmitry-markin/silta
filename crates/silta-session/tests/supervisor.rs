@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use silta_session::{compact, handoff, rotation::Limits, Auth, Config};
+use silta_session::{compact, handoff, rotation::Limits, Auth, Config, EXIT_MODEL};
 use tokio_util::sync::CancellationToken;
 
 struct Fixture {
@@ -36,6 +36,9 @@ impl Fixture {
             model: None,
             effort: None,
             fallback_model: None,
+            // The fake answers the window check with 500 000 unless told otherwise.
+            window: Some(500_000),
+            window_wait: Duration::from_secs(3),
             auth: None,
             stop_grace: Duration::from_secs(2),
             limits: Limits {
@@ -780,6 +783,98 @@ async fn a_unit_stop_during_the_wait_keeps_the_rotation_pending() {
     assert_eq!(fx.id(), first);
     stop.cancel();
     assert_eq!(run.await.unwrap(), 0);
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
+async fn a_window_below_the_configured_one_ends_the_session_before_its_first_turn() {
+    let fx = Fixture::new("window");
+    let cfg = Config {
+        limits: Limits {
+            enabled: false,
+            ..fx.config().limits
+        },
+        ..fx.config()
+    };
+    // Claude Code caps the window of a model it does not know at 200 000 tokens.
+    fx.set("fake-window", "200000");
+    assert_eq!(
+        silta_session::run(&cfg, CancellationToken::new()).await,
+        EXIT_MODEL
+    );
+    let log = fx.log();
+    assert!(log.contains("control silta-window"), "{log}");
+    assert!(!log.contains("\nline "), "no turn before the check: {log}");
+
+    // An unanswered check ends it as well, after the wait.
+    fx.set("fake-window", "500000");
+    fx.set("fake-mode", "nowindow");
+    let started = Instant::now();
+    assert_eq!(
+        silta_session::run(&cfg, CancellationToken::new()).await,
+        EXIT_MODEL
+    );
+    assert!(started.elapsed() >= cfg.window_wait);
+    assert!(!fx.log().contains("\nline "), "{}", fx.log());
+
+    // The configured window starts the turn.
+    fx.set("fake-mode", "ok");
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| l.contains("line Session test restarted"))
+        .await;
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
+async fn a_fallback_runs_through_an_outage_and_ends_the_session_otherwise() {
+    let fx = Fixture::new("fallback");
+    let cfg = Config {
+        fallback_model: Some("fake-fallback".into()),
+        limits: Limits {
+            enabled: false,
+            ..fx.config().limits
+        },
+        ..fx.config()
+    };
+    fx.set("fake-mode", "fallback-overloaded");
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| {
+        l.contains("fallback ") && l.contains("line Session test started")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!run.is_finished(), "an overload keeps the session");
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+
+    // A fallback that is not an outage ends the session, and it is not started again.
+    for trigger in [
+        "last_resort",
+        "model_not_found",
+        "permission_denied",
+        "unheard_of",
+    ] {
+        fx.set("fake-mode", &format!("fallback-{trigger}"));
+        let runs = starts(&fx.log()).len();
+        assert_eq!(
+            silta_session::run(&cfg, CancellationToken::new()).await,
+            EXIT_MODEL,
+            "{trigger}"
+        );
+        assert_eq!(starts(&fx.log()).len(), runs + 1, "{trigger}");
+    }
     fs::remove_dir_all(&fx.home).unwrap();
 }
 

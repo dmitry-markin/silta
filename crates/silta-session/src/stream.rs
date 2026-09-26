@@ -41,6 +41,15 @@ pub enum Event {
     /// Claude Code reported that a compaction did not go through (a `status` line
     /// with a `compact_result` other than `success`, seen when a hook blocks it).
     CompactionFailed,
+    /// The answer to a `get_context_usage` control request: `max_tokens` is the window
+    /// Claude Code measures the context against, `None` when it answered with an error.
+    ContextUsage {
+        request_id: String,
+        max_tokens: Option<u64>,
+    },
+    /// The turn was switched to the `--fallback-model` because the primary failed;
+    /// `trigger` says why (`overloaded`, `last_resort`, …).
+    ModelFallback { trigger: String },
     /// Anything else.
     Other,
 }
@@ -87,6 +96,7 @@ pub fn read(line: &str) -> (String, Event) {
                 .unwrap_or("?");
             (format!("stream_event {event}"), Event::Other)
         }
+        "control_response" if map.contains_key("response") => control_response(&map),
         other => {
             let summary = match map.get("subtype").and_then(Value::as_str) {
                 Some(subtype) => format!("{other} {subtype}"),
@@ -133,8 +143,45 @@ fn system_event(map: &Map<String, Value>) -> Event {
                 })
                 .unwrap_or_default(),
         },
+        Some("model_fallback") => Event::ModelFallback {
+            trigger: str_of(map, "trigger").to_owned(),
+        },
         _ => Event::Other,
     }
+}
+
+/// An answer to a control request the supervisor sent: `response.subtype` is `success`
+/// with the payload under `response.response`, or `error` with the text under
+/// `response.error`. Only the window check's answer is read; its journal line keeps
+/// the window and never the context breakdown.
+fn control_response(map: &Map<String, Value>) -> (String, Event) {
+    let response = map.get("response").and_then(Value::as_object);
+    let field = |key: &str| response.and_then(|r| r.get(key));
+    let subtype = field("subtype").and_then(Value::as_str).unwrap_or("?");
+    let request_id = field("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_owned();
+    let max_tokens = field("response")
+        .and_then(|r| r.get("maxTokens"))
+        .and_then(Value::as_u64)
+        .filter(|_| subtype == "success");
+    let mut line = format!("control_response {subtype}: request_id={request_id}");
+    if let Some(n) = max_tokens {
+        line.push_str(&format!(" maxTokens={n}"));
+    }
+    if let Some(err) = field("error").and_then(Value::as_str) {
+        line.push_str(&format!("; {}", shorten(err, 300)));
+    }
+    let event = if request_id == "?" {
+        Event::Other
+    } else {
+        Event::ContextUsage {
+            request_id,
+            max_tokens,
+        }
+    };
+    (line, event)
 }
 
 /// The line's `origin` names the channel: Claude Code puts it on the replayed `user`
@@ -443,6 +490,45 @@ mod tests {
         );
         let none = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"session_id":"af92"}"#;
         assert_eq!(read(none).1, Event::BackgroundTasks { ids: vec![] });
+        let fallback = r#"{"type":"system","subtype":"model_fallback","trigger":"last_resort","original_model":"claude-opus-5-5","fallback_model":"claude-opus-5","content":"Switched to Opus 5 because Opus 5.5 returned an error","uuid":"f1","session_id":"af92"}"#;
+        assert_eq!(
+            summarize(fallback),
+            "system model_fallback: fallback_model=claude-opus-5 original_model=claude-opus-5-5 trigger=last_resort"
+        );
+        assert_eq!(
+            read(fallback).1,
+            Event::ModelFallback {
+                trigger: "last_resort".into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_window_check_answer_keeps_the_window_only() {
+        let ok = r#"{"type":"control_response","response":{"subtype":"success","request_id":"silta-window","response":{"categories":[{"name":"Messages","tokens":15000,"color":"x"}],"totalTokens":15496,"maxTokens":500000,"rawMaxTokens":500000,"model":"claude-opus-5-5","memoryFiles":[]}}}"#;
+        assert_eq!(
+            summarize(ok),
+            "control_response success: request_id=silta-window maxTokens=500000"
+        );
+        assert_eq!(
+            read(ok).1,
+            Event::ContextUsage {
+                request_id: "silta-window".into(),
+                max_tokens: Some(500_000)
+            }
+        );
+        let err = r#"{"type":"control_response","response":{"subtype":"error","request_id":"silta-window","error":"get_context_usage is not supported in this context"}}"#;
+        assert_eq!(
+            summarize(err),
+            "control_response error: request_id=silta-window; get_context_usage is not supported in this context"
+        );
+        assert_eq!(
+            read(err).1,
+            Event::ContextUsage {
+                request_id: "silta-window".into(),
+                max_tokens: None
+            }
+        );
     }
 
     #[test]

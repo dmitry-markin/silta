@@ -41,6 +41,20 @@ pub const CHANNEL: &str = "plugin:silta-claude@silta-local";
 /// The stderr line of a `--resume` whose transcript Claude Code does not know.
 const NO_CONVERSATION: &str = "No conversation found with session ID";
 
+/// The exit code of a session whose Claude Code cannot run the model as configured: a
+/// window below the configured one, or a fallback that points at the model rather than
+/// at an outage. The unit's `RestartPreventExitStatus` keeps it down until it is fixed.
+pub const EXIT_MODEL: i32 = 79;
+
+/// The `request_id` of the window check, a `get_context_usage` control request.
+const WINDOW_REQUEST: &str = "silta-window";
+
+/// The `model_fallback` triggers that are an outage of the primary, for which the turn
+/// may run on the `--fallback-model`; the primary is tried again at the next turn. Any
+/// other trigger (`model_not_found`, `permission_denied`, `last_resort`) means the
+/// primary cannot serve this Claude Code at all, and a fallback would hide that.
+const FALLBACK_ALLOWED: [&str; 3] = ["overloaded", "server_error", "model_blocked"];
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub session: String,
@@ -54,6 +68,13 @@ pub struct Config {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub fallback_model: Option<String>,
+    /// The window Claude Code must measure the context against, the unit's
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW`: a Claude Code that does not know the model
+    /// assumes 200 000 tokens and caps the configured window at that. None skips the
+    /// check.
+    pub window: Option<u64>,
+    /// How long to wait for the window check's answer before giving the session up.
+    pub window_wait: Duration,
     /// None leaves claude without a credential (the tests).
     pub auth: Option<Auth>,
     /// How long to wait after closing stdin before killing claude.
@@ -154,6 +175,8 @@ struct Start {
 enum Outcome {
     /// The supervisor exits with this code; systemd decides about a restart.
     Exit(i32),
+    /// The supervisor exits with [`EXIT_MODEL`] for this reason, and stays down.
+    Unfit(String),
     /// Start claude again at once (a rotation step), with a pause before the next
     /// handoff attempt if the last one failed.
     Again { not_before: Option<Instant> },
@@ -189,6 +212,7 @@ async fn supervise(cfg: &Config, shutdown: &CancellationToken) -> (i32, String) 
         match run_once(cfg, &paths, &start, not_before, shutdown).await {
             Outcome::Exit(code) if shutdown.is_cancelled() => return (code, "stopped".to_owned()),
             Outcome::Exit(code) => return (code, format!("claude exited on its own with {code}")),
+            Outcome::Unfit(reason) => return (EXIT_MODEL, reason),
             Outcome::Again { not_before: pause } => not_before = pause,
         }
     }
@@ -397,6 +421,8 @@ async fn run_once(
         tracker: Tracker::new(cfg.limits.clone(), now),
         watch: None,
         contract: Contract::default(),
+        intro: None,
+        cut: false,
     };
     if start.kind == Kind::Retry {
         // The combined start line is the handoff request; the files are quiet now.
@@ -405,7 +431,18 @@ async fn run_once(
         }
         run.watch = Some(paths.watch_handoff());
     }
-    run.send(&intro(&cfg.session, start.kind)).await;
+    let line = intro(&cfg.session, start.kind);
+    if cfg.window.is_some() {
+        // No turn before the check: the host line waits for its answer.
+        run.control(
+            WINDOW_REQUEST,
+            serde_json::json!({"subtype": "get_context_usage", "detail": "summary"}),
+        )
+        .await;
+        run.intro = Some((line, now + cfg.window_wait));
+    } else {
+        run.send(&line).await;
+    }
     match start.kind {
         Kind::Retry => run.tracker = run.tracker.retrying(now, start.attempts, start.handoff),
         _ if cfg.limits.enabled && paths.marker_exists() => {
@@ -441,7 +478,7 @@ async fn run_once(
     let mut killed = false;
     let status = loop {
         tokio::select! {
-            _ = shutdown.cancelled(), if !matches!(run.after, Some(Outcome::Exit(_))) => {
+            _ = shutdown.cancelled(), if !matches!(run.after, Some(Outcome::Exit(_) | Outcome::Unfit(_))) => {
                 eprintln!("stopping: closing claude's stdin");
                 run.after = Some(Outcome::Exit(0));
                 run.begin_stop();
@@ -462,7 +499,14 @@ async fn run_once(
                     if let Some(line) = run.contract.event(&event, cfg.limits.enabled, Instant::now()) {
                         eprintln!("contract: {line}");
                     }
-                    if run.stopping.is_none() {
+                    match &event {
+                        stream::Event::ContextUsage { request_id, max_tokens } if request_id == WINDOW_REQUEST => {
+                            run.window(*max_tokens).await;
+                        }
+                        stream::Event::ModelFallback { trigger } => run.fallback(trigger),
+                        _ => {}
+                    }
+                    if run.stopping.is_none() && run.intro.is_none() {
                         if matches!(event, stream::Event::Result { .. }) && run.tracker.awaiting_handoff() {
                             let written = run.watch.as_ref().is_some_and(|w| paths.handoff_written(w));
                             run.tracker.set_note_written(written);
@@ -495,6 +539,13 @@ async fn run_once(
                         let _ = child.kill().await;
                         killed = true;
                     }
+                } else if let Some((_, deadline)) = run.intro {
+                    if now >= deadline {
+                        run.unfit(format!(
+                            "Claude Code did not answer the window check (get_context_usage) within {} s",
+                            cfg.window_wait.as_secs()
+                        ));
+                    }
                 } else {
                     ticks += 1;
                     if cfg.limits.enabled && ticks.is_multiple_of(5) {
@@ -515,6 +566,12 @@ async fn run_once(
                     }
                 }
             }
+        }
+        // An unfit session is not given its turn to finish: that turn runs on the
+        // wrong model or window.
+        if run.cut && !killed {
+            let _ = child.start_kill();
+            killed = true;
         }
     };
     // What the readers still hold after the exit.
@@ -576,15 +633,77 @@ struct Run<'a> {
     watch: Option<HandoffWatch>,
     /// The watch on Claude Code's output for what no longer matches the contract.
     contract: Contract,
+    /// The host line that starts the first turn and the deadline of the window check,
+    /// while the check's answer is awaited.
+    intro: Option<(String, Instant)>,
+    /// The session is unfit: claude is killed rather than stopped.
+    cut: bool,
 }
 
 impl Run<'_> {
+    /// A control request to claude, answered by a `control_response` with `id`.
+    async fn control(&mut self, id: &str, request: serde_json::Value) {
+        let line =
+            serde_json::json!({"type": "control_request", "request_id": id, "request": request});
+        self.write(line).await;
+    }
+
+    /// The window check's answer: the first turn starts only on a window at least the
+    /// configured one.
+    async fn window(&mut self, max_tokens: Option<u64>) {
+        let (Some(want), Some((line, _))) = (self.cfg.window, self.intro.take()) else {
+            return;
+        };
+        let model = self.cfg.model.as_deref().unwrap_or("the default model");
+        match max_tokens {
+            Some(n) if n >= want => {
+                eprintln!("model: Claude Code measures the context of {model} against {n} tokens");
+                self.send(&line).await;
+            }
+            Some(n) => self.unfit(format!(
+                "Claude Code measures the context of {model} against {n} tokens, below CLAUDE_CODE_AUTO_COMPACT_WINDOW={want}: this version does not know the model's window"
+            )),
+            None => self.unfit("Claude Code refused the window check (get_context_usage)".to_owned()),
+        }
+    }
+
+    /// A turn switched to the `--fallback-model`: an outage of the primary is let
+    /// through, anything else ends the session.
+    fn fallback(&mut self, trigger: &str) {
+        let fallback = self.cfg.fallback_model.as_deref().unwrap_or("?");
+        if FALLBACK_ALLOWED.contains(&trigger) {
+            eprintln!("model: this turn runs on {fallback} ({trigger}); the next one tries the primary again");
+        } else {
+            self.unfit(format!(
+                "Claude Code switched the turn to {fallback} ({trigger}): the primary model cannot serve this Claude Code"
+            ));
+        }
+    }
+
+    /// Ends the session for good: claude is killed at once and the supervisor exits
+    /// with [`EXIT_MODEL`].
+    fn unfit(&mut self, reason: String) {
+        if matches!(self.after, Some(Outcome::Unfit(_))) {
+            return;
+        }
+        eprintln!("model: {reason}; ending the session, which is not restarted until fixed (exit {EXIT_MODEL})");
+        self.after = Some(Outcome::Unfit(reason));
+        self.intro = None;
+        self.stdin = None;
+        self.stopping.get_or_insert_with(Instant::now);
+        self.cut = true;
+    }
+
     async fn send(&mut self, text: &str) {
+        let line =
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": text}});
+        self.write(line).await;
+    }
+
+    async fn write(&mut self, line: serde_json::Value) {
         let Some(stdin) = self.stdin.as_mut() else {
             return;
         };
-        let line =
-            serde_json::json!({"type": "user", "message": {"role": "user", "content": text}});
         let mut bytes = line.to_string().into_bytes();
         bytes.push(b'\n');
         if let Err(err) = async {

@@ -54,6 +54,12 @@ struct Args {
     #[arg(long, env = "SILTA_FALLBACK_MODEL")]
     fallback_model: Option<String>,
 
+    /// The window Claude Code decides automatic compaction by, read by Claude Code
+    /// itself; the session ends unless Claude Code measures the context against at
+    /// least this much (a model it does not know is capped at 200 000 tokens).
+    #[arg(long, env = "CLAUDE_CODE_AUTO_COMPACT_WINDOW")]
+    auto_compact_window: Option<u64>,
+
     /// The Anthropic-compatible endpoint a session with a gateway-token talks to.
     #[arg(long, env = "SILTA_GATEWAY_URL")]
     gateway_url: Option<String>,
@@ -138,6 +144,8 @@ fn main() -> ExitCode {
         model: args.model,
         effort: args.effort,
         fallback_model: args.fallback_model,
+        window: args.auto_compact_window,
+        window_wait: Duration::from_secs(60),
         auth: Some(auth),
         stop_grace: Duration::from_secs(args.stop_grace),
         limits: Limits {

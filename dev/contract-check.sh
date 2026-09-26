@@ -9,8 +9,9 @@
 # Asserts: the init line names a version and it is in silta-session's TESTED_VERSIONS;
 # a main-line assistant line carries the three usage counts; the turn's prompt comes
 # back as a user line (the idle gap rests on that line for a channel delivery); the
-# result line carries is_error. Agents, compaction and the hook stay in the manual
-# procedure. Exit 0 when every check passes, 1 otherwise; the failures are listed.
+# result line carries is_error; a get_context_usage control request is answered with an
+# integer maxTokens (the window check at every start). Agents, compaction and the hook
+# stay in the manual procedure. Exit 0 when every check passes, 1 otherwise; the failures are listed.
 #
 # TODO: this currently lacks at least the check for user message detection, that needs
 #       a fake channel plugin.
@@ -24,7 +25,8 @@ out=$(mktemp "${TMPDIR:-/tmp}/contract-check.XXXXXX")
 
 trap 'rm -f "$out"' EXIT
 
-printf '%s\n' '{"type":"user","message":{"role":"user","content":"Reply with the single word ok and nothing else."}}' \
+printf '%s\n' '{"type":"control_request","request_id":"silta-window","request":{"subtype":"get_context_usage","detail":"summary"}}' \
+  '{"type":"user","message":{"role":"user","content":"Reply with the single word ok and nothing else."}}' \
   | "$claude" -p --input-format stream-json --output-format stream-json --verbose \
       --replay-user-messages --permission-mode auto --permission-prompts none > "$out" 2>"$out.err"
 status=$?
@@ -67,6 +69,12 @@ if not results:
     fails.append("no result line")
 elif not isinstance(results[-1].get("is_error"), bool):
     fails.append("result line has no boolean is_error")
+usage = next((l.get("response", {}) for l in lines if l.get("type") == "control_response"
+              and l.get("response", {}).get("request_id") == "silta-window"), None)
+if usage is None:
+    fails.append("no control_response to get_context_usage; silta-session ends every start at the window check")
+elif usage.get("subtype") != "success" or not isinstance(usage.get("response", {}).get("maxTokens"), int):
+    fails.append(f"get_context_usage answered without an integer response.maxTokens: {usage.get('error') or usage.get('subtype')}")
 print(f"Claude Code {version or '?'}: {len(lines)} lines, {len(main)} main-line assistant, {len(results)} result")
 for f in fails:
     print(f"FAIL {f}")

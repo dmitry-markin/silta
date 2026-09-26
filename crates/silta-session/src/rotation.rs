@@ -357,7 +357,10 @@ impl Tracker {
                     *failed = true;
                 }
             }
-            Event::Init { .. } | Event::Other => {}
+            Event::Init { .. }
+            | Event::ContextUsage { .. }
+            | Event::ModelFallback { .. }
+            | Event::Other => {}
         }
         self.advance(now)
     }

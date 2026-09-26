@@ -11,9 +11,12 @@
 # later), noresume (a --resume is refused), nocompact (a /compact is reported blocked),
 # compacthang (a /compact never ends), compacthangonce (the same, once: the mode is
 # reset to ok first) or busycompact (an unrelated turn ends before the compaction, as
-# if a person's message had been queued ahead of the command).
+# if a person's message had been queued ahead of the command), fallback-<trigger> (every
+# turn reports a model_fallback with that trigger first) or nowindow (a control request
+# is never answered).
 # HOME/fake-context is the context size reported in every assistant line; a compaction
-# sets it to 100, as the real one shrinks the context.
+# sets it to 100, as the real one shrinks the context. HOME/fake-window is the maxTokens
+# of the answer to a get_context_usage control request (default 500000).
 set -u
 id=""; resume=""
 while [ $# -gt 0 ]; do
@@ -46,6 +49,15 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 touch "$proj/$id.jsonl"
 while IFS= read -r line; do
+  case "$line" in *'"type":"control_request"'*)
+    request=$(printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+    echo "control $request" >> "$HOME/fake.log"
+    [ "$(mode)" = nowindow ] && continue
+    window=$(cat "$HOME/fake-window" 2>/dev/null || echo 500000)
+    echo "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$request\",\"response\":{\"totalTokens\":$context,\"maxTokens\":$window,\"rawMaxTokens\":$window,\"model\":\"fake\"}}}"
+    continue
+    ;;
+  esac
   text=$(printf '%s' "$line" | sed 's/.*"content":"//; s/"}}$//')
   echo "line $text" >> "$HOME/fake.log"
   echo "$line" >> "$proj/$id.jsonl"
@@ -79,6 +91,11 @@ while IFS= read -r line; do
     echo "compact $id" >> "$HOME/fake.log"
     echo '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"duration_ms":0,"duration_api_ms":0,"total_cost_usd":0.001,"usage":{}}'
     continue
+    ;;
+  esac
+  case "$(mode)" in fallback-*)
+    echo "{\"type\":\"system\",\"subtype\":\"model_fallback\",\"trigger\":\"$(mode | sed 's/^fallback-//')\",\"original_model\":\"fake\",\"fallback_model\":\"fake-fallback\",\"content\":\"Switched to fake-fallback\"}"
+    echo "fallback $id" >> "$HOME/fake.log"
     ;;
   esac
   assistant ok
