@@ -665,7 +665,7 @@ impl Run<'_> {
                 self.send(&line).await;
             }
             Some(n) => self.end(EXIT_MODEL, format!(
-                "Claude Code measures the context of {model} against {n} tokens, below CLAUDE_CODE_AUTO_COMPACT_WINDOW={want}: this version does not know the model's window"
+                "Claude Code measures the context of {model} against {n} tokens, below CLAUDE_CODE_AUTO_COMPACT_WINDOW={want}: this version does not know the model's window or the configured window is above the model's"
             )),
             None => self.end(EXIT_MODEL, "Claude Code refused the window check (get_context_usage): this version cannot be held to a window".to_owned()),
         }
