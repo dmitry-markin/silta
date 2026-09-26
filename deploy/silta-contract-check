@@ -713,6 +713,8 @@ class Config:
     keep: bool
     # Added to every run of Claude Code, with {logs} and {run} filled in (--claude-arg).
     claude_args: list[str]
+    # Seconds between the window check's answer and the first host line (--first-turn-delay).
+    first_turn_delay: float
 
 
 def parse_unit(path: Path) -> dict[str, str]:
@@ -876,6 +878,11 @@ def configure(args: argparse.Namespace) -> Config:
             args.claude_arg
             if args.claude_arg is not None
             else shlex.split(os.environ.get("SILTA_CHECK_CLAUDE_ARGS", ""))
+        ),
+        first_turn_delay=(
+            args.first_turn_delay
+            if args.first_turn_delay is not None
+            else float(os.environ.get("SILTA_CHECK_FIRST_TURN_DELAY") or 0)
         ),
     )
 
@@ -1751,6 +1758,7 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
         "intro": INTRO,
         "fallback": cfg.fallback_model,
         "home": str(cfg.home),
+        "first_turn_delay": cfg.first_turn_delay,
         "inbox": str(cfg.state / "workspace" / "inbox"),
         "subagent_model": cfg.passthrough.get("CLAUDE_CODE_SUBAGENT_MODEL"),
     }
@@ -1772,6 +1780,11 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
                     "text": "no control_response within 60 s; sending the host line anyway",
                 }
             )
+        # Unlike the supervisor, which starts the first turn at once: a pause that lets
+        # Claude Code finish its startup fetches first (--first-turn-delay).
+        if cfg.first_turn_delay > 0:
+            trace.add({"type": "_note", "text": f"first turn delayed {cfg.first_turn_delay} s"})
+            time.sleep(cfg.first_turn_delay)
         run.send_user(INTRO)
         # The first answer of a model opens the channel (lib.rs `open_channel`).
         first = trace.wait(
@@ -1933,6 +1946,11 @@ def check_main(report: Report, trace: Trace, meta: dict) -> Optional[str]:
     check_init_plugin(report, init)
     check_init_memory_paths(report, init, meta)
     check_init_lines(report, lines, init)
+    if meta.get("first_turn_delay"):
+        report.info(
+            "main: first turn delayed",
+            f"{meta['first_turn_delay']} s after the window check; the supervisor does not wait",
+        )
     check_window_answer(report, lines, meta)
     check_replayed_host_line(report, lines, meta)
     check_assistant_usage(report, lines)
@@ -3492,6 +3510,16 @@ def main() -> int:
         type=float,
         default=240,
         help="seconds to wait for a turn to end (default: 240)",
+    )
+    parser.add_argument(
+        "--first-turn-delay",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "seconds the main run waits between the window check's answer and the first host"
+            " line, which the supervisor sends at once; for telling a race at Claude Code's"
+            " startup from a contract break (default: $SILTA_CHECK_FIRST_TURN_DELAY, else 0)"
+        ),
     )
     parser.add_argument(
         "--claude-arg",

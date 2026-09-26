@@ -39,6 +39,10 @@ Environment=DISABLE_AUTOUPDATER=1
 # It may hold more of the conversation and the requests than the traces do; it stays in
 # the check's private state directory, pruned with the traces.
 Environment=SILTA_CHECK_CLAUDE_ARGS=
+# Seconds the main run waits between the window check and its first turn, which the
+# supervisor starts at once (the checker's --first-turn-delay): a non-zero value tells a
+# race at Claude Code's startup from a contract break, 0 checks what the minds meet.
+Environment=SILTA_CHECK_FIRST_TURN_DELAY=0
 LoadCredential=auth:/etc/silta/auth/check
 ExecStart=/usr/lib/silta/silta-contract-check
 TimeoutStartSec=40min
