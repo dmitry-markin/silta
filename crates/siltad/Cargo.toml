@@ -50,6 +50,7 @@ assets = [
   ["target/release/silta-session", "usr/lib/silta/", "755"],
   ["../../deploy/silta-precompact-block", "usr/lib/silta/", "755"],
   ["../../deploy/silta-contract-check", "usr/lib/silta/", "755"],
+  ["../../deploy/the-hound-of-the-baskervilles.txt", "usr/share/silta/", "644"],
   ["../../deploy/silta-session-add", "usr/sbin/", "755"],
   ["../../deploy/siltad.service", "usr/lib/systemd/system/", "644"],
   ["../../deploy/silta-session@.service", "usr/lib/systemd/system/", "644"],

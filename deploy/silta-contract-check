@@ -64,7 +64,8 @@ The script is formatted with black at 100 columns and checked with pycodestyle (
 W503 ignored, as black's style needs), both run by CI next to the replay.
 
 A full run makes a handful of short turns on the configured model and, for the hook,
-two turns on a cheap model over a context of about 90 000 tokens (`--hook-model`; `--skip hook`
+two turns on a cheap model over a context of about 106 000 tokens, a public-domain novel sent
+whole (`--hook-model`; `--skip hook`
 leaves that run out); it takes a few minutes and costs well under a dollar. The report ends
 with the run's cost as Claude Code counted it, at list prices, which is notional on a
 subscription.
@@ -126,13 +127,18 @@ NO_CONVERSATION = "No conversation found with session ID"
 FALLBACK_FATAL = ["model_not_found", "permission_denied", "last_resort", "model_blocked"]
 FALLBACK_OUTAGE = ["overloaded", "server_error"]
 
-# The smallest window Claude Code accepts for CLAUDE_CODE_AUTO_COMPACT_WINDOW, used by the
-# hook run so that a modest context trips the automatic compaction. Claude Code compacts
-# at about the window minus a 20 000-token output reserve minus 13 000 (see the unit's
-# comment on the window), 67 000 here; the filler aims above that and, with Claude Code's
-# own system prompt, below the window.
-HOOK_WINDOW = 100_000
-FILLER_WORDS = 58_000
+# A small window for CLAUDE_CODE_AUTO_COMPACT_WINDOW in the hook run, so that a modest
+# context triggers the automatic compaction (Claude Code accepts 100 000 to 1 000 000).
+# It compacts at about the window minus a 20 000-token output reserve minus 13 000 (see
+# the unit's comment on the window), 87 000 here. The filler is a whole book, The Hound
+# of the Baskervilles by Arthur Conan Doyle (1902, public domain), about 92 000 tokens,
+# which with Claude Code's own prompt comes to some 106 000, between the threshold and
+# the window. The file is the bare text, so the model gets a real book to hold rather
+# than generated filler; the message that carries it says what it is.
+HOOK_WINDOW = 120_000
+HOOK_THRESHOLD = HOOK_WINDOW - 20_000 - 13_000
+FILLER_FILE = "the-hound-of-the-baskervilles.txt"
+FILLER_TITLE = "The Hound of the Baskervilles by Arthur Conan Doyle"
 DEFAULT_HOOK_MODEL = "claude-haiku-4-5-20251001"
 
 # The variables that decide how Claude Code authenticates (lib.rs `AUTH_VARS`): the
@@ -506,6 +512,7 @@ class Config:
     plugin_bin: Path
     marketplace: Path
     hook: Path
+    filler: Path
     managed_settings: Path
     home: Path
     state: Path
@@ -657,6 +664,14 @@ def configure(args: argparse.Namespace) -> Config:
         plugin_bin=find_plugin_bin(args.plugin_bin, repo),
         marketplace=marketplace,
         hook=here / "silta-precompact-block",
+        filler=next(
+            (
+                p
+                for p in (here / FILLER_FILE, Path("/usr/share/silta") / FILLER_FILE)
+                if p.is_file()
+            ),
+            here / FILLER_FILE,
+        ),
         managed_settings=Path("/etc/claude-code/managed-settings.json"),
         home=home,
         state=state,
@@ -1065,6 +1080,7 @@ def check_static(report: Report, cfg: Config) -> Optional[str]:
     plugin_version = check_plugin_binary(report, cfg)
     check_marketplace(report, cfg, plugin_version)
     check_hook_script(report, cfg)
+    check_filler_text(report, cfg)
     check_managed_settings(report, cfg)
     return version
 
@@ -1180,6 +1196,19 @@ def check_hook_script(report: Report, cfg: Config) -> None:
         cfg.hook.is_file() and os.access(cfg.hook, os.X_OK),
         f"{cfg.hook} is not an executable file",
         str(cfg.hook),
+    )
+
+
+def check_filler_text(report: Report, cfg: Config) -> None:
+    """The book the hook run fills the context with is shipped next to this script or under
+    /usr/share/silta (FILLER_FILE); without it the hook run has nothing to send."""
+    words = len(cfg.filler.read_text(encoding="utf-8").split()) if cfg.filler.is_file() else 0
+    report.check(
+        "filler text",
+        words > 40_000,
+        f"{cfg.filler} is missing or too short ({words} words); the hook run needs a text of"
+        " some 60 000 words",
+        f"{cfg.filler}, {words} words",
     )
 
 
@@ -2248,29 +2277,6 @@ def check_bogus_resume(report: Report, second: list[dict]) -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-def filler(words: int) -> str:
-    """Deterministic prose of about `words` words, roughly 1.3 tokens each."""
-    vocabulary = (
-        "the family assistant keeps notes about plans meals weather travel and school while it"
-        " waits for messages in quiet rooms during long evenings and early mornings across seasons"
-        " of ordinary days"
-    ).split()
-    out = []
-    n = 0
-    seed = 17
-    while n < words:
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        length = 8 + seed % 9
-        sentence = []
-        for i in range(length):
-            seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-            sentence.append(vocabulary[seed % len(vocabulary)])
-        sentence[0] = sentence[0].capitalize()
-        out.append(" ".join(sentence) + ".")
-        n += length
-    return " ".join(out)
-
-
 def drive_hook(cfg: Config, trace: Trace, session_id: str, managed_hook: bool) -> dict:
     meta = {
         "run": "hook",
@@ -2307,13 +2313,17 @@ def drive_hook(cfg: Config, trace: Trace, session_id: str, managed_hook: bool) -
         fallback="",
     )
     try:
-        text = filler(FILLER_WORDS)
+        text = cfg.filler.read_text(encoding="utf-8")
         trace.add(
-            {"type": "_note", "text": f"filler of {len(text.split())} words, {len(text)} bytes"}
+            {
+                "type": "_note",
+                "text": f"filler {cfg.filler}: {len(text.split())} words, {len(text)} bytes",
+            }
         )
         run.send_user(
-            "The text below is filler for a test of the harness; do not summarise it. Reply with"
-            " the single word ok.\n\n" + text
+            f"The text below is {FILLER_TITLE}, public domain, sent whole to fill the context"
+            " for a test of the harness; nothing about it is asked, read it only if you want to."
+            " Reply with the single word ok.\n\n" + text
         )
         first = run.wait_result(0, timeout=cfg.turn_timeout * 2)
         if first is not None:
@@ -2346,9 +2356,9 @@ def check_hook(report: Report, trace: Trace, meta: dict) -> None:
 
 
 def check_filler_turn(report: Report, lines: list[dict], meta: dict) -> Optional[int]:
-    """A user line of about 90 000 tokens is accepted on stdin and answered on the hook
-    model, and the short second turn ends too. Returns the context size the first answer
-    reported, or None when the run cannot be judged."""
+    """A user line carrying the whole book, about 92 000 tokens, is accepted on stdin and
+    answered on the hook model, and the short second turn ends too. Returns the context size
+    the first answer reported, or None when the run cannot be judged."""
     results = of_type(lines, "result")
     assistants = [line for line in of_type(lines, "assistant") if is_main(line)]
     if not report.check(
@@ -2376,20 +2386,31 @@ def check_compaction_attempted(
     report: Report, lines: list[dict], trace: Trace, meta: dict, context: int
 ) -> bool:
     """CLAUDE_CODE_AUTO_COMPACT_WINDOW is honoured: with the window at its minimum and the
-    context past the threshold (the window minus the output reserve minus 13 000), Claude
-    Code attempts an automatic compaction, seen as a `status` `compacting`, a boundary, or
-    the hook's marker."""
+    context past the threshold (the window minus the output reserve minus 13 000,
+    HOOK_THRESHOLD), Claude Code attempts an automatic compaction, seen as a `status`
+    `compacting`, a boundary, or the hook's marker. A miss is told apart by the context
+    size: above the assumed threshold it is Claude Code's threshold that moved, below it
+    the book is shorter than assumed for this model's tokenizer."""
     statuses = of_type(lines, "system", "status")
     boundaries = of_type(lines, "system", "compact_boundary")
     marker = trace_file(trace, "marker")
     fired = marker is not None and marker.get("exists") is True
     attempted = any(s.get("status") == "compacting" for s in statuses) or bool(boundaries) or fired
+    if context >= HOOK_THRESHOLD:
+        cause = (
+            f"the context is past the assumed threshold of {HOOK_THRESHOLD}, so Claude Code's"
+            " threshold moved or the window is not honoured"
+        )
+    else:
+        cause = (
+            f"the context is below the assumed threshold of {HOOK_THRESHOLD}, so the filler"
+            " text is too short for this model's tokenizer"
+        )
     return report.check(
         "hook: automatic compaction attempted",
         attempted,
         f"no compaction after a context of {context} tokens with"
-        f" CLAUDE_CODE_AUTO_COMPACT_WINDOW={meta['window']}: the window is not honoured or the"
-        " threshold moved; the hook was never asked",
+        f" CLAUDE_CODE_AUTO_COMPACT_WINDOW={meta['window']}: {cause}; the hook was never asked",
     )
 
 
@@ -2776,7 +2797,7 @@ def main() -> int:
         "--hook-model",
         default=DEFAULT_HOOK_MODEL,
         help=(
-            "the model of the hook run, which reads about 90 000 tokens twice (default:"
+            "the model of the hook run, which reads about 106 000 tokens twice (default:"
             f" {DEFAULT_HOOK_MODEL})"
         ),
     )
@@ -2795,7 +2816,7 @@ def main() -> int:
         "--skip",
         help=(
             "runs to skip, comma-separated: resume,hook,fallback,badkey (hook is the slow one: two"
-            " turns over a context of about 90 000 tokens on the hook model)"
+            " turns over a context of about 106 000 tokens on the hook model)"
         ),
     )
     parser.add_argument(
