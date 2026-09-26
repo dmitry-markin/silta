@@ -74,7 +74,9 @@ Claude Code must do, which part of Silta rests on it and what breaks otherwise; 
 carries the same words as the function's name, so a failure leads straight to its code.
 
 The script is formatted with black at 100 columns and checked with pycodestyle (E203 and
-W503 ignored, as black's style needs), both run by CI next to the replay.
+W503 ignored, as black's style needs), both pinned by hash in
+dev/contract-check-format-requirements.txt and run by CI in a job of their own, next to the
+replay's.
 
 A full run makes some fifteen short turns on the configured model and, for the hook,
 two turns on a cheap model over a context of about 106 000 tokens, a public-domain novel sent
@@ -1548,7 +1550,6 @@ def hook_plan(cfg: Config) -> tuple[bool, Optional[str]]:
             " script's own hook would be ignored"
         )
     return False, None
-
 
 
 # --------------------------------------------------------------------------------------------------

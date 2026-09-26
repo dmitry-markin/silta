@@ -99,22 +99,32 @@ jobs:
 
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-  contract-check:
-    name: contract check smoke
+  contract-check-format:
+    name: contract checker format
     runs-on: ubuntu-latest
-    # The checker itself needs a Claude Code and a login, so CI runs its assertions over a
-    # recorded trace instead: this keeps the script's parsing and checks working, not the
-    # contract, which only a live run on the VM or a developer's machine can check. Before
-    # that, the formatting: black at 100 columns and pycodestyle without the two codes
-    # black's style trips (E203, W503), both pinned.
+    # black at 100 columns and pycodestyle without the two codes black's style trips (E203,
+    # W503), from a venv (the runner's Python is externally managed) with every package
+    # pinned by hash in dev/contract-check-format-requirements.txt.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - run: python3 -m pip install --user black==26.5.1 pycodestyle==2.15.0
+      - run: |
+          python3 -m venv "$RUNNER_TEMP/format"
+          "$RUNNER_TEMP/format/bin/pip" install --require-hashes -r dev/contract-check-format-requirements.txt
 
-      - run: python3 -m black --check --line-length 100 deploy/silta-contract-check
+      - run: '"$RUNNER_TEMP/format/bin/black" --check --line-length 100 deploy/silta-contract-check'
 
-      - run: python3 -m pycodestyle --max-line-length 100 --ignore E203,W503 deploy/silta-contract-check
+      - run: '"$RUNNER_TEMP/format/bin/pycodestyle" --max-line-length 100 --ignore E203,W503 deploy/silta-contract-check'
+
+  contract-check:
+    name: contract check replay
+    runs-on: ubuntu-latest
+    # The checker itself needs a Claude Code and a login, so CI runs its assertions over a
+    # recorded trace instead: this keeps the script's parsing and checks working, not the
+    # contract, which only a live run on the VM or a developer's machine can check. The
+    # script is stdlib-only, so the runner's python3 is all it needs.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - run: deploy/silta-contract-check --replay dev/contract-fixtures/2.1.283
 
