@@ -29,11 +29,13 @@ organised by the piece of Silta that depends on it:
                               the marker (deploy/silta-precompact-block)
   the channel                 the plugin installed from the marketplace as `silta-session-add`
                               does it, registered through `--channels`, its tools in the
-                              session, messages from the daemon becoming `<channel>` user
-                              messages with every attribute the plugin sets (a thread, a
-                              quote, a file, a reaction), whether they arrive between turns,
-                              during a turn or during `/compact`, and turns that answer them
-                              with the reply tool
+                              session, the channel handler Claude Code attaches by the end of
+                              the first turn (the plugin's MCP log says when), messages from
+                              the daemon becoming `<channel>` user messages with every
+                              attribute the plugin sets (a thread, a quote, a file, a
+                              reaction), whether they arrive between turns, during a turn or
+                              during `/compact`, and turns that answer them with the reply
+                              tool
   the managed settings        the keys the deployment sets, and the effect of those a run can
                               see: the channel allowlist and the hook. That the Bash sandbox
                               hides the credential is not checked: a turn that looks for it
@@ -266,6 +268,22 @@ REPLY_IN_THREAD = (
     " as the text, the thread attribute of this message as thread, more set to false; do not"
     " open the attached file."
 )
+# A turn of the host's own, for Claude Code to attach the channel handler at its start.
+NOOP = "This line comes from the host, not from a person. Reply with the single word ok."
+
+# Claude Code attaches the handler of the plugin's channel notifications at the start of a
+# turn, once a fetch of its own at startup has finished, and says so in the plugin's MCP
+# log (`Channel notifications re-registered after reconnect`, also without --debug); a
+# notification that arrives before is dropped without a trace. The first turn often starts
+# before that fetch has finished. The main run looks for the line after the first turn and,
+# while it is missing, starts up to HANDLER_TURNS - 1 turns of NOOP, so that every message
+# is sent to a registered handler.
+HANDLER_LINE = ("Channel notifications", "registered")
+HANDLER_TURNS = 3
+
+# How long a message the fake daemon sent may take to appear as a `user` line: a message
+# sent during a turn appears after the turn's running tool call.
+DELIVERY_WAIT = 60
 
 
 # --------------------------------------------------------------------------------------------------
@@ -323,6 +341,12 @@ class Report:
         if detail:
             line += f": {detail}"
         emit(line, PRIORITIES.get(status, INFO), status, self.out)
+
+    def running(self, run: str, what: str) -> None:
+        """A run starts: one line, not a check, so that a long run shows in the journal
+        while it lasts (its checks print when it ends); left out by --quiet."""
+        if not self.quiet:
+            emit(f"RUN   {run}: {what}; its checks follow when it ends", out=self.out)
 
     def ok(self, name: str, detail: str = "") -> None:
         self._add("PASS", name, detail)
@@ -713,8 +737,6 @@ class Config:
     keep: bool
     # Added to every run of Claude Code, with {logs} and {run} filled in (--claude-arg).
     claude_args: list[str]
-    # Seconds between the window check's answer and the first host line (--first-turn-delay).
-    first_turn_delay: float
 
 
 def parse_unit(path: Path) -> dict[str, str]:
@@ -878,11 +900,6 @@ def configure(args: argparse.Namespace) -> Config:
             args.claude_arg
             if args.claude_arg is not None
             else shlex.split(os.environ.get("SILTA_CHECK_CLAUDE_ARGS", ""))
-        ),
-        first_turn_delay=(
-            args.first_turn_delay
-            if args.first_turn_delay is not None
-            else float(os.environ.get("SILTA_CHECK_FIRST_TURN_DELAY") or 0)
         ),
     )
 
@@ -1133,6 +1150,16 @@ class ClaudeRun:
         self.marker = cfg.state / "rotate-requested"
         if self.marker.exists():
             self.marker.unlink()
+        # The plugin's MCP log files of this run: those that are not there yet.
+        self.mcp_logs = (
+            cfg.home
+            / ".cache/claude-cli-nodejs"
+            / session_slug(self.workspace)
+            / f"mcp-logs-plugin-{PLUGIN_NAME}-{SERVER_NAME}"
+        )
+        self.mcp_logs_before = (
+            {f.name for f in self.mcp_logs.iterdir()} if self.mcp_logs.is_dir() else set()
+        )
         self.trace.add(
             {
                 "type": "_start",
@@ -1218,6 +1245,45 @@ class ClaudeRun:
         traced ahead of it."""
         self.trace.add({"type": "_ready"})
         self.ready_file.write_text("contract-check\n", encoding="utf-8")
+
+    def handler_registrations(self) -> int:
+        """How many times this run's MCP log says Claude Code attached the channel handler
+        (HANDLER_LINE)."""
+        if not self.mcp_logs.is_dir():
+            return 0
+        count = 0
+        for f in self.mcp_logs.iterdir():
+            if f.name in self.mcp_logs_before or not f.is_file():
+                continue
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                text = str(entry.get("debug") or "") if isinstance(entry, dict) else ""
+                count += all(word in text for word in HANDLER_LINE)
+        return count
+
+    def wait_handler(self, timeout: float) -> bool:
+        """Whether the channel handler is attached, looking again every 0.1 s for up to
+        `timeout` seconds: the line is written at a turn's start but may reach the file
+        a moment later."""
+        deadline = time.monotonic() + timeout
+        while self.handler_registrations() == 0:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+        return True
+
+    def wait_delivery(self, start: int, event_id: str) -> Optional[dict]:
+        """The `user` line that delivered the event, from index `start` on, waiting up to
+        DELIVERY_WAIT."""
+        return self.trace.wait(
+            lambda line: line.get("type") == "user"
+            and any(t.get("event_id") == event_id for t in channel_tags(line)),
+            DELIVERY_WAIT,
+            start,
+        )
 
     def wait_tool_use(self, start: int, names: tuple[str, ...]) -> Optional[dict]:
         """The main line's first call of one of the named tools from index `start` on."""
@@ -1758,7 +1824,6 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
         "intro": INTRO,
         "fallback": cfg.fallback_model,
         "home": str(cfg.home),
-        "first_turn_delay": cfg.first_turn_delay,
         "inbox": str(cfg.state / "workspace" / "inbox"),
         "subagent_model": cfg.passthrough.get("CLAUDE_CODE_SUBAGENT_MODEL"),
     }
@@ -1780,11 +1845,6 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
                     "text": "no control_response within 60 s; sending the host line anyway",
                 }
             )
-        # Unlike the supervisor, which starts the first turn at once: a pause that lets
-        # Claude Code finish its startup fetches first (--first-turn-delay).
-        if cfg.first_turn_delay > 0:
-            trace.add({"type": "_note", "text": f"first turn delayed {cfg.first_turn_delay} s"})
-            time.sleep(cfg.first_turn_delay)
         run.send_user(INTRO)
         # The first answer of a model opens the channel (lib.rs `open_channel`).
         first = trace.wait(
@@ -1798,16 +1858,18 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
         if run.wait_result(0) is None:
             trace.add({"type": "_note", "text": "the first turn did not end; stopping"})
             return meta
+        drive_handler(run)
         # The plugin connects once the ready file exists and Claude Code has initialised
         # it; then a message from Alice, whose turn should call the reply tool.
         if daemon.connected.wait(30):
             n = len(trace)
             daemon.event("$alice-1", REPLY_OK)
-            trace.wait(
-                lambda line: line.get("type") == "result" and channel_origin(line),
-                cfg.turn_timeout,
-                n,
-            )
+            if run.wait_delivery(n, "$alice-1") is not None:
+                trace.wait(
+                    lambda line: line.get("type") == "result" and channel_origin(line),
+                    cfg.turn_timeout,
+                    n,
+                )
             trace.wait_quiet(3, 30)
             drive_midturn(run, daemon)
         else:
@@ -1859,6 +1921,7 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
             cfg.turn_timeout,
             n,
         )
+        sent = len(trace)
         if daemon.connected.is_set():
             daemon.event("$alice-4", REPLY_OK)
         trace.wait(
@@ -1867,11 +1930,11 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
             n,
         )
         trace.wait(lambda line: line.get("type") == "result", cfg.turn_timeout, n)
-        if daemon.connected.is_set():
+        if daemon.connected.is_set() and run.wait_delivery(sent, "$alice-4") is not None:
             trace.wait(
                 lambda line: line.get("type") == "result" and channel_origin(line),
                 cfg.turn_timeout,
-                n,
+                sent,
             )
         trace.wait_quiet(3, 30)
         # The graceful stop in the middle of a turn: the turn ends, then Claude Code.
@@ -1900,6 +1963,31 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
         trace.close()
 
 
+def drive_handler(run: ClaudeRun) -> None:
+    """After the first turn, the channel handler (HANDLER_LINE): attached by then, or at the
+    start of one of up to HANDLER_TURNS - 1 turns of NOOP. Each look is recorded, for
+    check_channel_handler."""
+    trace = run.trace
+    turn = 1
+    while True:
+        registered = run.wait_handler(2)
+        trace.add(
+            {
+                "type": "_handler",
+                "after_turn": turn,
+                "registered": registered,
+                "mcp_logs": str(run.mcp_logs),
+            }
+        )
+        if registered or turn >= HANDLER_TURNS:
+            return
+        n = len(trace)
+        run.send_user(NOOP)
+        if run.wait_result(n) is None:
+            return
+        turn += 1
+
+
 def drive_midturn(run: ClaudeRun, daemon: FakeDaemon) -> None:
     """Two messages from Alice while a turn runs, as a person writes while the mind works:
     one in a thread, quoting her first message, with a file; then a reaction to the mind's
@@ -1919,19 +2007,14 @@ def drive_midturn(run: ClaudeRun, daemon: FakeDaemon) -> None:
         attachments=[attachment],
     )
     daemon.event("$alice-3", "👍", kind="reaction", reacts_to="$reply-1")
-    for event_id in ("$alice-2", "$alice-3"):
+    delivered = [run.wait_delivery(n, event_id) for event_id in ("$alice-2", "$alice-3")]
+    if delivered[0] is not None:
         trace.wait(
-            lambda line: line.get("type") == "user"
-            and any(t.get("event_id") == event_id for t in channel_tags(line)),
+            lambda line: line["type"] == "_daemon"
+            and (line.get("line", {}).get("cmd", {}).get("reply") or {}).get("thread") == THREAD,
             run.cfg.turn_timeout,
             n,
         )
-    trace.wait(
-        lambda line: line["type"] == "_daemon"
-        and (line.get("line", {}).get("cmd", {}).get("reply") or {}).get("thread") == THREAD,
-        run.cfg.turn_timeout,
-        n,
-    )
     trace.wait_quiet(5, run.cfg.turn_timeout)
 
 
@@ -1946,17 +2029,13 @@ def check_main(report: Report, trace: Trace, meta: dict) -> Optional[str]:
     check_init_plugin(report, init)
     check_init_memory_paths(report, init, meta)
     check_init_lines(report, lines, init)
-    if meta.get("first_turn_delay"):
-        report.info(
-            "main: first turn delayed",
-            f"{meta['first_turn_delay']} s after the window check; the supervisor does not wait",
-        )
     check_window_answer(report, lines, meta)
     check_replayed_host_line(report, lines, meta)
     check_assistant_usage(report, lines)
     check_results(report, lines)
     check_no_fallback(report, lines)
     check_plugin_connection(report, trace)
+    check_channel_handler(report, trace)
     check_channel_delivery(report, lines)
     check_midturn_delivery(report, trace, meta)
     check_subagent(report, lines, meta)
@@ -2307,6 +2386,43 @@ def check_plugin_connection(report: Report, trace: Trace) -> None:
     )
 
 
+def check_channel_handler(report: Report, trace: Trace) -> None:
+    """Claude Code has the handler of the plugin's channel notifications in place by the end
+    of the first turn (HANDLER_LINE in the plugin's MCP log). It attaches it at a turn's
+    start once a fetch of its own at startup has finished; when the first turn starts
+    earlier, the handler comes only with the next turn, and a notification before then is
+    dropped without a trace. The supervisor starts the first turn right after the window
+    check and opens the channel at the model's first answer, so a message the daemon hands
+    over then is acknowledged by the plugin and lost. Whether the first turn wins that race
+    depends on the network, hence a warning; the run itself goes on with turns of NOOP
+    until the handler is attached, so that the checks of the deliveries below do not."""
+    looks = [line for line in trace.lines if line["type"] == "_handler"]
+    if not looks:
+        report.skip(
+            "main: channel handler",
+            "the trace has no look at the handler: the run ended in its first turn, or the trace"
+            " predates the look",
+        )
+        return
+    attached = next((look for look in looks if look.get("registered")), None)
+    if attached is None:
+        report.fail(
+            "main: channel handler",
+            f"no line with {' and '.join(HANDLER_LINE)} in the plugin's MCP log"
+            f" ({looks[-1].get('mcp_logs')}) after {looks[-1].get('after_turn')} turns: Claude"
+            " Code did not attach the channel handler, or no longer says so there",
+        )
+    elif attached is looks[0]:
+        report.ok("main: channel handler", "attached by the end of the first turn")
+    else:
+        report.warn(
+            "main: channel handler",
+            f"attached only at turn {attached.get('after_turn')}: the first turn started before"
+            " Claude Code's startup fetch had finished, so a queued message the daemon hands over"
+            " when the plugin connects in a mind's first turn is dropped, and acknowledged",
+        )
+
+
 def check_channel_delivery(report: Report, lines: list[dict]) -> None:
     """Claude Code's side of the channel: the plugin's `notifications/claude/channel` becomes
     a `user` line whose text is a `<channel source="plugin:silta-claude:silta"
@@ -2317,20 +2433,23 @@ def check_channel_delivery(report: Report, lines: list[dict]) -> None:
     `channel_origin`). In that turn the model answers with the reply tool, whose result is
     not an error."""
     users = of_type(lines, "user")
-    channel_users = [
-        line
-        for line in users
-        if channel_origin(line) or (content_text(line) or "").lstrip().startswith("<channel")
-    ]
-    if not report.check(
-        "main: channel user line",
-        bool(channel_users),
-        "the delivered message never appeared as a user line: Claude Code did not register the"
-        " channel (managed settings? plugin allowlist?) or dropped the notification",
-    ):
+    _, u, tag = find_delivery(lines, "$alice-1")
+    if not u:
+        # A channel line without the tag means its text changed, not that it was lost.
+        untagged = [line for line in users if channel_origin(line) and not channel_tags(line)]
+        report.fail(
+            "main: channel user line",
+            (
+                "a user line has the channel origin but no <channel ... event_id> tag:"
+                f" {shorten(content_text(untagged[0]), 200)!r}"
+                if untagged
+                else "$alice-1, which the plugin handed to Claude Code, never appeared as a user"
+                " line: Claude Code dropped the notification (see main: channel handler; the"
+                " managed settings? the plugin allowlist?)"
+            ),
+        )
         return
-    _, first, tag = find_delivery(lines, "$alice-1")
-    u = first or channel_users[0]
+    report.ok("main: channel user line", "$alice-1 delivered")
     text = (content_text(u) or "").lstrip()
     report.check(
         "main: channel origin",
@@ -3379,6 +3498,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
         main_id = str(uuid.uuid4())
         session_ids.append(main_id)
         report.info("logs", str(cfg.logs))
+        report.running("main", "a fresh session with the channel, some ten turns")
         trace = Trace(cfg.logs / "main.jsonl")
         seen = check_main(report, trace, drive_main(cfg, trace, main_id))
         note_cost(report, "main", trace)
@@ -3387,6 +3507,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             report.skip("resume", "--skip")
             report.costs["resume"] = None
         else:
+            report.running("resume", "the main session resumed, then an unknown id")
             trace = Trace(cfg.logs / "resume.jsonl")
             check_resume(report, trace, drive_resume(cfg, trace, main_id))
             note_cost(report, "resume", trace)
@@ -3396,6 +3517,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
         else:
             sid = str(uuid.uuid4())
             session_ids.append(sid)
+            report.running("hook", "two turns over a whole book on the hook model")
             trace = Trace(cfg.logs / "hook.jsonl")
             check_hook(report, trace, drive_hook(cfg, trace, sid, managed_hook))
             note_cost(report, "hook", trace)
@@ -3405,6 +3527,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
         else:
             sid = str(uuid.uuid4())
             session_ids.append(sid)
+            report.running("fallback", "a model Claude Code does not find")
             trace = Trace(cfg.logs / "fallback.jsonl")
             check_fallback(report, trace, drive_fallback(cfg, trace, sid))
             note_cost(report, "fallback", trace)
@@ -3414,6 +3537,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
         else:
             sid = str(uuid.uuid4())
             session_ids.append(sid)
+            report.running("badkey", "a credential the API refuses")
             trace = Trace(cfg.logs / "badkey.jsonl")
             check_badkey(report, trace, drive_badkey(cfg, trace, sid))
             note_cost(report, "badkey", trace)
@@ -3510,16 +3634,6 @@ def main() -> int:
         type=float,
         default=240,
         help="seconds to wait for a turn to end (default: 240)",
-    )
-    parser.add_argument(
-        "--first-turn-delay",
-        type=float,
-        metavar="SECONDS",
-        help=(
-            "seconds the main run waits between the window check's answer and the first host"
-            " line, which the supervisor sends at once; for telling a race at Claude Code's"
-            " startup from a contract break (default: $SILTA_CHECK_FIRST_TURN_DELAY, else 0)"
-        ),
     )
     parser.add_argument(
         "--claude-arg",
