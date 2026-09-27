@@ -47,10 +47,7 @@
    cargo deb -p typst-cli
    sudo dpkg -i target/debian/typst-cli_0.15.1-1_amd64.deb  # replace with the .deb for your version
    ```
-9. Install Claude Code under the `claude` system user (already created when installing `silta_*.deb` above):
-   ```bash
-   sudo runuser -u claude -- bash -c "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash"
-   ```
+9. Install Claude Code following the procedure in [Updating Claude Code](#updating-claude-code) below.
 10. Edit `/etc/silta/siltad.toml` and fill in the assistant's Matrix `homeserver_url`, `user_id`, and `password`. You may also want to change the assistant's name in `/etc/silta/persona.md`.
 11. Add at least one assistant session with:
     ```bash
@@ -80,16 +77,28 @@
 
 ## Updating Claude Code
 
-Claude Code is installed under the `claude` user and never updates itself (`DISABLE_AUTOUPDATER=1` in the units). To update it:
+Claude Code is installed under the `claude` user and never updates itself. To install or update it:
 
-1. Install the new version as the `claude` user with the same command as in step 9 above.
-2. Check it against the contract the assistant relies on, with real turns in a session of its own that touches no assistant session. The check runs as the `silta-check` user and needs a credential of its own, laid out like a session's, in `/etc/silta/auth/check` (your subscription token from `claude setup-token` as `oauth-token`, or an API key as `api-key`, root-owned, mode 0600). Then:
+1. Back up the entire `/opt/claude` with the current version (if any) in case you need to revert to it.
+2. Install the new version as the `claude` user:
    ```bash
-   sudo systemctl start silta-contract-check
-   sudo journalctl -u silta-contract-check -b
+   sudo runuser -u claude -- bash -c "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash"
    ```
-   Every check prints one line; the last lines say whether the contract holds and whether the version is one the release was checked against (`TESTED_VERSIONS` in `crates/silta-session/src/contract.rs`). A run takes several minutes and makes some fifteen short turns on the configured model plus two turns on a cheap model, about a dollar at list prices.
-3. Restart the sessions onto the new version at a quiet moment, since a restart rewrites each session's context:
+   If the installed version differs from the one listed in [README](../README.md#project-status), proceed with checking it for compatibility.
+3. Make sure you have a credential installed for the contract checking session: exactly one of `oauth-token` (for subscription token from `claude setup-token`) or `api-key` (for Anthropic API key) under `/etc/silta/auth/check`:
+   ```
+   sudo install -m 0600 /dev/stdin /etc/silta/auth/check/oauth-token
+   # or
+   sudo install -m 0600 /dev/stdin /etc/silta/auth/check/api-key
+   ```
+4. Check the installed Claude Code version using `sudo systemctl start silta-contract-check`. A run takes several minutes and costs about a dollar at the API prices. You can inspect the exact tests failed with `sudo journalctl -b -u silta-contract-check`
+5. If the check fails, either revert to a previous version installed or install the version listed in `README` with:
+   ```
+   # replace <version> with the version needed; check the output to list the correct version
+   sudo runuser -u claude -- bash -c \
+       "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- <version>"
+   ```
+6. Restart the sessions onto the new version at a quiet moment:
    ```bash
    sudo systemctl restart silta-session.target
    ```

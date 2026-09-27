@@ -82,7 +82,7 @@ This allows the assistant to continue from the point where it was before the com
 
 Used daily by the author, his family, and friends since 7 September 2026. Built with Claude Code and the assistant itself. Expect things to break (and get fixed).
 
-The Claude Code version checked to work is 2.1.283. Newer versions may break the integration; `silta-contract-check` (shipped in the package, see [docs/deployment.md](docs/deployment.md#updating-claude-code)) checks a new version against everything Silta assumes of Claude Code before the sessions are moved onto it.
+The Claude Code version checked to work is 2.1.283. Newer versions may break the integration: check them first with `silta-contract-check` (see [Updating Claude Code](docs/deployment.md#updating-claude-code)) before using with real sessions.
 
 ## Known issues
 
