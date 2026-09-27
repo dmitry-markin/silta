@@ -89,7 +89,7 @@
    ./build-deb.sh
    sudo dpkg -i target/debian/silta_<version>_amd64.deb  # use the path printed by build-deb.sh above
    ```
-2. Update Claude Code to a tested version stated in [README](../README.md#project-status) following the procedure in [Updating Claude Code](#updating-claude-code) below.
+2. Update Claude Code to the tested version stated in [README](../README.md#project-status) following the procedure in [Updating Claude Code](#updating-claude-code) below.
 3. Restart the services:
    ```bash
    sudo systemctl restart siltad
@@ -136,7 +136,7 @@ You can try using the latest version of Claude Code after checking it for compat
    ```
    Paste the token, press Enter, then Ctrl-D.
 4. Check the installed Claude Code using `sudo systemctl start silta-contract-check`. A run takes several minutes and costs about a dollar at the API prices. The command returns when the run is over and fails if any check failed. See which checks failed with `sudo journalctl -b -u silta-contract-check`.
-5. If the check fails, either revert to a backed up version or install the version listed in [README](../README.md#project-status) following the procedure above.
+5. If the check fails, either revert to the backed-up version or install the version listed in [README](../README.md#project-status) following the procedure above.
 6. Restart the sessions onto the new version at a quiet moment:
    ```bash
    sudo systemctl restart silta-session.target
