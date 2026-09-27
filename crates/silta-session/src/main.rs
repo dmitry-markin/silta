@@ -113,13 +113,8 @@ fn parse_switch(s: &str) -> Result<bool, String> {
 }
 
 fn main() -> ExitCode {
-    let args = match Args::try_parse() {
-        Ok(args) => args,
-        Err(err) => {
-            let _ = err.print();
-            return ExitCode::from(2);
-        }
-    };
+    // clap prints and exits: 2 on an error, 0 for `--help` and `--version`.
+    let args = Args::parse();
     let auth = std::env::var_os("CREDENTIALS_DIRECTORY")
         .ok_or_else(|| "no credentials directory".to_owned())
         .and_then(|dir| Auth::load(&PathBuf::from(dir), args.gateway_url.as_deref()));

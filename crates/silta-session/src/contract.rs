@@ -7,8 +7,10 @@ use std::time::{Duration, Instant};
 
 use crate::stream::Event;
 
-/// The Claude Code versions whose output the supervisor was checked against; any other
-/// version gets a line at every start until the list is extended.
+/// The Claude Code versions whose output the supervisor was checked against
+/// (deploy/silta-contract-check does the checking); any other version gets a line at
+/// every `init` line, which Claude Code writes at every turn, until the list is
+/// extended. Once per turn is deliberate: the line stays visible in the journal.
 pub const TESTED_VERSIONS: &[&str] = &["2.1.281", "2.1.283"];
 
 /// The `model_fallback` triggers of the checked versions that mean the primary cannot
@@ -152,6 +154,29 @@ mod tests {
             t1 + 2 * CAP,
         );
         assert!(c.tick(t1 + 4 * CAP, CAP).is_none());
+    }
+
+    /// The contract checker (deploy/silta-contract-check) carries the same list, so that
+    /// a run on a VM, where there is no source, can say whether the version is pinned.
+    #[test]
+    fn the_contract_checker_carries_the_same_tested_versions() {
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/silta-contract-check"
+        );
+        let text = std::fs::read_to_string(script).expect("deploy/silta-contract-check");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("TESTED_VERSIONS = ["))
+            .expect("a TESTED_VERSIONS = [...] line in the checker");
+        let listed: Vec<&str> = line
+            .trim_start_matches("TESTED_VERSIONS = [")
+            .trim_end_matches(']')
+            .split(',')
+            .map(|v| v.trim().trim_matches('"'))
+            .filter(|v| !v.is_empty())
+            .collect();
+        assert_eq!(listed, TESTED_VERSIONS, "{line}");
     }
 
     #[test]

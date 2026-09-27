@@ -23,6 +23,13 @@ if [ -z "$name" ] || ! [[ "$name" =~ ^[a-z][a-z0-9-]*$ ]]; then
   echo "usage: silta-session-add <name>    (lowercase letters, digits and hyphens: the session name in siltad.toml)" >&2
   exit 2
 fi
+# The contract checker runs as silta-check with /var/lib/silta/check and
+# /etc/silta/auth/check (silta-contract-check.service): a mind named check would share
+# its user, its state and its credential.
+if [ "$name" = check ]; then
+  echo "silta-session-add: the name check is reserved for the contract checker (silta-check)" >&2
+  exit 2
+fi
 [ "$(id -u)" = 0 ] || { echo "silta-session-add: run as root" >&2; exit 1; }
 user="silta-$name"
 home="/var/lib/silta/$name"
@@ -62,30 +69,24 @@ echo "plugin silta-claude installed for $user in $workspace"
 
 cat <<EOT
 
-Give the daemon the session in /etc/silta/siltad.toml (a personal mind below; the hub
-is receive = "groups"):
+Add the new session to /etc/silta/siltad.toml (use `receive = "groups"` for a hub session):
 
 [[sessions]]
 name = "$name"
 receive = { people = ["<Person>"] }
 user = "$user"
 
-Give the mind its credential, exactly one file in $auth (the unit does not start
-without): the person's subscription token, from claude setup-token under their account,
+Install the session credential, exactly one file in $auth:
+the person's subscription token, from `claude setup-token` under their account,
 
-install -m 0600 /dev/stdin $auth/oauth-token
+sudo install -m 0600 /dev/stdin $auth/oauth-token
 
 or their Claude Console API key,
 
-install -m 0600 /dev/stdin $auth/api-key
-
-or their OpenRouter token (the endpoint is SILTA_GATEWAY_URL in the unit; Claude Code
-has no channels through a gateway, so this mind receives no messages):
-
-install -m 0600 /dev/stdin $auth/gateway-token
+sudo install -m 0600 /dev/stdin $auth/api-key
 
 After this is done:
 
-systemctl restart siltad
-systemctl enable --now "silta-session@$name.service"
+sudo systemctl restart siltad
+sudo systemctl enable --now "silta-session@$name.service"
 EOT

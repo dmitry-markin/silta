@@ -1,0 +1,67 @@
+# Checks the installed Claude Code against what silta-session and silta-claude assume of
+# it, with real turns on a session of its own: run it after a Claude Code update, before
+# the minds are restarted onto it (systemctl restart silta-session.target), and whenever
+# a mind's journal shows a `contract:` line.
+#
+#   systemctl start silta-contract-check
+#   journalctl -u silta-contract-check
+#
+# It runs as its own user, silta-check, with /var/lib/silta/check as HOME and workspace,
+# so no mind and no admin login is touched. The credential comes from
+# /etc/silta/auth/check, laid out like a mind's: exactly one file, oauth-token (from
+# claude setup-token) or api-key. The model, window and the other knobs are read from the
+# installed silta-session@.service; a run makes some fifteen short turns on that model and
+# two turns on a cheap model for the hook check. The traces of the last five runs stay under
+# /var/lib/silta/check/logs for /usr/lib/silta/silta-contract-check --replay.
+#
+# The hardening is the mind's, so that the bubblewrap sandbox and the hook run under the
+# same conditions; see silta-session@.service for the reasons behind each line.
+[Unit]
+Description=Silta contract check of the installed Claude Code
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=silta-check
+Group=silta-check
+StateDirectory=silta/check
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/silta/check
+Environment=HOME=/var/lib/silta/check
+Environment=CLAUDE_BIN=/opt/claude/.local/bin/claude
+Environment=SILTA_CLAUDE_BIN=/usr/bin/silta-claude
+Environment=DISABLE_AUTOUPDATER=1
+# Arguments added to every run of Claude Code, split like a shell command line, with
+# {logs} and {run} filled in (the checker's --claude-arg). Claude Code's own debug log of
+# each run, next to its trace, is a drop-in (systemctl edit silta-contract-check) with
+#   Environment="SILTA_CHECK_CLAUDE_ARGS=--debug-file {logs}/{run}-debug.log"
+# It may hold more of the conversation and the requests than the traces do; it stays in
+# the check's private state directory, pruned with the traces.
+Environment=SILTA_CHECK_CLAUDE_ARGS=
+LoadCredential=auth:/etc/silta/auth/check
+ExecStart=/usr/lib/silta/silta-contract-check
+TimeoutStartSec=40min
+MemoryMax=2G
+TasksMax=512
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=invisible
+RestrictNamespaces=user mnt pid net
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=~@reboot @swap @module @raw-io @obsolete @clock @debug @cpu-emulation
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native

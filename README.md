@@ -82,11 +82,11 @@ This allows the assistant to continue from the point where it was before the com
 
 Used daily by the author, his family, and friends since 7 September 2026. Built with Claude Code and the assistant itself. Expect things to break (and get fixed).
 
-The Claude Code version checked to work is 2.1.283. Newer versions may break the integration. API contract checker is coming.
+The Claude Code version tested to work is 2.1.283. Newer versions may break the integration: check them first with `silta-contract-check` (see [Updating Claude Code: Installing an untested version](docs/deployment.md#installing-an-untested-version)) before using them with real sessions.
 
 ## Known issues
 
-1. Claude Code evolves fast, breaking the integration. An automatic tool for checking the contract surface is planned.
+1. Claude Code evolves fast, breaking the integration. The contract checker catches a break before an update reaches the sessions, but only for what it checks.
 2. A running `Monitor` task blocks the graceful stop, so the supervisor waits out its timeout and restarts the session before compaction. Session continuity is unaffected.
 3. Support for third-party gateways (like OpenRouter) is implemented, but effectively dormant until Anthropic extends the Claude Code channels beta to them.
 4. Some sites block web fetch requests coming from datacenter IPs, making the research less efficient. Such sites are in the minority, and this can be worked around by using a residential IP for the network egress of the VM or session's Linux user.
