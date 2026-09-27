@@ -109,7 +109,7 @@ Claude Code is installed under the `claude` user and never updates itself. To in
 4. Check the installed Claude Code version using `sudo systemctl start silta-contract-check`. A run takes several minutes and costs about a dollar at the API prices. You can inspect the exact tests failed with `sudo journalctl -b -u silta-contract-check`
 5. If the check fails, either revert to a previous version installed or install the version listed in [README](../README.md#project-status) with:
    ```bash
-   # replace <version> with the version needed
+   # replace <version> with the version required
    sudo runuser -u claude -- bash -c \
        "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- <version>"
    ```
