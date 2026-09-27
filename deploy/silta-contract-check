@@ -81,11 +81,10 @@ dev/contract-check-format-requirements.txt and run by CI in a job of their own, 
 replay's.
 
 A full run makes some fifteen short turns on the configured model and, for the hook,
-two turns on a cheap model over a context of about 106 000 tokens, a public-domain novel sent
-whole (`--hook-model`; `--skip hook`
-leaves that run out); it takes several minutes and costs about a dollar. The report ends
-with the run's cost as Claude Code counted it, at list prices, which is notional on a
-subscription.
+two turns on a cheap model over a context of about 106 000 tokens (`--hook-model`;
+`--skip hook` leaves that run out); it takes several minutes and costs about a dollar.
+The report ends with the run's cost as Claude Code counted it, at list prices, which is
+notional on a subscription.
 """
 
 from __future__ import annotations
