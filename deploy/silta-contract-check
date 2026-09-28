@@ -68,8 +68,10 @@ directory, to be attached to an issue: the build is the commit silta-claude was 
 (`silta-claude --version`), the version Claude Code's. The report's first line names this
 script's own version (`--version`: the commit, with `-dirty` for uncommitted changes, when
 run from the repository; the package's version, which names the commit too, when
-installed), so a report is read against the checks that made it. A developer's run that
-passed keeps the report alone in its temporary state directory. The whole trace of each run (Claude
+installed, with the package's name), so a report is read against the checks that made it;
+under systemd the second line names the unit and the invocation, whose journal
+`journalctl _SYSTEMD_INVOCATION_ID=<id>` shows alone. A developer's run that passed keeps
+the report alone in its temporary state directory. The whole trace of each run (Claude
 Code's stdout and stderr, what was written to its stdin, what the fake daemon saw, the files
 looked at) is saved as one JSON line per event under the logs directory; `--replay DIR` runs
 the same assertions over a saved trace, for a failure to be examined offline and for CI to
@@ -850,7 +852,7 @@ def checker_version(repo: Optional[Path]) -> Optional[str]:
     repository, `git describe --tags --always --dirty` of the checkout, as the binaries'
     build-version.rs describes a commit plus a `-dirty` mark for uncommitted changes;
     installed, the version of the Debian package it came with, which names the commit too
-    (build-deb.sh)."""
+    (build-deb.sh), and the package's name: `0.5.1+22.g8c2d807 (Debian package silta)`."""
 
     def output(*cmd: str) -> Optional[str]:
         try:
@@ -867,7 +869,38 @@ def checker_version(repo: Optional[Path]) -> Optional[str]:
     owner = output("dpkg-query", "-S", str(Path(__file__).resolve()))
     if not owner:
         return None
-    return output("dpkg-query", "-W", "-f", "${Version}", owner.split(":")[0])
+    package = owner.split(":")[0]
+    version = output("dpkg-query", "-W", "-f", "${Version}", package)
+    return f"{version} (Debian package {package})" if version else None
+
+
+def systemd_unit() -> Optional[str]:
+    """The systemd service this script runs as, if it does, for the report's second line:
+    the unit, from the process's own cgroup, and the invocation, whose journal
+    `journalctl _SYSTEMD_INVOCATION_ID=<id>` shows alone. systemd sets INVOCATION_ID for a
+    service's processes, but a shell started by a service (a terminal's) inherits it, so
+    the cgroup must be the service itself and not a scope under it."""
+    invocation = os.environ.get("INVOCATION_ID")
+    if not invocation:
+        return None
+    try:
+        # `0::/system.slice/silta-contract-check.service`
+        cgroup = Path("/proc/self/cgroup").read_text()
+    except OSError:
+        return None
+    # The unified hierarchy's line, else (cgroup v1) systemd's own; the other controllers'
+    # lines may name other units.
+    lines = cgroup.splitlines()
+    line = next((x for x in lines if x.startswith("0::")), None) or next(
+        (x for x in lines if ":name=systemd:" in x), ""
+    )
+    unit = line.rsplit("/", 1)[-1]
+    if not unit.endswith(".service"):
+        return None
+    return (
+        f"systemd unit {unit}, invocation {invocation}"
+        f" (journalctl _SYSTEMD_INVOCATION_ID={invocation} shows this run alone)"
+    )
 
 
 def configure(args: argparse.Namespace, version: Optional[str]) -> Config:
@@ -3763,6 +3796,9 @@ def main() -> int:
         f" {cfg.plugin_bin}, model {cfg.model}, window {cfg.window},"
         f" {'the unit' if cfg.service else 'the developer'}'s login, state {cfg.state}"
     )
+    unit = systemd_unit()
+    if unit:
+        report.say(unit)
     version = None
     try:
         try:
