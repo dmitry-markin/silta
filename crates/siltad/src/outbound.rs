@@ -351,7 +351,7 @@ async fn do_react(daemon: &Daemon, session: &str, react: React) -> Result<OwnedE
         )
     })?;
     after_send(daemon, session, &room, react.more).await;
-    info!(dir = "out", session, room = %room.room_id(), %target, emoji = %react.emoji, more = react.more, "posted a reaction to the room");
+    info!(dir = "out", session, room = %room.room_id(), %target, more = react.more, "posted a reaction to the room");
     Ok(sent.response.event_id)
 }
 
@@ -491,7 +491,7 @@ async fn do_send_file(
             )
         })?;
     after_send(daemon, session, &room, cmd.more).await;
-    info!(dir = "out", session, room = %room.room_id(), name, bytes, mime = %mime, more = cmd.more, "uploaded a file to the room");
+    info!(dir = "out", session, room = %room.room_id(), bytes, mime = %mime, more = cmd.more, "uploaded a file to the room");
     Ok(response.event_id)
 }
 

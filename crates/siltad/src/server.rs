@@ -239,7 +239,7 @@ async fn handle(daemon: Shared, stream: UnixStream, cancel: CancellationToken) {
                 kind => daemon.execute(&session, Cmd { id: cmd.id, kind }).await,
             }),
             Ok(Incoming::Message(ClientMessage::File(header))) => {
-                debug!(dir = "out", session, transfer = %header.transfer, name = %header.name, size = header.size, "the session begins sending a file");
+                debug!(dir = "out", session, transfer = %header.transfer, size = header.size, "the session begins sending a file");
                 let transfer = header.transfer.clone();
                 if let Err(err) = receiver.begin(header).await {
                     warn!(

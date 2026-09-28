@@ -81,8 +81,8 @@ pub enum TransferError {
     Unknown(String),
     #[error("transfer {0} is already open")]
     Duplicate(String),
-    #[error("{name} is {size} bytes, over the {max} byte limit")]
-    TooLarge { name: String, size: u64, max: u64 },
+    #[error("{size} bytes, over the {max} byte limit")]
+    TooLarge { size: u64, max: u64 },
     #[error("transfer {transfer}: {received} bytes received for a declared size of {declared}")]
     SizeMismatch {
         transfer: String,
@@ -149,7 +149,6 @@ impl Receiver {
         }
         if header.size > self.max_bytes {
             return Err(TransferError::TooLarge {
-                name: header.name,
                 size: header.size,
                 max: self.max_bytes,
             });
