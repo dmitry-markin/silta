@@ -11,7 +11,7 @@ use silta_session::{rotation::Limits, Auth, Config};
 
 /// Runs one Silta session headless for silta-session@<name>.service.
 #[derive(Parser, Debug)]
-#[command(name = "silta-session", version)]
+#[command(name = "silta-session", version = env!("SILTA_VERSION"))]
 struct Args {
     /// The session name, the unit's instance name.
     #[arg(long, env = "SILTA_SESSION")]
@@ -115,6 +115,7 @@ fn parse_switch(s: &str) -> Result<bool, String> {
 fn main() -> ExitCode {
     // clap prints and exits: 2 on an error, 0 for `--help` and `--version`.
     let args = Args::parse();
+    eprintln!("silta-session {} starting", env!("SILTA_VERSION"));
     let auth = std::env::var_os("CREDENTIALS_DIRECTORY")
         .ok_or_else(|| "no credentials directory".to_owned())
         .and_then(|dir| Auth::load(&PathBuf::from(dir), args.gateway_url.as_deref()));

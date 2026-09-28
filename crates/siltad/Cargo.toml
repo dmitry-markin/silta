@@ -29,9 +29,11 @@ tracing-subscriber.workspace = true
 # because cargo-deb builds only the crate it is pointed at. Units and users are handled
 # by the hand-written scripts in debian/ rather than cargo-deb's systemd-units option,
 # which expects debhelper naming and would enable and start the session template.
-# Files under etc/ are conffiles automatically.
+# Files under etc/ are conffiles automatically. A native package (no `-1` revision): the
+# packaging lives and changes with the code, so a packaging fix is a new version too.
 [package.metadata.deb]
 name = "silta"
+revision = ""
 maintainer = "Dmitry Markin <dmitry@markin.tech>"
 copyright = "2026 Dmitry Markin"
 extended-description = """\

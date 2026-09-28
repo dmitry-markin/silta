@@ -24,7 +24,7 @@ use tracing_subscriber::EnvFilter;
 /// Claude Code channel plugin for the silta bridge. Reads its session name and the
 /// daemon socket from the environment; holds no Matrix credentials.
 #[derive(Parser, Debug)]
-#[command(name = "silta-claude", version)]
+#[command(name = "silta-claude", version = env!("SILTA_VERSION"))]
 struct Args {
     /// Session name announced to the daemon (which rooms this session owns is the
     /// daemon's decision).
@@ -130,7 +130,7 @@ async fn run(args: Args, parent: libc::pid_t) -> i32 {
         error!("cannot create the inbox {}: {err}", inbox.display());
         return 1;
     }
-    info!(session = %args.session, socket = %args.socket.display(), inbox = %inbox.display(), "silta-claude {} starting", env!("CARGO_PKG_VERSION"));
+    info!(session = %args.session, socket = %args.socket.display(), inbox = %inbox.display(), "silta-claude {} starting", env!("SILTA_VERSION"));
     let (events_tx, events_rx) = mpsc::channel(256);
     let (ready_tx, ready_rx) = oneshot::channel();
     let daemon = daemon::DaemonClient::start(

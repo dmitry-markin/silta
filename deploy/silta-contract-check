@@ -2,21 +2,22 @@
 """Checks a Claude Code build against the contract silta-session and silta-claude rely on.
 
 Claude Code has no stable API for a host like Silta: the supervisor speaks its stream-json
-protocol, the plugin speaks MCP with a Claude-specific channel extension, and the
-deployment rests on a set of flags, environment variables, managed settings and file
-locations. Every one of them can change between Claude Code releases, so before a
-release is pinned for the minds (`TESTED_VERSIONS` in crates/silta-session/src/contract.rs)
-this script runs it once against everything Silta assumes of it, with real turns.
+protocol, the plugin speaks MCP with a Claude-specific channel extension, and the deployment
+rests on a set of flags, environment variables, managed settings and file locations. Every
+one of them can change between Claude Code releases, so before a release is pinned for the
+minds (`TESTED_VERSIONS` in crates/silta-session/src/contract.rs) this script runs it once
+against everything Silta assumes of it, with real turns.
 
-It replaces nothing in the deployment and touches no mind: it runs Claude Code with a
-state directory, a workspace and a credential of its own, plays the daemon itself on a
-private socket, and lets the real silta-claude plugin connect to that. What it checks is
-organised by the piece of Silta that depends on it:
+It replaces nothing in the deployment and touches no mind: it runs Claude Code with a state
+directory, a workspace and a credential of its own, plays the daemon itself on a private
+socket, and lets the real silta-claude plugin connect to that. What it checks is organised
+by the piece of Silta that depends on it:
 
   the supervisor's launch     the command line of `silta-session` (lib.rs `run_once`), the
                               environment knobs Claude Code reads, stdin EOF as the graceful
                               stop (in the middle of a turn, and with a background command
                               running), `--resume` and its failure text, the transcript's path
+
   the supervisor's reading    every stream-json line `stream.rs` parses: `system init`,
                               main-line `assistant` usage and the `parent_tool_use_id` that
                               sets a subagent's lines apart, `user` and `result` lines with
@@ -24,9 +25,11 @@ organised by the piece of Silta that depends on it:
                               `/compact` exchange, `model_fallback`, the `<synthetic>` marker
                               of an API failure, the `control_response` of the window check
                               (at a fresh start and at a resume)
+
   the rotation                the handoff note written into the memory directory, the
                               PreCompact hook blocking an automatic compaction and leaving
                               the marker (deploy/silta-precompact-block)
+
   the channel                 the plugin installed from the marketplace as `silta-session-add`
                               does it, registered through `--channels`, its tools in the
                               session, the channel handler Claude Code attaches by the end of
@@ -36,6 +39,7 @@ organised by the piece of Silta that depends on it:
                               reaction), whether they arrive between turns, during a turn or
                               during `/compact`, and turns that answer them with the reply
                               tool
+
   the managed settings        the keys the deployment sets, and the effect of those a run can
                               see: the channel allowlist and the hook. That the Bash sandbox
                               hides the credential is not checked: a turn that looks for it
@@ -52,39 +56,53 @@ Two ways to run it:
                                 like a mind's (oauth-token or api-key). The model, window and
                                 the other knobs come from the installed
                                 silta-session@.service.
+
   on a developer's machine      deploy/silta-contract-check from the repository, with the
                                 developer's own `claude` and login: the state lives in a
-                                temporary directory, the marketplace is registered under the
-                                developer's ~/.claude for the duration of the run and removed
-                                afterwards (unless it was there already), and the run's
-                                transcript and MCP logs are removed at the end.
+                                temporary directory under /tmp, where only the logs (the
+                                traces and the report) stay at the end, for the system to
+                                clear; the marketplace is registered under the developer's
+                                ~/.claude for the duration of the run and removed afterwards
+                                (unless it was there already), and the run's transcript and
+                                MCP logs under ~/.claude are removed at the end.
 
 Every check prints one line, PASS / FAIL / SKIP / WARN / INFO (coloured on a terminal; with
 syslog priority prefixes under systemd, so `journalctl -p warning -u silta-contract-check`
 lists the failures and warnings alone; `--quiet` leaves PASS and INFO out), and the exit
-code is 0 when nothing failed. The whole trace of each run (Claude Code's stdout and stderr,
-what was written to its stdin, what the fake daemon saw, the files looked at) is saved as
-one JSON line per event under the logs directory; `--replay DIR` runs the same assertions
-over a saved trace, for a failure to be examined offline and for CI to keep the assertions
-themselves working (dev/contract-fixtures).
+code is 0 when nothing failed.
 
-In the code, every contract point is one `check_*` function whose docstring says what
-Claude Code must do, which part of Silta rests on it and what breaks otherwise; the
-`check_static`, `check_main`, `check_resume`, `check_hook`, `check_fallback` and
-`check_badkey` functions list them in the order the runs produce the evidence, and the
-`drive_*` functions next to them run Claude Code to produce it. The report line of a check
-carries the same words as the function's name, so a failure leads straight to its code.
+The same lines, as plain text and with PASS and INFO even under `--quiet`, are saved to
+`report-silta-<build>-claude-code-<version>.txt` in the logs directory, to be attached to an
+issue: the build is the commit silta-claude was built from (`silta-claude --version`), the
+version Claude Code's. The report's first line names this script's own version (`--version`:
+the commit, with `-dirty` for uncommitted changes, when run from the repository; the
+package's version, which names the commit too, when installed, with the package's name), so
+a report is read against the checks that made it; under systemd the second line names the
+unit and the invocation, whose journal `journalctl _SYSTEMD_INVOCATION_ID=<id>` shows alone.
+
+The whole trace of each run (Claude Code's stdout and stderr, what was written to its stdin,
+what the fake daemon saw, the files looked at) is saved as one JSON line per event under the
+logs directory; `--replay DIR` runs the same assertions over a saved trace, for a failure to
+be examined offline and for CI to keep the assertions themselves working
+(dev/contract-fixtures), and writes no report file.
+
+In the code, every contract point is one `check_*` function whose docstring says what Claude
+Code must do, which part of Silta rests on it and what breaks otherwise; the `check_static`,
+`check_main`, `check_resume`, `check_hook`, `check_fallback` and `check_badkey` functions
+list them in the order the runs produce the evidence, and the `drive_*` functions next to
+them run Claude Code to produce it. The report line of a check carries the same words as the
+function's name, so a failure leads straight to its code.
 
 The script is formatted with black at 100 columns and checked with pycodestyle (E203 and
 W503 ignored, as black's style needs), both pinned by hash in
 dev/contract-check-format-requirements.txt and run by CI in a job of their own, next to the
 replay's.
 
-A full run makes some fifteen short turns on the configured model and, for the hook,
-two turns on a cheap model over a context of about 106 000 tokens (`--hook-model`;
-`--skip hook` leaves that run out); it takes several minutes and costs about a dollar.
-The report ends with the run's cost as Claude Code counted it, at list prices, which is
-notional on a subscription.
+A full run makes some fifteen short turns on the configured model and, for the hook, two
+turns on a cheap model over a context of about 106 000 tokens (`--hook-model`; `--skip hook`
+leaves that run out); it takes several minutes and costs about a dollar. The report ends
+with the run's cost as Claude Code counted it, at list prices, which is notional on a
+subscription.
 """
 
 from __future__ import annotations
@@ -284,6 +302,12 @@ HANDLER_TURNS = 3
 # sent during a turn appears after the turn's running tool call.
 DELIVERY_WAIT = 60
 
+# How much of a run's plugin log its trace keeps: a whole run's log is some 7 500
+# characters, so a longer one went wrong somewhere; the head keeps the normal part and
+# where it turned, the tail how it ended.
+MCP_LOG_HEAD = 15_000
+MCP_LOG_TAIL = 5_000
+
 
 # --------------------------------------------------------------------------------------------------
 # The report: one line per check, the summary at the end.
@@ -294,6 +318,18 @@ ERR, WARNING, NOTICE, INFO = 3, 4, 5, 6
 # The terminal colour of each category of line (ANSI SGR codes: red, yellow, green, cyan).
 COLORS = {"FAIL": "31", "WARN": "33", "PASS": "32", "SKIP": "36"}
 PRIORITIES = {"FAIL": ERR, "WARN": WARNING}
+
+
+def is_journal(out: Any) -> bool:
+    """Whether `out` is the journal stream systemd connected a service's output to:
+    JOURNAL_STREAM names its device and inode, and is inherited by whatever the service
+    starts (a terminal's shells too), so the stream itself must match (systemd.exec(5))."""
+    try:
+        dev, ino = (int(x) for x in os.environ["JOURNAL_STREAM"].split(":"))
+        st = os.fstat(out.fileno())
+    except (KeyError, ValueError, OSError, AttributeError):
+        return False
+    return (st.st_dev, st.st_ino) == (dev, ino)
 
 
 def emit(
@@ -307,7 +343,7 @@ def emit(
     `[blob data]`."""
     out = out or sys.stdout
     tty = hasattr(out, "isatty") and out.isatty()
-    journal = not tty and "JOURNAL_STREAM" in os.environ
+    journal = not tty and is_journal(out)
     color = COLORS.get(category or "")
     for line in text.split("\n"):
         if journal:
@@ -330,22 +366,40 @@ class Report:
     # `--quiet`: PASS and INFO lines are counted but not printed.
     quiet: bool = False
     printed: int = 0
+    # Every line of the report as plain text, the ones --quiet leaves out too, for the
+    # report file (`save`).
+    lines: list[str] = field(default_factory=list)
+    # What the report file is named after: `silta-claude --version`'s build (the commit
+    # it was built from) and `claude --version`.
+    silta_version: Optional[str] = None
+    claude_version: Optional[str] = None
+
+    def say(
+        self,
+        text: str,
+        priority: int = INFO,
+        category: Optional[str] = None,
+        words: int = 1,
+        printed: bool = True,
+    ) -> None:
+        """A line of the report: printed with `emit` and kept for the report file."""
+        self.lines.extend(text.split("\n"))
+        if printed:
+            emit(text, priority, category, self.out, words)
 
     def _add(self, status: str, name: str, detail: str) -> None:
         self.checks.append((status, name, detail))
-        if self.quiet and status in ("PASS", "INFO"):
-            return
-        self.printed += 1
         line = f"{status:<5} {name}"
         if detail:
             line += f": {detail}"
-        emit(line, PRIORITIES.get(status, INFO), status, self.out)
+        printed = not (self.quiet and status in ("PASS", "INFO"))
+        self.printed += printed
+        self.say(line, PRIORITIES.get(status, INFO), status, printed=printed)
 
     def running(self, run: str, what: str) -> None:
         """A run starts: one line, not a check, so that a long run shows in the journal
         while it lasts (its checks print when it ends); left out by --quiet."""
-        if not self.quiet:
-            emit(f"RUN   {run}: {what}; its checks follow when it ends", out=self.out)
+        self.say(f"RUN   {run}: {what}; its checks follow when it ends", printed=not self.quiet)
 
     def ok(self, name: str, detail: str = "") -> None:
         self._add("PASS", name, detail)
@@ -378,47 +432,55 @@ class Report:
         for status, _, _ in self.checks:
             if status in counts:
                 counts[status] += 1
-        emit(
+        self.say(
             ("\n" if self.printed else "")
             + f"{counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped, "
             f"{counts['WARN']} warnings",
             NOTICE,
-            out=self.out,
         )
         if self.costs:
             parts = ", ".join(
                 f"{run} {'skipped' if usd is None else f'${usd:.2f}'}"
                 for run, usd in self.costs.items()
             )
-            emit(
+            self.say(
                 f"run cost: ${sum(usd or 0.0 for usd in self.costs.values()):.2f} ({parts})",
                 NOTICE,
-                out=self.out,
             )
         if self.failed():
-            emit("contract broken:", ERR, "FAIL", self.out, words=2)
+            self.say("contract broken:", ERR, "FAIL", words=2)
             for status, name, detail in self.checks:
                 if status == "FAIL":
-                    emit(f"  {name}: {detail}", ERR, out=self.out)
+                    self.say(f"  {name}: {detail}", ERR)
         elif version:
             if version in TESTED_VERSIONS:
-                emit(
+                self.say(
                     f"contract holds for Claude Code {version}, which is in TESTED_VERSIONS",
                     NOTICE,
                     "PASS",
-                    self.out,
                     words=2,
                 )
             else:
-                emit(
+                self.say(
                     f"contract holds for Claude Code {version}: add it to TESTED_VERSIONS in "
                     "crates/silta-session/src/contract.rs, to this script and to the README "
                     "(the supervisor prints a contract line at every turn until then)",
                     NOTICE,
                     "PASS",
-                    self.out,
                     words=2,
                 )
+
+    def save(self, directory: Path, version: Optional[str]) -> Path:
+        """Writes the report, every line as plain text, to
+        `report-silta-<build>-claude-code-<version>.txt` in `directory`, to be attached to
+        an issue. The build is the commit silta-claude was built from, as `git describe`
+        put it (its crate version without one); `version` is Claude Code's."""
+        parts = [self.silta_version, version or self.claude_version]
+        silta, claude = (re.sub(r"[^\w.+-]", "_", p or "unknown") for p in parts)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"report-silta-{silta}-claude-code-{claude}.txt"
+        path.write_text("".join(line + "\n" for line in self.lines))
+        return path
 
 
 # --------------------------------------------------------------------------------------------------
@@ -733,9 +795,13 @@ class Config:
     hook_model: str
     turn_timeout: float
     skip: set[str]
-    keep: bool
     # Added to every run of Claude Code, with {logs} and {run} filled in (--claude-arg).
     claude_args: list[str]
+    # This script's version (checker_version) and, run from the repository, the same
+    # `git describe` (with `-dirty`, as build-version.rs), to hold silta-claude's build
+    # against.
+    version: Optional[str]
+    commit: Optional[str]
 
 
 def parse_unit(path: Path) -> dict[str, str]:
@@ -784,7 +850,8 @@ def find_claude(explicit: Optional[str]) -> Path:
         "/opt/claude/.local/bin/claude",
     ]:
         if candidate and Path(candidate).exists():
-            return Path(candidate)
+            # Absolute: the runs start it from the workspace.
+            return Path(candidate).absolute()
     raise SystemExit("claude not found: pass --claude or set CLAUDE_BIN")
 
 
@@ -795,7 +862,8 @@ def find_plugin_bin(explicit: Optional[str], repo: Optional[Path]) -> Path:
     candidates += [shutil.which("silta-claude"), "/usr/bin/silta-claude"]
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
-            return Path(candidate)
+            # Absolute: Claude Code starts it from the workspace, through SILTA_CLAUDE_BIN.
+            return Path(candidate).absolute()
     raise SystemExit("silta-claude not found: pass --plugin-bin, set SILTA_CLAUDE_BIN, or build it")
 
 
@@ -807,7 +875,74 @@ def repo_root() -> Optional[Path]:
     return None
 
 
-def configure(args: argparse.Namespace) -> Config:
+def checker_version(repo: Optional[Path]) -> Optional[str]:
+    """This script's version (`--version`, the report's first line): run from the
+    repository, `git describe --tags --match 'v[0-9]*' --always --dirty` of the checkout, as
+    the binaries'
+    build-version.rs describes a commit plus a `-dirty` mark for uncommitted changes;
+    installed, the version of the Debian package it came with, which names the commit too
+    (build-deb.sh), and the package's name: `0.5.1+22.g8c2d807 (Debian package silta)`."""
+
+    def output(*cmd: str) -> Optional[str]:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if out.returncode != 0:
+            return None
+        return out.stdout.strip() or None
+
+    if repo:
+        return output(
+            "git",
+            "-C",
+            str(repo),
+            "describe",
+            "--tags",
+            "--match",
+            "v[0-9]*",
+            "--always",
+            "--dirty",
+        )
+    # `silta: /usr/lib/silta/silta-contract-check`
+    owner = output("dpkg-query", "-S", str(Path(__file__).resolve()))
+    if not owner:
+        return None
+    package = owner.split(":")[0]
+    version = output("dpkg-query", "-W", "-f", "${Version}", package)
+    return f"{version} (Debian package {package})" if version else None
+
+
+def systemd_unit() -> Optional[str]:
+    """The systemd service this script runs as, if it does, for the report's second line:
+    the unit, from the process's own cgroup, and the invocation, whose journal
+    `journalctl _SYSTEMD_INVOCATION_ID=<id>` shows alone. systemd sets INVOCATION_ID for a
+    service's processes, but a shell started by a service (a terminal's) inherits it, and
+    may share its cgroup, so stdout must be the service's journal stream too."""
+    invocation = os.environ.get("INVOCATION_ID")
+    if not invocation or not is_journal(sys.stdout):
+        return None
+    try:
+        # `0::/system.slice/silta-contract-check.service`
+        cgroup = Path("/proc/self/cgroup").read_text()
+    except OSError:
+        return None
+    # The unified hierarchy's line, else (cgroup v1) systemd's own; the other controllers'
+    # lines may name other units.
+    lines = cgroup.splitlines()
+    line = next((x for x in lines if x.startswith("0::")), None) or next(
+        (x for x in lines if ":name=systemd:" in x), ""
+    )
+    unit = line.rsplit("/", 1)[-1]
+    if not unit.endswith(".service"):
+        return None
+    return (
+        f"systemd unit {unit}, invocation {invocation}"
+        f" (journalctl _SYSTEMD_INVOCATION_ID={invocation} shows this run alone)"
+    )
+
+
+def configure(args: argparse.Namespace, version: Optional[str]) -> Config:
     if os.geteuid() == 0:
         raise SystemExit(
             "do not run as root: on a VM use `systemctl start silta-contract-check`, which runs it"
@@ -894,12 +1029,13 @@ def configure(args: argparse.Namespace) -> Config:
         hook_model=args.hook_model,
         turn_timeout=args.turn_timeout,
         skip=set(filter(None, (args.skip or "").split(","))),
-        keep=args.keep,
         claude_args=(
             args.claude_arg
             if args.claude_arg is not None
             else shlex.split(os.environ.get("SILTA_CHECK_CLAUDE_ARGS", ""))
         ),
+        version=version,
+        commit=version if repo else None,
     )
 
 
@@ -1331,10 +1467,50 @@ class ClaudeRun:
         )
         return code
 
-    def kill(self) -> None:
+    def finish(self) -> None:
+        """The run's end, however it came (in each drive_* function's `finally`): Claude
+        Code is killed if it still runs, and the plugin's log files this run added are
+        recorded."""
         if self.process.poll() is None:
             self.process.kill()
             self.process.wait()
+        self.record_mcp_logs()
+
+    def record_mcp_logs(self) -> None:
+        """The plugin's stderr as Claude Code keeps it, `<HOME>/.cache/claude-cli-nodejs/
+        <slug>/mcp-logs-plugin-<plugin>-<server>/`, one file per start (the plugin README;
+        the supervisor prunes the directory, state.rs `prune_cache`): the files of this run
+        alone, since the runs share the workspace and so the directory. cleanup_traces
+        removes the directory at the end."""
+        entry: dict[str, Any] = {
+            "type": "_file",
+            "name": "mcp-logs",
+            "run": self.name,
+            "path": str(self.mcp_logs),
+            "exists": self.mcp_logs.is_dir(),
+        }
+        if self.mcp_logs.is_dir():
+            files = sorted(
+                f
+                for f in self.mcp_logs.iterdir()
+                if f.is_file() and f.name not in self.mcp_logs_before
+            )
+            entry["files"] = [f.name for f in files]
+            entry["content"] = clip(
+                "".join(f.read_text(encoding="utf-8", errors="replace") for f in files),
+                MCP_LOG_HEAD,
+                MCP_LOG_TAIL,
+            )
+        self.trace.add(entry)
+
+
+def clip(text: str, head: int, tail: int) -> str:
+    """`text` as it is when it fits in `head + tail` characters, else its first `head` and
+    last `tail` characters around a note of what was cut."""
+    if len(text) <= head + tail:
+        return text
+    cut = len(text) - head - tail
+    return f"{text[:head]}\n[... {cut} characters cut ...]\n{text[-tail:]}"
 
 
 def record_file(trace: Trace, name: str, path: Path, **extra: Any) -> None:
@@ -1388,6 +1564,7 @@ def check_claude_version(report: Report, cfg: Config) -> Optional[str]:
         return None
     m = re.search(r"(\d+\.\d+\.\d+)", out.stdout)
     version = m.group(1) if m else None
+    report.claude_version = version
     report.check(
         "claude --version",
         version is not None,
@@ -1408,7 +1585,10 @@ def check_claude_version(report: Report, cfg: Config) -> Optional[str]:
 
 def check_plugin_binary(report: Report, cfg: Config) -> Optional[str]:
     """`silta-claude --version` works and exits 0: the binary the marketplace's .mcp.json
-    starts through `${SILTA_CLAUDE_BIN:-silta-claude}`. Returns its version."""
+    starts through `${SILTA_CLAUDE_BIN:-silta-claude}`. Returns its version; the commit it
+    was built from (like `0.5.1 (v0.5.1-19-g9c5140a)`, crates/build-version.rs) names the
+    report file. Run from the repository, a build from another commit than the checkout's
+    is a warning: the checkout's plugin is the one to check."""
     try:
         out = subprocess.run(
             [str(cfg.plugin_bin), "--version"], capture_output=True, text=True, timeout=30
@@ -1416,15 +1596,32 @@ def check_plugin_binary(report: Report, cfg: Config) -> Optional[str]:
     except (OSError, subprocess.TimeoutExpired) as e:
         report.fail("silta-claude --version", f"{cfg.plugin_bin}: {e}")
         return None
-    m = re.search(r"silta-claude (\d+\.\d+\.\d+)", out.stdout)
+    m = re.search(r"silta-claude (\d+\.\d+\.\d+)(?: \(([^)]+)\))?", out.stdout)
     plugin_version = m.group(1) if m and out.returncode == 0 else None
+    if plugin_version:
+        report.silta_version = m.group(2) or plugin_version
     report.check(
         "silta-claude --version",
         plugin_version is not None,
         f"{cfg.plugin_bin}: exit {out.returncode}, stdout {out.stdout.strip()!r}, stderr"
         f" {shorten(out.stderr)!r}",
-        f"{cfg.plugin_bin} is silta-claude {plugin_version}",
+        f"{cfg.plugin_bin} is {m.group(0) if m else None}",
     )
+    # Run from the repository, the checkout's plugin is the one to check; a binary from
+    # target/ may be older (and target/release is taken before target/debug).
+    if plugin_version and cfg.commit and m.group(2) != cfg.commit:
+        profile = cfg.plugin_bin.resolve().parent
+        rebuild = (
+            f"cargo build{' --release' if profile.name == 'release' else ''}"
+            if profile.parent.name == "target"
+            else "--plugin-bin with a build of the checkout"
+        )
+        report.warn(
+            "silta-claude build",
+            f"{cfg.plugin_bin} is built from {m.group(2) or 'no commit'}, this script runs"
+            f" from {cfg.commit}, another state of the tree: {rebuild} for the checkout's"
+            " plugin to be the one checked",
+        )
     return plugin_version
 
 
@@ -1738,6 +1935,20 @@ class PluginInstall:
                 shutil.rmtree(cache, ignore_errors=True)
 
 
+def clear_state(cfg: Config) -> None:
+    """A developer's run leaves only its logs in its temporary state directory: the
+    workspace, the system prompt and the rest go, the directory itself stays (0700 from
+    mkdtemp, so nothing can be put in its place); /tmp is the system's to clear."""
+    logs = cfg.logs.resolve()
+    for entry in cfg.state.iterdir():
+        if logs.is_relative_to(entry.resolve()):
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+
+
 def cleanup_traces(cfg: Config, session_ids: list[str]) -> None:
     """Claude Code kept the runs' transcripts and the memory they wrote under
     <HOME>/.claude/projects/<workspace slug>/ and the plugin's logs under
@@ -1766,33 +1977,6 @@ def clear_workspace_state(cfg: Config) -> None:
     for d in (cfg.home / ".claude/projects" / slug, cfg.home / ".cache/claude-cli-nodejs" / slug):
         if d.is_dir():
             shutil.rmtree(d, ignore_errors=True)
-
-
-def record_mcp_logs(trace: Trace, home: Path, transcript: Optional[Path]) -> None:
-    """Where Claude Code keeps the plugin's stderr: `<HOME>/.cache/claude-cli-nodejs/<slug>/
-    mcp-logs-plugin-<plugin>-<server>/`, one file per start (the plugin README; the
-    supervisor prunes the directory, state.rs `prune_cache`)."""
-    if transcript is None:
-        return
-    directory = (
-        home
-        / ".cache/claude-cli-nodejs"
-        / transcript.parent.name
-        / f"mcp-logs-plugin-{PLUGIN_NAME}-{SERVER_NAME}"
-    )
-    entry: dict[str, Any] = {
-        "type": "_file",
-        "name": "mcp-logs",
-        "path": str(directory),
-        "exists": directory.is_dir(),
-    }
-    if directory.is_dir():
-        files = sorted(f for f in directory.iterdir() if f.is_file())
-        entry["files"] = [f.name for f in files]
-        entry["content"] = "".join(f.read_text(encoding="utf-8", errors="replace") for f in files)[
-            :20000
-        ]
-    trace.add(entry)
 
 
 def find_transcript(home: Path, session_id: str) -> Optional[Path]:
@@ -1953,11 +2137,10 @@ def drive_main(cfg: Config, trace: Trace, session_id: str) -> dict:
                 "exists": transcript is not None,
             }
         )
-        record_mcp_logs(trace, cfg.home, transcript)
         record_file(trace, "marker", run.marker)
         return meta
     finally:
-        run.kill()
+        run.finish()
         daemon.close()
         trace.close()
 
@@ -2966,7 +3149,7 @@ def drive_resume(cfg: Config, trace: Trace, session_id: str) -> dict:
         run.close_stdin()
         run.wait_exit(cfg.stop_grace)
     finally:
-        run.kill()
+        run.finish()
         daemon.close()
     bogus = ClaudeRun(
         cfg, trace, "resume-bogus", model=cfg.model, session_id=None, resume=meta["bogus"]
@@ -2975,7 +3158,7 @@ def drive_resume(cfg: Config, trace: Trace, session_id: str) -> dict:
         bogus.send_user("Reply with the single word ok.")
         bogus.wait_exit(60)
     finally:
-        bogus.kill()
+        bogus.finish()
         trace.close()
     return meta
 
@@ -3148,7 +3331,7 @@ def drive_hook(cfg: Config, trace: Trace, session_id: str, managed_hook: bool) -
         record_file(trace, "marker", run.marker)
         return meta
     finally:
-        run.kill()
+        run.finish()
         daemon.close()
         trace.close()
 
@@ -3319,7 +3502,7 @@ def drive_fallback(cfg: Config, trace: Trace, session_id: str) -> dict:
         run.wait_exit(60)
         return meta
     finally:
-        run.kill()
+        run.finish()
         daemon.close()
         trace.close()
 
@@ -3390,7 +3573,7 @@ def drive_badkey(cfg: Config, trace: Trace, session_id: str) -> dict:
         run.wait_exit(60)
         return meta
     finally:
-        run.kill()
+        run.finish()
         daemon.close()
         trace.close()
 
@@ -3547,6 +3730,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
 
 
 def main() -> int:
+    checker = checker_version(repo_root())
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3647,11 +3831,6 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--keep",
-        action="store_true",
-        help="keep the temporary state directory of a developer-machine run",
-    )
-    parser.add_argument(
         "-q",
         "--quiet",
         action="store_true",
@@ -3665,26 +3844,40 @@ def main() -> int:
         metavar="DIR",
         help="run the assertions over the traces saved in DIR instead of running Claude Code",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {checker or 'unknown'}",
+        help="print this script's version (the commit, or the package's version) and exit",
+    )
     args = parser.parse_args()
     report = Report(quiet=args.quiet)
     if args.replay:
         version = replay(report, Path(args.replay))
         report.summary(version)
         return 1 if report.failed() else 0
-    cfg = configure(args)
-    emit(
-        f"contract check of {cfg.claude} with {cfg.plugin_bin}, model {cfg.model}, window"
-        f" {cfg.window}, {'the unit' if cfg.service else 'the developer'}'s login, state"
-        f" {cfg.state}"
+    cfg = configure(args, checker)
+    report.say(
+        f"silta-contract-check {cfg.version or 'unknown'}: contract check of {cfg.claude} with"
+        f" {cfg.plugin_bin}, model {cfg.model}, window {cfg.window},"
+        f" {'the unit' if cfg.service else 'the developer'}'s login, state {cfg.state}"
     )
+    unit = systemd_unit()
+    if unit:
+        report.say(unit)
+    version = None
     try:
         version = live(report, cfg)
+        report.summary(version)
     finally:
-        if not cfg.service and not cfg.keep and not report.failed():
-            shutil.rmtree(cfg.state, ignore_errors=True)
-        elif not cfg.service:
-            emit(f"state and traces kept in {cfg.state}")
-    report.summary(version)
+        # Also after a crash or ^C, with the lines so far; a failure to save warns and
+        # leaves the run's own outcome (its exception, its exit code) as it is.
+        try:
+            emit(f"report saved to {report.save(cfg.logs, version)}")
+        except OSError as e:
+            emit(f"report not saved to {cfg.logs}: {e}", WARNING, "WARN")
+        if not cfg.service:
+            clear_state(cfg)
     return 1 if report.failed() else 0
 
 

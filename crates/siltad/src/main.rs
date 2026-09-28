@@ -30,7 +30,7 @@ const DEFAULT_LOG_FILTER: &str = "info,\
 /// silta daemon: one Matrix device for the family assistant, one Unix socket for its
 /// sessions.
 #[derive(Parser, Debug)]
-#[command(name = "siltad", version)]
+#[command(name = "siltad", version = env!("SILTA_VERSION"))]
 struct Args {
     /// Configuration file.
     #[arg(long, default_value = "/etc/silta/siltad.toml")]
@@ -86,7 +86,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let users = resolve_users(&routing)?;
     info!(
         "siltad {} starting: {} people, {} sessions ({}), replay window {} s, attachments up to {} MB, inbox files kept {} days, owner alerts after {} s, socket {}",
-        env!("CARGO_PKG_VERSION"),
+        env!("SILTA_VERSION"),
         config.people.len(),
         config.sessions.len(),
         routing.session_users().map(|(s, u)| format!("{s} as {u}")).collect::<Vec<_>>().join(", "),
