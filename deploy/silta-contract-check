@@ -65,8 +65,11 @@ lists the failures and warnings alone; `--quiet` leaves PASS and INFO out), and 
 code is 0 when nothing failed. The same lines, as plain text and with PASS and INFO even
 under `--quiet`, are saved to `report-silta-<build>-claude-code-<version>.txt` in the logs
 directory, to be attached to an issue: the build is the commit silta-claude was built from
-(`silta-claude --version`), the version Claude Code's. A developer's run that passed keeps
-the report alone in its temporary state directory. The whole trace of each run (Claude
+(`silta-claude --version`), the version Claude Code's. The report's first line names this
+script's own version (`--version`: the commit, with `-dirty` for uncommitted changes, when
+run from the repository; the package's version, which names the commit too, when
+installed), so a report is read against the checks that made it. A developer's run that
+passed keeps the report alone in its temporary state directory. The whole trace of each run (Claude
 Code's stdout and stderr, what was written to its stdin, what the fake daemon saw, the files
 looked at) is saved as one JSON line per event under the logs directory; `--replay DIR` runs
 the same assertions over a saved trace, for a failure to be examined offline and for CI to
@@ -766,6 +769,10 @@ class Config:
     keep: bool
     # Added to every run of Claude Code, with {logs} and {run} filled in (--claude-arg).
     claude_args: list[str]
+    # This script's version (checker_version) and, run from the repository, its commit
+    # without the `-dirty` mark, to hold silta-claude's build against.
+    version: Optional[str]
+    commit: Optional[str]
 
 
 def parse_unit(path: Path) -> dict[str, str]:
@@ -837,7 +844,32 @@ def repo_root() -> Optional[Path]:
     return None
 
 
-def configure(args: argparse.Namespace) -> Config:
+def checker_version(repo: Optional[Path]) -> Optional[str]:
+    """This script's version (`--version`, the report's first line): run from the
+    repository, `git describe --tags --always --dirty` of the checkout, as the binaries'
+    build-version.rs describes a commit plus a `-dirty` mark for uncommitted changes;
+    installed, the version of the Debian package it came with, which names the commit too
+    (build-deb.sh)."""
+
+    def output(*cmd: str) -> Optional[str]:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if out.returncode != 0:
+            return None
+        return out.stdout.strip() or None
+
+    if repo:
+        return output("git", "-C", str(repo), "describe", "--tags", "--always", "--dirty")
+    # `silta: /usr/lib/silta/silta-contract-check`
+    owner = output("dpkg-query", "-S", str(Path(__file__).resolve()))
+    if not owner:
+        return None
+    return output("dpkg-query", "-W", "-f", "${Version}", owner.split(":")[0])
+
+
+def configure(args: argparse.Namespace, version: Optional[str]) -> Config:
     if os.geteuid() == 0:
         raise SystemExit(
             "do not run as root: on a VM use `systemctl start silta-contract-check`, which runs it"
@@ -930,6 +962,8 @@ def configure(args: argparse.Namespace) -> Config:
             if args.claude_arg is not None
             else shlex.split(os.environ.get("SILTA_CHECK_CLAUDE_ARGS", ""))
         ),
+        version=version,
+        commit=version.removesuffix("-dirty") if repo and version else None,
     )
 
 
@@ -1441,7 +1475,8 @@ def check_plugin_binary(report: Report, cfg: Config) -> Optional[str]:
     """`silta-claude --version` works and exits 0: the binary the marketplace's .mcp.json
     starts through `${SILTA_CLAUDE_BIN:-silta-claude}`. Returns its version; the commit it
     was built from (like `0.5.1 (v0.5.1-19-g9c5140a)`, crates/build-version.rs) names the
-    report file."""
+    report file. Run from the repository, a build from another commit than the checkout's
+    is a warning: the checkout's plugin is the one to check."""
     try:
         out = subprocess.run(
             [str(cfg.plugin_bin), "--version"], capture_output=True, text=True, timeout=30
@@ -1460,6 +1495,14 @@ def check_plugin_binary(report: Report, cfg: Config) -> Optional[str]:
         f" {shorten(out.stderr)!r}",
         f"{cfg.plugin_bin} is {m.group(0) if m else None}",
     )
+    # Run from the repository, the checkout's plugin is the one to check; a binary from
+    # target/ may be older.
+    if plugin_version and cfg.commit and m.group(2) != cfg.commit:
+        report.warn(
+            "silta-claude build",
+            f"built from {m.group(2) or 'no commit'}, this script runs from {cfg.commit}:"
+            " cargo build for the checkout's plugin to be the one checked",
+        )
     return plugin_version
 
 
@@ -3582,6 +3625,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
 
 
 def main() -> int:
+    checker = checker_version(repo_root())
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3700,17 +3744,23 @@ def main() -> int:
         metavar="DIR",
         help="run the assertions over the traces saved in DIR instead of running Claude Code",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {checker or 'unknown'}",
+        help="print this script's version (the commit, or the package's version) and exit",
+    )
     args = parser.parse_args()
     report = Report(quiet=args.quiet)
     if args.replay:
         version = replay(report, Path(args.replay))
         report.summary(version)
         return 1 if report.failed() else 0
-    cfg = configure(args)
+    cfg = configure(args, checker)
     report.say(
-        f"contract check of {cfg.claude} with {cfg.plugin_bin}, model {cfg.model}, window"
-        f" {cfg.window}, {'the unit' if cfg.service else 'the developer'}'s login, state"
-        f" {cfg.state}"
+        f"silta-contract-check {cfg.version or 'unknown'}: contract check of {cfg.claude} with"
+        f" {cfg.plugin_bin}, model {cfg.model}, window {cfg.window},"
+        f" {'the unit' if cfg.service else 'the developer'}'s login, state {cfg.state}"
     )
     version = None
     try:
