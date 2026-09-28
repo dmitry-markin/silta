@@ -769,8 +769,9 @@ class Config:
     keep: bool
     # Added to every run of Claude Code, with {logs} and {run} filled in (--claude-arg).
     claude_args: list[str]
-    # This script's version (checker_version) and, run from the repository, its commit
-    # without the `-dirty` mark, to hold silta-claude's build against.
+    # This script's version (checker_version) and, run from the repository, the same
+    # `git describe` (with `-dirty`, as build-version.rs), to hold silta-claude's build
+    # against.
     version: Optional[str]
     commit: Optional[str]
 
@@ -963,7 +964,7 @@ def configure(args: argparse.Namespace, version: Optional[str]) -> Config:
             else shlex.split(os.environ.get("SILTA_CHECK_CLAUDE_ARGS", ""))
         ),
         version=version,
-        commit=version.removesuffix("-dirty") if repo and version else None,
+        commit=version if repo else None,
     )
 
 
