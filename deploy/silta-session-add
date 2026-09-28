@@ -11,12 +11,12 @@
 # interrupted behind their back.
 #
 # Running it again for an existing mind reinstalls the plugin. That is rarely what is
-# needed: a session spawns the MCP server from ${SILTA_CLAUDE_BIN:-silta-claude} on PATH
-# at every start, so a new /usr/bin/silta-claude only needs a restart of the unit. Only
-# a change to the plugin's own marketplace files (.mcp.json above all) needs the
-# reinstall, because Claude Code copies those into the user's plugin cache at install
-# time and keeps running the copy. The reinstall takes effect when the operator restarts
-# the unit.
+# needed: a session spawns the MCP server from ${SILTA_CLAUDE_BIN:-silta-claude}, which
+# the unit sets, at every start, so a new /usr/lib/silta/silta-claude only needs a restart
+# of the unit. Only a change to the plugin's own marketplace files (.mcp.json above all)
+# needs the reinstall, because Claude Code copies those into the user's plugin cache at
+# install time and keeps running the copy. The reinstall takes effect when the operator
+# restarts the unit.
 set -euo pipefail
 name="${1:-}"
 if [ -z "$name" ] || ! [[ "$name" =~ ^[a-z][a-z0-9-]*$ ]]; then

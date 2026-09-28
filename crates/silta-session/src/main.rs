@@ -37,7 +37,7 @@ struct Args {
     #[arg(
         long,
         env = "SILTA_CLAUDE_BIN",
-        default_value = "/usr/bin/silta-claude"
+        default_value = "/usr/lib/silta/silta-claude"
     )]
     plugin_bin: PathBuf,
 

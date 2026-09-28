@@ -859,7 +859,7 @@ def find_plugin_bin(explicit: Optional[str], repo: Optional[Path]) -> Path:
     candidates = [explicit, os.environ.get("SILTA_CLAUDE_BIN")]
     if repo:
         candidates += [repo / "target/release/silta-claude", repo / "target/debug/silta-claude"]
-    candidates += [shutil.which("silta-claude"), "/usr/bin/silta-claude"]
+    candidates += [shutil.which("silta-claude"), "/usr/lib/silta/silta-claude"]
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
             # Absolute: Claude Code starts it from the workspace, through SILTA_CLAUDE_BIN.
@@ -3750,7 +3750,7 @@ def main() -> int:
         "--plugin-bin",
         help=(
             "the silta-claude binary (default: $SILTA_CLAUDE_BIN, the repository's target/,"
-            " silta-claude on PATH)"
+            " silta-claude on PATH, /usr/lib/silta/silta-claude)"
         ),
     )
     parser.add_argument(

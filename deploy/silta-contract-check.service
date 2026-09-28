@@ -30,7 +30,7 @@ StateDirectoryMode=0700
 WorkingDirectory=/var/lib/silta/check
 Environment=HOME=/var/lib/silta/check
 Environment=CLAUDE_BIN=/opt/claude/.local/bin/claude
-Environment=SILTA_CLAUDE_BIN=/usr/bin/silta-claude
+Environment=SILTA_CLAUDE_BIN=/usr/lib/silta/silta-claude
 Environment=DISABLE_AUTOUPDATER=1
 # Arguments added to every run of Claude Code, split like a shell command line, with
 # {logs} and {run} filled in (the checker's --claude-arg). Claude Code's own debug log of
