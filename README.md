@@ -1,6 +1,6 @@
 # Silta
 
-[![License Apache-2.0 OR MIT](https://img.shields.io/badge/License-Apache--2.0%20OR%20MIT-blue)](#license) [![crates.io](https://img.shields.io/crates/v/silta.svg)](https://crates.io/crates/silta)
+[![crates.io](https://img.shields.io/crates/v/silta.svg)](https://crates.io/crates/silta) [![CI](https://github.com/dmitry-markin/silta/actions/workflows/ci.yml/badge.svg)](https://github.com/dmitry-markin/silta/actions/workflows/ci.yml) [![License Apache-2.0 OR MIT](https://img.shields.io/badge/License-Apache--2.0%20OR%20MIT-blue)](#license)
 
 Family AI assistant that runs on Claude Code and speaks Matrix. Keeps its memory and the thread of a conversation across context limits, so it always stays the same assistant.
 
