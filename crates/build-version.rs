@@ -1,8 +1,10 @@
-//! The build script of siltad, silta-session and silta-claude (`build =` in their
-//! Cargo.toml): sets `SILTA_VERSION` to the crate's version and the commit it is built
-//! from, as `git describe --tags --always` prints it: like `0.5.1 (v0.5.1-19-g9c5140a)`,
-//! or `0.5.1 (v0.5.1)` on a tag. `--version` and the startup log lines print it, so a journal
-//! excerpt names its build; the contract checker names its report after the plugin's.
+//! The build script of siltad, silta-session and silta-claude, each linking it as its
+//! build.rs (a link and not `build =`, which cargo package refuses outside the crate; a
+//! packaged crate gets a copy): sets `SILTA_VERSION` to the crate's version and the commit
+//! it is built from, as `git describe --tags --always` prints it: like
+//! `0.5.1 (v0.5.1-19-g9c5140a)`, or `0.5.1 (v0.5.1)` on a tag. `--version` and the startup
+//! log lines print it, so a journal excerpt names its build; the contract checker names its
+//! report after the plugin's.
 //! Outside a git checkout (a source tarball) the version is the crate's alone.
 //!
 //! The script reruns when HEAD moves (a commit, a checkout) or a tag is added; an edit to
@@ -20,8 +22,8 @@ fn git(args: &[&str]) -> Option<String> {
 
 fn main() {
     let version = env!("CARGO_PKG_VERSION");
-    // Relative to the package being built, as the `build =` key.
-    println!("cargo:rerun-if-changed=../build-version.rs");
+    // The link; cargo follows it to this file's time.
+    println!("cargo:rerun-if-changed=build.rs");
     match git(&["describe", "--tags", "--always"]) {
         Some(describe) => {
             println!("cargo:rustc-env=SILTA_VERSION={version} ({describe})");
