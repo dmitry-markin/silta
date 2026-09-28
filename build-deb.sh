@@ -21,8 +21,9 @@ dirty=
 if [[ $(git describe --always --dirty 2>/dev/null) == *-dirty ]]; then
     dirty=.dirty
 fi
-if describe=$(git describe --tags --long 2>/dev/null); then
-    # v0.5.1-19-g9c5140a, split from the right: a tag may contain a hyphen.
+if describe=$(git describe --tags --long --match 'v[0-9]*' 2>/dev/null); then
+    # v0.5.1-19-g9c5140a (release tags only, as the binaries'), split from the right: a
+    # tag may contain a hyphen.
     hash=${describe##*-}
     rest=${describe%-*}
     count=${rest##*-}
@@ -33,7 +34,7 @@ if describe=$(git describe --tags --long 2>/dev/null); then
         deb_version=(--deb-version "$version~$count.$hash$dirty")
     fi
 elif hash=$(git rev-parse --short HEAD 2>/dev/null); then
-    # A checkout without tags (a shallow clone): the commit alone.
+    # A checkout without release tags (a shallow clone): the commit alone.
     deb_version=(--deb-version "$version+g$hash$dirty")
 fi
 cargo build --release --workspace

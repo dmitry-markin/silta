@@ -54,10 +54,12 @@ Two ways to run it:
                                 silta-session@.service.
   on a developer's machine      deploy/silta-contract-check from the repository, with the
                                 developer's own `claude` and login: the state lives in a
-                                temporary directory, the marketplace is registered under the
-                                developer's ~/.claude for the duration of the run and removed
-                                afterwards (unless it was there already), and the run's
-                                transcript and MCP logs are removed at the end.
+                                temporary directory under /tmp, kept with the traces and the
+                                report for the system to clear, the marketplace is registered
+                                under the developer's ~/.claude for the duration of the run
+                                and removed afterwards (unless it was there already), and the
+                                run's transcript and MCP logs under ~/.claude are removed at
+                                the end.
 
 Every check prints one line, PASS / FAIL / SKIP / WARN / INFO (coloured on a terminal; with
 syslog priority prefixes under systemd, so `journalctl -p warning -u silta-contract-check`
@@ -70,8 +72,7 @@ script's own version (`--version`: the commit, with `-dirty` for uncommitted cha
 run from the repository; the package's version, which names the commit too, when
 installed, with the package's name), so a report is read against the checks that made it;
 under systemd the second line names the unit and the invocation, whose journal
-`journalctl _SYSTEMD_INVOCATION_ID=<id>` shows alone. A developer's run that passed keeps
-the report alone in its temporary state directory. The whole trace of each run (Claude
+`journalctl _SYSTEMD_INVOCATION_ID=<id>` shows alone. The whole trace of each run (Claude
 Code's stdout and stderr, what was written to its stdin, what the fake daemon saw, the files
 looked at) is saved as one JSON line per event under the logs directory; `--replay DIR` runs
 the same assertions over a saved trace, for a failure to be examined offline and for CI to
@@ -305,6 +306,18 @@ COLORS = {"FAIL": "31", "WARN": "33", "PASS": "32", "SKIP": "36"}
 PRIORITIES = {"FAIL": ERR, "WARN": WARNING}
 
 
+def is_journal(out: Any) -> bool:
+    """Whether `out` is the journal stream systemd connected a service's output to:
+    JOURNAL_STREAM names its device and inode, and is inherited by whatever the service
+    starts (a terminal's shells too), so the stream itself must match (systemd.exec(5))."""
+    try:
+        dev, ino = (int(x) for x in os.environ["JOURNAL_STREAM"].split(":"))
+        st = os.fstat(out.fileno())
+    except (KeyError, ValueError, OSError, AttributeError):
+        return False
+    return (st.st_dev, st.st_ino) == (dev, ino)
+
+
 def emit(
     text: str, priority: int = INFO, category: Optional[str] = None, out: Any = None, words: int = 1
 ) -> None:
@@ -316,7 +329,7 @@ def emit(
     `[blob data]`."""
     out = out or sys.stdout
     tty = hasattr(out, "isatty") and out.isatty()
-    journal = not tty and "JOURNAL_STREAM" in os.environ
+    journal = not tty and is_journal(out)
     color = COLORS.get(category or "")
     for line in text.split("\n"):
         if journal:
@@ -768,7 +781,6 @@ class Config:
     hook_model: str
     turn_timeout: float
     skip: set[str]
-    keep: bool
     # Added to every run of Claude Code, with {logs} and {run} filled in (--claude-arg).
     claude_args: list[str]
     # This script's version (checker_version) and, run from the repository, the same
@@ -849,7 +861,8 @@ def repo_root() -> Optional[Path]:
 
 def checker_version(repo: Optional[Path]) -> Optional[str]:
     """This script's version (`--version`, the report's first line): run from the
-    repository, `git describe --tags --always --dirty` of the checkout, as the binaries'
+    repository, `git describe --tags --match 'v[0-9]*' --always --dirty` of the checkout, as
+    the binaries'
     build-version.rs describes a commit plus a `-dirty` mark for uncommitted changes;
     installed, the version of the Debian package it came with, which names the commit too
     (build-deb.sh), and the package's name: `0.5.1+22.g8c2d807 (Debian package silta)`."""
@@ -864,7 +877,17 @@ def checker_version(repo: Optional[Path]) -> Optional[str]:
         return out.stdout.strip() or None
 
     if repo:
-        return output("git", "-C", str(repo), "describe", "--tags", "--always", "--dirty")
+        return output(
+            "git",
+            "-C",
+            str(repo),
+            "describe",
+            "--tags",
+            "--match",
+            "v[0-9]*",
+            "--always",
+            "--dirty",
+        )
     # `silta: /usr/lib/silta/silta-contract-check`
     owner = output("dpkg-query", "-S", str(Path(__file__).resolve()))
     if not owner:
@@ -878,10 +901,10 @@ def systemd_unit() -> Optional[str]:
     """The systemd service this script runs as, if it does, for the report's second line:
     the unit, from the process's own cgroup, and the invocation, whose journal
     `journalctl _SYSTEMD_INVOCATION_ID=<id>` shows alone. systemd sets INVOCATION_ID for a
-    service's processes, but a shell started by a service (a terminal's) inherits it, so
-    the cgroup must be the service itself and not a scope under it."""
+    service's processes, but a shell started by a service (a terminal's) inherits it, and
+    may share its cgroup, so stdout must be the service's journal stream too."""
     invocation = os.environ.get("INVOCATION_ID")
-    if not invocation:
+    if not invocation or not is_journal(sys.stdout):
         return None
     try:
         # `0::/system.slice/silta-contract-check.service`
@@ -990,7 +1013,6 @@ def configure(args: argparse.Namespace, version: Optional[str]) -> Config:
         hook_model=args.hook_model,
         turn_timeout=args.turn_timeout,
         skip=set(filter(None, (args.skip or "").split(","))),
-        keep=args.keep,
         claude_args=(
             args.claude_arg
             if args.claude_arg is not None
@@ -1530,12 +1552,19 @@ def check_plugin_binary(report: Report, cfg: Config) -> Optional[str]:
         f"{cfg.plugin_bin} is {m.group(0) if m else None}",
     )
     # Run from the repository, the checkout's plugin is the one to check; a binary from
-    # target/ may be older.
+    # target/ may be older (and target/release is taken before target/debug).
     if plugin_version and cfg.commit and m.group(2) != cfg.commit:
+        profile = cfg.plugin_bin.resolve().parent
+        rebuild = (
+            f"cargo build{' --release' if profile.name == 'release' else ''}"
+            if profile.parent.name == "target"
+            else "--plugin-bin with a build of the checkout"
+        )
         report.warn(
             "silta-claude build",
-            f"built from {m.group(2) or 'no commit'}, this script runs from {cfg.commit}:"
-            " cargo build for the checkout's plugin to be the one checked",
+            f"{cfg.plugin_bin} is built from {m.group(2) or 'no commit'}, this script runs"
+            f" from {cfg.commit}, another state of the tree: {rebuild} for the checkout's"
+            " plugin to be the one checked",
         )
     return plugin_version
 
@@ -3760,11 +3789,6 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--keep",
-        action="store_true",
-        help="keep the temporary state directory of a developer-machine run",
-    )
-    parser.add_argument(
         "-q",
         "--quiet",
         action="store_true",
@@ -3801,18 +3825,17 @@ def main() -> int:
         report.say(unit)
     version = None
     try:
-        try:
-            version = live(report, cfg)
-        finally:
-            if not cfg.service and not cfg.keep and not report.failed():
-                shutil.rmtree(cfg.state, ignore_errors=True)
-            elif not cfg.service:
-                report.say(f"state and traces kept in {cfg.state}")
+        version = live(report, cfg)
         report.summary(version)
     finally:
-        # Also after a crash or ^C, with the lines so far. A developer's run that passed
-        # has had its state removed: the report comes back alone, at the same path.
-        emit(f"report saved to {report.save(cfg.logs, version)}")
+        # Also after a crash or ^C, with the lines so far; a failure to save warns and
+        # leaves the run's own outcome (its exception, its exit code) as it is.
+        try:
+            emit(f"report saved to {report.save(cfg.logs, version)}")
+        except OSError as e:
+            emit(f"report not saved to {cfg.logs}: {e}", WARNING, "WARN")
+        if not cfg.service:
+            emit(f"state and traces kept in {cfg.state}")
     return 1 if report.failed() else 0
 
 

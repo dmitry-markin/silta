@@ -1,16 +1,20 @@
 //! The build script of siltad, silta-session and silta-claude, each linking it as its
 //! build.rs (a link and not `build =`, which cargo package refuses outside the crate; a
 //! packaged crate gets a copy): sets `SILTA_VERSION` to the crate's version and the commit
-//! it is built from, as `git describe --tags --always --dirty` prints it: like
+//! it is built from, as `git describe --tags --match 'v[0-9]*' --always --dirty` prints it
+//! (release tags only, as build-deb.sh and the checker): like
 //! `0.5.1 (v0.5.1-19-g9c5140a)`, `0.5.1 (v0.5.1-19-g9c5140a-dirty)` with uncommitted
 //! changes, or `0.5.1 (v0.5.1)` on a tag. `--version` and the startup log lines print it,
 //! so a journal excerpt names its build; the contract checker names its report after the
-//! plugin's. Outside a git checkout (a source tarball) the version is the crate's alone.
+//! plugin's. Outside a silta checkout (a source tarball, or a crate unpacked inside some
+//! other repository, such as a home directory kept in git) the version is the crate's
+//! alone.
 //!
-//! The script reruns when HEAD moves (a commit, a checkout), a tag is added or a tracked
-//! file changes (which may make the tree dirty or clean again), so each of these rebuilds
-//! the three crates. A change only staged, such as `git add` of a new file, shows at the
-//! next rerun.
+//! The script reruns when HEAD moves (a commit, a checkout, a reset: HEAD's reflog, which
+//! a commit appends to even when `git gc` has packed the branch), a tag is added or a
+//! tracked file changes (which may make the tree dirty or clean again), so each of these
+//! rebuilds the three crates. A change only staged, such as `git add` of a new file, shows
+//! at the next rerun.
 
 use std::{path::Path, process::Command};
 
@@ -26,11 +30,18 @@ fn main() {
     let version = env!("CARGO_PKG_VERSION");
     // The link; cargo follows it to this file's time.
     println!("cargo:rerun-if-changed=build.rs");
-    match git(&["describe", "--tags", "--always", "--dirty"]) {
+    // Only a checkout that tracks this script is silta's.
+    let describe = git(&["ls-files", "--error-unmatch", "build.rs"]).and_then(|_| {
+        git(&[
+            "describe", "--tags", "--match", "v[0-9]*", "--always", "--dirty",
+        ])
+    });
+    match describe {
         Some(describe) => {
             println!("cargo:rustc-env=SILTA_VERSION={version} ({describe})");
             let mut watched = vec![
                 "HEAD".to_owned(),
+                "logs/HEAD".to_owned(),
                 "packed-refs".to_owned(),
                 "refs/tags".to_owned(),
             ];
