@@ -11,16 +11,21 @@
 # (0.5.1+19.g9c5140a.dirty, or 0.5.1+0.g6218eb5.dirty on the tag itself), which sorts
 # after the clean build of the same commit. Outside a git checkout the version is the
 # crate's alone. No `-1` revision: a native package (crates/siltad/Cargo.toml).
+
 set -euo pipefail
+
 cd "$(dirname "$0")"
+
 version=$(cargo pkgid -p siltad)
 version=${version##*[#@]}
 deb_version=()
+
 # `-dirty` as git describe marks it for the binaries (crates/build-version.rs).
 dirty=
 if [[ $(git describe --always --dirty 2>/dev/null) == *-dirty ]]; then
     dirty=.dirty
 fi
+
 if describe=$(git describe --tags --long --match 'v[0-9]*' 2>/dev/null); then
     # v0.5.1-19-g9c5140a (release tags only, as the binaries'), split from the right: a
     # tag may contain a hyphen.
@@ -37,5 +42,6 @@ elif hash=$(git rev-parse --short HEAD 2>/dev/null); then
     # A checkout without release tags (a shallow clone): the commit alone.
     deb_version=(--deb-version "$version+g$hash$dirty")
 fi
+
 cargo build --release --workspace
 cargo deb -p siltad --no-build "${deb_version[@]}" "$@"
