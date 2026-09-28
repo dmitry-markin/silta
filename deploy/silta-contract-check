@@ -2,21 +2,22 @@
 """Checks a Claude Code build against the contract silta-session and silta-claude rely on.
 
 Claude Code has no stable API for a host like Silta: the supervisor speaks its stream-json
-protocol, the plugin speaks MCP with a Claude-specific channel extension, and the
-deployment rests on a set of flags, environment variables, managed settings and file
-locations. Every one of them can change between Claude Code releases, so before a
-release is pinned for the minds (`TESTED_VERSIONS` in crates/silta-session/src/contract.rs)
-this script runs it once against everything Silta assumes of it, with real turns.
+protocol, the plugin speaks MCP with a Claude-specific channel extension, and the deployment
+rests on a set of flags, environment variables, managed settings and file locations. Every
+one of them can change between Claude Code releases, so before a release is pinned for the
+minds (`TESTED_VERSIONS` in crates/silta-session/src/contract.rs) this script runs it once
+against everything Silta assumes of it, with real turns.
 
-It replaces nothing in the deployment and touches no mind: it runs Claude Code with a
-state directory, a workspace and a credential of its own, plays the daemon itself on a
-private socket, and lets the real silta-claude plugin connect to that. What it checks is
-organised by the piece of Silta that depends on it:
+It replaces nothing in the deployment and touches no mind: it runs Claude Code with a state
+directory, a workspace and a credential of its own, plays the daemon itself on a private
+socket, and lets the real silta-claude plugin connect to that. What it checks is organised
+by the piece of Silta that depends on it:
 
   the supervisor's launch     the command line of `silta-session` (lib.rs `run_once`), the
                               environment knobs Claude Code reads, stdin EOF as the graceful
                               stop (in the middle of a turn, and with a background command
                               running), `--resume` and its failure text, the transcript's path
+
   the supervisor's reading    every stream-json line `stream.rs` parses: `system init`,
                               main-line `assistant` usage and the `parent_tool_use_id` that
                               sets a subagent's lines apart, `user` and `result` lines with
@@ -24,9 +25,11 @@ organised by the piece of Silta that depends on it:
                               `/compact` exchange, `model_fallback`, the `<synthetic>` marker
                               of an API failure, the `control_response` of the window check
                               (at a fresh start and at a resume)
+
   the rotation                the handoff note written into the memory directory, the
                               PreCompact hook blocking an automatic compaction and leaving
                               the marker (deploy/silta-precompact-block)
+
   the channel                 the plugin installed from the marketplace as `silta-session-add`
                               does it, registered through `--channels`, its tools in the
                               session, the channel handler Claude Code attaches by the end of
@@ -36,6 +39,7 @@ organised by the piece of Silta that depends on it:
                               reaction), whether they arrive between turns, during a turn or
                               during `/compact`, and turns that answer them with the reply
                               tool
+
   the managed settings        the keys the deployment sets, and the effect of those a run can
                               see: the channel allowlist and the hook. That the Bash sandbox
                               hides the credential is not checked: a turn that looks for it
@@ -52,6 +56,7 @@ Two ways to run it:
                                 like a mind's (oauth-token or api-key). The model, window and
                                 the other knobs come from the installed
                                 silta-session@.service.
+
   on a developer's machine      deploy/silta-contract-check from the repository, with the
                                 developer's own `claude` and login: the state lives in a
                                 temporary directory under /tmp, kept with the traces and the
@@ -64,37 +69,40 @@ Two ways to run it:
 Every check prints one line, PASS / FAIL / SKIP / WARN / INFO (coloured on a terminal; with
 syslog priority prefixes under systemd, so `journalctl -p warning -u silta-contract-check`
 lists the failures and warnings alone; `--quiet` leaves PASS and INFO out), and the exit
-code is 0 when nothing failed. The same lines, as plain text and with PASS and INFO even
-under `--quiet`, are saved to `report-silta-<build>-claude-code-<version>.txt` in the logs
-directory, to be attached to an issue: the build is the commit silta-claude was built from
-(`silta-claude --version`), the version Claude Code's. The report's first line names this
-script's own version (`--version`: the commit, with `-dirty` for uncommitted changes, when
-run from the repository; the package's version, which names the commit too, when
-installed, with the package's name), so a report is read against the checks that made it;
-under systemd the second line names the unit and the invocation, whose journal
-`journalctl _SYSTEMD_INVOCATION_ID=<id>` shows alone. The whole trace of each run (Claude
-Code's stdout and stderr, what was written to its stdin, what the fake daemon saw, the files
-looked at) is saved as one JSON line per event under the logs directory; `--replay DIR` runs
-the same assertions over a saved trace, for a failure to be examined offline and for CI to
-keep the assertions themselves working (dev/contract-fixtures), and writes no report file.
+code is 0 when nothing failed.
 
-In the code, every contract point is one `check_*` function whose docstring says what
-Claude Code must do, which part of Silta rests on it and what breaks otherwise; the
-`check_static`, `check_main`, `check_resume`, `check_hook`, `check_fallback` and
-`check_badkey` functions list them in the order the runs produce the evidence, and the
-`drive_*` functions next to them run Claude Code to produce it. The report line of a check
-carries the same words as the function's name, so a failure leads straight to its code.
+The same lines, as plain text and with PASS and INFO even under `--quiet`, are saved to
+`report-silta-<build>-claude-code-<version>.txt` in the logs directory, to be attached to an
+issue: the build is the commit silta-claude was built from (`silta-claude --version`), the
+version Claude Code's. The report's first line names this script's own version (`--version`:
+the commit, with `-dirty` for uncommitted changes, when run from the repository; the
+package's version, which names the commit too, when installed, with the package's name), so
+a report is read against the checks that made it; under systemd the second line names the
+unit and the invocation, whose journal `journalctl _SYSTEMD_INVOCATION_ID=<id>` shows alone.
+
+The whole trace of each run (Claude Code's stdout and stderr, what was written to its stdin,
+what the fake daemon saw, the files looked at) is saved as one JSON line per event under the
+logs directory; `--replay DIR` runs the same assertions over a saved trace, for a failure to
+be examined offline and for CI to keep the assertions themselves working
+(dev/contract-fixtures), and writes no report file.
+
+In the code, every contract point is one `check_*` function whose docstring says what Claude
+Code must do, which part of Silta rests on it and what breaks otherwise; the `check_static`,
+`check_main`, `check_resume`, `check_hook`, `check_fallback` and `check_badkey` functions
+list them in the order the runs produce the evidence, and the `drive_*` functions next to
+them run Claude Code to produce it. The report line of a check carries the same words as the
+function's name, so a failure leads straight to its code.
 
 The script is formatted with black at 100 columns and checked with pycodestyle (E203 and
 W503 ignored, as black's style needs), both pinned by hash in
 dev/contract-check-format-requirements.txt and run by CI in a job of their own, next to the
 replay's.
 
-A full run makes some fifteen short turns on the configured model and, for the hook,
-two turns on a cheap model over a context of about 106 000 tokens (`--hook-model`;
-`--skip hook` leaves that run out); it takes several minutes and costs about a dollar.
-The report ends with the run's cost as Claude Code counted it, at list prices, which is
-notional on a subscription.
+A full run makes some fifteen short turns on the configured model and, for the hook, two
+turns on a cheap model over a context of about 106 000 tokens (`--hook-model`; `--skip hook`
+leaves that run out); it takes several minutes and costs about a dollar. The report ends
+with the run's cost as Claude Code counted it, at list prices, which is notional on a
+subscription.
 """
 
 from __future__ import annotations
