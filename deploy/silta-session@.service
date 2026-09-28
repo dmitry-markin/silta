@@ -24,7 +24,7 @@ Environment=HOME=/var/lib/silta/%i
 Environment=SILTA_SESSION=%i
 Environment=SILTA_SOCKET=/run/siltad/siltad.sock
 Environment=SILTA_PERSONA=/etc/silta/persona.md
-Environment=SILTA_CLAUDE_BIN=/usr/bin/silta-claude
+Environment=SILTA_CLAUDE_BIN=/usr/lib/silta/silta-claude
 # How long silta-session waits for claude to finish its turn and exit after stdin is
 # closed, before killing it. Kept below `TimeoutStopSec` so the supervisor, not systemd,
 # is the one that ends the session.
