@@ -439,6 +439,7 @@ async fn do_send_file(
         Ok(max) => {
             let max = u64::from(max);
             if size > max {
+                warn!(dir = "out", session, room = %room.room_id(), transfer = %cmd.transfer, bytes = size, "file not uploaded: over the server's {} limit", human_size(max));
                 return Err(file_error(format!(
                     "{name} is {} and the server accepts at most {}",
                     human_size(size),
@@ -450,7 +451,10 @@ async fn do_send_file(
     }
     let data = tokio::fs::read(&received.path)
         .await
-        .map_err(|e| file_error(format!("cannot read the received file: {e}")))?;
+        .map_err(|e| {
+            warn!(dir = "out", session, room = %room.room_id(), transfer = %cmd.transfer, "file not uploaded: cannot read the received file: {e}");
+            file_error(format!("cannot read the received file: {e}"))
+        })?;
     let mime: mime_guess::Mime = received
         .header
         .mime
@@ -485,13 +489,14 @@ async fn do_send_file(
         .send_attachment(&name, &mime, data, config)
         .await
         .map_err(|e| {
+            warn!(dir = "out", session, room = %room.room_id(), transfer = %cmd.transfer, bytes, "file not uploaded: the upload failed: {e}");
             (
                 ResultError::SendFailed,
                 format!("sending {name} to {} failed: {e}", room.room_id()),
             )
         })?;
     after_send(daemon, session, &room, cmd.more).await;
-    info!(dir = "out", session, room = %room.room_id(), bytes, mime = %mime, more = cmd.more, "uploaded a file to the room");
+    info!(dir = "out", session, room = %room.room_id(), transfer = %cmd.transfer, bytes, mime = %mime, more = cmd.more, "uploaded a file to the room");
     Ok(response.event_id)
 }
 
