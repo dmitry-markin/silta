@@ -24,7 +24,7 @@ use tracing_subscriber::EnvFilter;
 /// Claude Code channel plugin for the silta bridge. Reads its session name and the
 /// daemon socket from the environment; holds no Matrix credentials.
 #[derive(Parser, Debug)]
-#[command(name = "silta-claude", version)]
+#[command(name = "silta-claude", version = env!("SILTA_VERSION"))]
 struct Args {
     /// Session name announced to the daemon (which rooms this session owns is the
     /// daemon's decision).

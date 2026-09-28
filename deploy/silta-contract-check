@@ -62,11 +62,15 @@ Two ways to run it:
 Every check prints one line, PASS / FAIL / SKIP / WARN / INFO (coloured on a terminal; with
 syslog priority prefixes under systemd, so `journalctl -p warning -u silta-contract-check`
 lists the failures and warnings alone; `--quiet` leaves PASS and INFO out), and the exit
-code is 0 when nothing failed. The whole trace of each run (Claude Code's stdout and stderr,
-what was written to its stdin, what the fake daemon saw, the files looked at) is saved as
-one JSON line per event under the logs directory; `--replay DIR` runs the same assertions
-over a saved trace, for a failure to be examined offline and for CI to keep the assertions
-themselves working (dev/contract-fixtures).
+code is 0 when nothing failed. The same lines, as plain text and with PASS and INFO even
+under `--quiet`, are saved to `report-silta-<build>-claude-code-<version>.txt` in the logs
+directory, to be attached to an issue: the build is the commit silta-claude was built from
+(`silta-claude --version`), the version Claude Code's. A developer's run that passed keeps
+the report alone in its temporary state directory. The whole trace of each run (Claude
+Code's stdout and stderr, what was written to its stdin, what the fake daemon saw, the files
+looked at) is saved as one JSON line per event under the logs directory; `--replay DIR` runs
+the same assertions over a saved trace, for a failure to be examined offline and for CI to
+keep the assertions themselves working (dev/contract-fixtures), and writes no report file.
 
 In the code, every contract point is one `check_*` function whose docstring says what
 Claude Code must do, which part of Silta rests on it and what breaks otherwise; the
@@ -330,22 +334,40 @@ class Report:
     # `--quiet`: PASS and INFO lines are counted but not printed.
     quiet: bool = False
     printed: int = 0
+    # Every line of the report as plain text, the ones --quiet leaves out too, for the
+    # report file (`save`).
+    lines: list[str] = field(default_factory=list)
+    # What the report file is named after: `silta-claude --version`'s build (the commit
+    # it was built from) and `claude --version`.
+    silta_version: Optional[str] = None
+    claude_version: Optional[str] = None
+
+    def say(
+        self,
+        text: str,
+        priority: int = INFO,
+        category: Optional[str] = None,
+        words: int = 1,
+        printed: bool = True,
+    ) -> None:
+        """A line of the report: printed with `emit` and kept for the report file."""
+        self.lines.extend(text.split("\n"))
+        if printed:
+            emit(text, priority, category, self.out, words)
 
     def _add(self, status: str, name: str, detail: str) -> None:
         self.checks.append((status, name, detail))
-        if self.quiet and status in ("PASS", "INFO"):
-            return
-        self.printed += 1
         line = f"{status:<5} {name}"
         if detail:
             line += f": {detail}"
-        emit(line, PRIORITIES.get(status, INFO), status, self.out)
+        printed = not (self.quiet and status in ("PASS", "INFO"))
+        self.printed += printed
+        self.say(line, PRIORITIES.get(status, INFO), status, printed=printed)
 
     def running(self, run: str, what: str) -> None:
         """A run starts: one line, not a check, so that a long run shows in the journal
         while it lasts (its checks print when it ends); left out by --quiet."""
-        if not self.quiet:
-            emit(f"RUN   {run}: {what}; its checks follow when it ends", out=self.out)
+        self.say(f"RUN   {run}: {what}; its checks follow when it ends", printed=not self.quiet)
 
     def ok(self, name: str, detail: str = "") -> None:
         self._add("PASS", name, detail)
@@ -378,47 +400,55 @@ class Report:
         for status, _, _ in self.checks:
             if status in counts:
                 counts[status] += 1
-        emit(
+        self.say(
             ("\n" if self.printed else "")
             + f"{counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped, "
             f"{counts['WARN']} warnings",
             NOTICE,
-            out=self.out,
         )
         if self.costs:
             parts = ", ".join(
                 f"{run} {'skipped' if usd is None else f'${usd:.2f}'}"
                 for run, usd in self.costs.items()
             )
-            emit(
+            self.say(
                 f"run cost: ${sum(usd or 0.0 for usd in self.costs.values()):.2f} ({parts})",
                 NOTICE,
-                out=self.out,
             )
         if self.failed():
-            emit("contract broken:", ERR, "FAIL", self.out, words=2)
+            self.say("contract broken:", ERR, "FAIL", words=2)
             for status, name, detail in self.checks:
                 if status == "FAIL":
-                    emit(f"  {name}: {detail}", ERR, out=self.out)
+                    self.say(f"  {name}: {detail}", ERR)
         elif version:
             if version in TESTED_VERSIONS:
-                emit(
+                self.say(
                     f"contract holds for Claude Code {version}, which is in TESTED_VERSIONS",
                     NOTICE,
                     "PASS",
-                    self.out,
                     words=2,
                 )
             else:
-                emit(
+                self.say(
                     f"contract holds for Claude Code {version}: add it to TESTED_VERSIONS in "
                     "crates/silta-session/src/contract.rs, to this script and to the README "
                     "(the supervisor prints a contract line at every turn until then)",
                     NOTICE,
                     "PASS",
-                    self.out,
                     words=2,
                 )
+
+    def save(self, directory: Path, version: Optional[str]) -> Path:
+        """Writes the report, every line as plain text, to
+        `report-silta-<build>-claude-code-<version>.txt` in `directory`, to be attached to
+        an issue. The build is the commit silta-claude was built from, as `git describe`
+        put it (its crate version without one); `version` is Claude Code's."""
+        parts = [self.silta_version, version or self.claude_version]
+        silta, claude = (re.sub(r"[^\w.+-]", "_", p or "unknown") for p in parts)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"report-silta-{silta}-claude-code-{claude}.txt"
+        path.write_text("".join(line + "\n" for line in self.lines))
+        return path
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1388,6 +1418,7 @@ def check_claude_version(report: Report, cfg: Config) -> Optional[str]:
         return None
     m = re.search(r"(\d+\.\d+\.\d+)", out.stdout)
     version = m.group(1) if m else None
+    report.claude_version = version
     report.check(
         "claude --version",
         version is not None,
@@ -1408,7 +1439,8 @@ def check_claude_version(report: Report, cfg: Config) -> Optional[str]:
 
 def check_plugin_binary(report: Report, cfg: Config) -> Optional[str]:
     """`silta-claude --version` works and exits 0: the binary the marketplace's .mcp.json
-    starts through `${SILTA_CLAUDE_BIN:-silta-claude}`. Returns its version."""
+    starts through `${SILTA_CLAUDE_BIN:-silta-claude}`. Returns its version; the commit it
+    was built from (`0.5.1 (v0.5.1-19-g9c5140a)`, build.rs) names the report file."""
     try:
         out = subprocess.run(
             [str(cfg.plugin_bin), "--version"], capture_output=True, text=True, timeout=30
@@ -1416,14 +1448,16 @@ def check_plugin_binary(report: Report, cfg: Config) -> Optional[str]:
     except (OSError, subprocess.TimeoutExpired) as e:
         report.fail("silta-claude --version", f"{cfg.plugin_bin}: {e}")
         return None
-    m = re.search(r"silta-claude (\d+\.\d+\.\d+)", out.stdout)
+    m = re.search(r"silta-claude (\d+\.\d+\.\d+)(?: \(([^)]+)\))?", out.stdout)
     plugin_version = m.group(1) if m and out.returncode == 0 else None
+    if plugin_version:
+        report.silta_version = m.group(2) or plugin_version
     report.check(
         "silta-claude --version",
         plugin_version is not None,
         f"{cfg.plugin_bin}: exit {out.returncode}, stdout {out.stdout.strip()!r}, stderr"
         f" {shorten(out.stderr)!r}",
-        f"{cfg.plugin_bin} is silta-claude {plugin_version}",
+        f"{cfg.plugin_bin} is {m.group(0) if m else None}",
     )
     return plugin_version
 
@@ -3672,19 +3706,25 @@ def main() -> int:
         report.summary(version)
         return 1 if report.failed() else 0
     cfg = configure(args)
-    emit(
+    report.say(
         f"contract check of {cfg.claude} with {cfg.plugin_bin}, model {cfg.model}, window"
         f" {cfg.window}, {'the unit' if cfg.service else 'the developer'}'s login, state"
         f" {cfg.state}"
     )
+    version = None
     try:
-        version = live(report, cfg)
+        try:
+            version = live(report, cfg)
+        finally:
+            if not cfg.service and not cfg.keep and not report.failed():
+                shutil.rmtree(cfg.state, ignore_errors=True)
+            elif not cfg.service:
+                report.say(f"state and traces kept in {cfg.state}")
+        report.summary(version)
     finally:
-        if not cfg.service and not cfg.keep and not report.failed():
-            shutil.rmtree(cfg.state, ignore_errors=True)
-        elif not cfg.service:
-            emit(f"state and traces kept in {cfg.state}")
-    report.summary(version)
+        # Also after a crash or ^C, with the lines so far. A developer's run that passed
+        # has had its state removed: the report comes back alone, at the same path.
+        emit(f"report saved to {report.save(cfg.logs, version)}")
     return 1 if report.failed() else 0
 
 
