@@ -31,7 +31,7 @@ Everything in the agent's context is sent to the model provider and is retained 
 1. Matrix IDs of the users and of the assistant are not intentionally forwarded to the agent (user names from the config are used instead to identify people), but can reach the context through side channels. Mentions in the rooms and error messages from Matrix SDK returned as tool call errors might carry real user IDs.
 2. The agent sees real room IDs, including the homeserver's server name for rooms older than version 12. The server's name and URL might still reach the context via tool call errors coming from Matrix SDK.
 3. Messages are decrypted by `siltad`. Claude Code keeps the full session transcript, the memory notes and downloaded attachments unencrypted on the VM's disk.
-4. No user or assistant messages reach the journal log, but message sizes and attachment filenames are logged.
+4. No user or assistant messages reach the journal: only the sizes of messages and attachments are logged, never their content or filenames.
 
 ## Architecture overview
 
