@@ -278,6 +278,8 @@ async fn fetch_attachment(daemon: &Daemon, message: &mut Event, media: Media) {
         ..
     } = media;
     let max = daemon.spool.max_bytes;
+    // One attachment per Matrix message, so the transfer id is the event id.
+    let transfer = format!("{}-1", safe_id(&message.event_id));
     let describe = |detail: &str| -> String {
         let size = size
             .map(|s| format!(", {}", human_size(s)))
@@ -285,7 +287,7 @@ async fn fetch_attachment(daemon: &Daemon, message: &mut Event, media: Media) {
         format!("[attachment \"{name}\" ({mime}{size}) {detail}]")
     };
     if size.is_some_and(|s| s > max) {
-        info!(dir = "in", room = %message.room_id, name, "attachment not received: over the {} limit", human_size(max));
+        info!(dir = "in", room = %message.room_id, transfer, "attachment not received: over the {} limit", human_size(max));
         note(
             message,
             describe(&format!(
@@ -295,8 +297,6 @@ async fn fetch_attachment(daemon: &Daemon, message: &mut Event, media: Media) {
         );
         return;
     }
-    // One attachment per Matrix message, so the transfer id is the event id.
-    let transfer = format!("{}-1", safe_id(&message.event_id));
     let path = daemon.spool.inbox_path(&transfer);
     match timeout(
         DOWNLOAD_TIMEOUT,
@@ -305,7 +305,7 @@ async fn fetch_attachment(daemon: &Daemon, message: &mut Event, media: Media) {
     .await
     {
         Ok(Ok(bytes)) => {
-            info!(dir = "in", room = %message.room_id, name, bytes, "received an attachment into the spool as {transfer}");
+            info!(dir = "in", room = %message.room_id, transfer, bytes, "received an attachment into the spool");
             message.attachments.push(Attachment {
                 transfer,
                 name,
@@ -314,7 +314,7 @@ async fn fetch_attachment(daemon: &Daemon, message: &mut Event, media: Media) {
             });
         }
         Ok(Err(DownloadError::TooLarge(bytes))) => {
-            info!(dir = "in", room = %message.room_id, name, bytes, "attachment not received: over the {} limit", human_size(max));
+            info!(dir = "in", room = %message.room_id, transfer, bytes, "attachment not received: over the {} limit", human_size(max));
             note(
                 message,
                 describe(&format!(
@@ -325,14 +325,14 @@ async fn fetch_attachment(daemon: &Daemon, message: &mut Event, media: Media) {
             );
         }
         Ok(Err(DownloadError::Failed(err))) => {
-            warn!(dir = "in", room = %message.room_id, name, "attachment not received: the download failed: {err:#}");
+            warn!(dir = "in", room = %message.room_id, transfer, "attachment not received: the download failed: {err:#}");
             note(
                 message,
                 describe(&format!("could not be downloaded: {err}")),
             );
         }
         Err(_) => {
-            warn!(dir = "in", room = %message.room_id, name, "attachment not received: the download timed out after {DOWNLOAD_TIMEOUT:?}");
+            warn!(dir = "in", room = %message.room_id, transfer, "attachment not received: the download timed out after {DOWNLOAD_TIMEOUT:?}");
             note(message, describe("could not be downloaded: timed out"));
         }
     }
