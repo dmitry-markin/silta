@@ -130,7 +130,7 @@ async fn run(args: Args, parent: libc::pid_t) -> i32 {
         error!("cannot create the inbox {}: {err}", inbox.display());
         return 1;
     }
-    info!(session = %args.session, socket = %args.socket.display(), inbox = %inbox.display(), "silta-claude {} starting", env!("CARGO_PKG_VERSION"));
+    info!(session = %args.session, socket = %args.socket.display(), inbox = %inbox.display(), "silta-claude {} starting", env!("SILTA_VERSION"));
     let (events_tx, events_rx) = mpsc::channel(256);
     let (ready_tx, ready_rx) = oneshot::channel();
     let daemon = daemon::DaemonClient::start(

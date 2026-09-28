@@ -1440,7 +1440,8 @@ def check_claude_version(report: Report, cfg: Config) -> Optional[str]:
 def check_plugin_binary(report: Report, cfg: Config) -> Optional[str]:
     """`silta-claude --version` works and exits 0: the binary the marketplace's .mcp.json
     starts through `${SILTA_CLAUDE_BIN:-silta-claude}`. Returns its version; the commit it
-    was built from (`0.5.1 (v0.5.1-19-g9c5140a)`, build.rs) names the report file."""
+    was built from (like `0.5.1 (v0.5.1-19-g9c5140a)`, crates/build-version.rs) names the
+    report file."""
     try:
         out = subprocess.run(
             [str(cfg.plugin_bin), "--version"], capture_output=True, text=True, timeout=30
