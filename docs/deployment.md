@@ -154,11 +154,11 @@ A `silta-session` unit that exited with status 79 (`sudo systemctl status silta-
 
 ### Recovering a session if the request was flagged
 
-High-risk requests on cyber and bio topics may be flagged and refused by the model provider. In this case Claude Code would noramally downgrade the model to a weaker one for the rest of the session. Because running a session with a weaker model damages user experience, falling back to a weaker model is disabled. Such a session will likely keep refusing and stop responding to user messages. The person with the `role = "owner"` will receive the silent session alert in this case as usual.
+High-risk requests on cyber and bio topics may be flagged and refused by the model provider. In this case Claude Code would normally downgrade the model to a weaker one for the rest of the session. Because running a session with a weaker model damages the user experience, falling back to a weaker model is disabled. Such a session will likely keep refusing and stop responding to user messages. The person with the `role = "owner"` will receive the silent session alert in this case as usual.
 
 The following procedure might allow resuming the session with the original model. Replace `<name>` with the session name from `siltad.toml`.
 
-1. Set a model to a weaker one in a drop-in unit with `sudo systemctl edit silta-session@<name>`:
+1. Set the model to a weaker one in a drop-in unit with `sudo systemctl edit silta-session@<name>`:
    ```
    [Service]
    Environment=SILTA_MODEL=claude-opus-5
@@ -171,7 +171,7 @@ The following procedure might allow resuming the session with the original model
    ```
 3. Wait for the compaction step to finish (see the journal), stop the session with `sudo systemctl stop silta-session@<name>`, remove the drop-in with the model override using `sudo systemctl revert silta-session@<name>` (edit instead if you set other overrides in the drop-in), then issue `sudo systemctl daemon-reload`.
 4. Start the session again with the original model: `sudo systemctl start silta-session@<name>`.
-5. If the original model refuses again after step 4, the refused exchange still in the compaction summary is the one flagged. Keep the session on the fallback model until enough conversation has passed for it to leave the summary's message tail (about a hundred messages), then repeat the procedure. Alternatively, remove the session ID file `/var/lib/silta/<user>/session-id` and let `silta-session` start a fresh session. The workspace files and memory notes, including the last handoff note, are kept, but the conversation itself is not: the assistant starts from its notes rather than from the chat history.
+5. If the original model refuses again after step 4, the refused exchange still in the compaction summary is what triggers it. Keep the session on the weaker model until enough conversation has passed for it to leave the summary's message tail (about a hundred messages), then repeat the procedure. Alternatively, remove the session ID file `/var/lib/silta/<name>/session-id` and let `silta-session` start a fresh session. The workspace files and memory notes, including the last handoff note, are kept, but the conversation itself is not: the assistant starts from its notes rather than from the chat history.
 
 ### Checking the Claude Code contract
 
