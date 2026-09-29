@@ -30,10 +30,24 @@
   "feedbackDrafts": "off",
   "attribution": { "sessionUrl": false },
   "remoteControl": { "shareHostProfile": "off" },
+  "claudeMdExcludes": [
+    "/var/lib/silta/*/**/.claude/rules/**",
+    "/var/lib/silta/*/**/AGENTS.md",
+    "/var/lib/silta/*/**/CLAUDE.local.md",
+    "/var/lib/silta/*/**/CLAUDE.md"
+  ],
   "sandbox": {
     "enabled": true,
     "failIfUnavailable": true,
     "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyWrite": [
+        "~/workspace/.claude",
+        "~/workspace/AGENTS.md",
+        "~/workspace/CLAUDE.local.md",
+        "~/workspace/CLAUDE.md"
+      ]
+    },
     "credentials": {
       "envVars": [
         { "name": "CLAUDE_CODE_OAUTH_TOKEN", "mode": "deny" },

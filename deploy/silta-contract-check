@@ -213,7 +213,9 @@ MANAGED_KEYS = {
     "allowedMcpServers": "the plugin binary's allowlist entry",
     "disableSideloadFlags": "command-line flags cannot bring in settings or MCP servers",
     "strictKnownMarketplaces": "the packaged marketplace is the only one a mind may add",
-    "sandbox": "the bubblewrap sandbox for Bash, which protects the credential",
+    "sandbox": "the bubblewrap sandbox for Bash, which protects the credential and the"
+    " instruction files at the top of the workspace",
+    "claudeMdExcludes": "instruction files a mind writes under its home are never loaded",
     "permissions": "the Edit deny rules that keep the mind out of the harness's files and the"
     " instruction files Claude Code loads, and the allow rules that keep the channel tools"
     " and crons out of the auto mode classifier",
