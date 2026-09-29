@@ -214,7 +214,8 @@ MANAGED_KEYS = {
     "disableSideloadFlags": "command-line flags cannot bring in settings or MCP servers",
     "strictKnownMarketplaces": "the packaged marketplace is the only one a mind may add",
     "sandbox": "the bubblewrap sandbox for Bash, which protects the credential",
-    "permissions": "the Edit deny rules that keep the mind out of the harness's files",
+    "permissions": "the Edit deny rules that keep the mind out of the harness's files, and the"
+    " allow rules that keep the channel tools and crons out of the auto mode classifier",
     "disableRemoteControl": "no remote control of a mind's session",
     "disableSkillShellExecution": "skills run no shell commands of their own",
     "disableClaudeAiConnectors": "no claude.ai connectors in a mind's session",

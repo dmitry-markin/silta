@@ -45,6 +45,12 @@
   },
   "permissions": {
     "disableBypassPermissionsMode": "disable",
+    "allow": [
+      "mcp__plugin_silta-claude_silta",
+      "CronCreate",
+      "CronList",
+      "CronDelete"
+    ],
     "deny": [
       "Read(//run/credentials/**)",
       "Read(//proc/**)",
