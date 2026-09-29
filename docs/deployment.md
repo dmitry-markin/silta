@@ -128,23 +128,21 @@ You can try using the latest version of Claude Code after checking it for compat
    ```bash
    sudo runuser -u claude -- bash -c "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash"
    ```
-3. Make sure you have a credential installed for the contract checker: exactly one of `oauth-token` (for a subscription token from `claude setup-token`) or `api-key` (for Anthropic API key) under `/etc/silta/auth/check`:
-   ```bash
-   sudo install -m 0600 /dev/stdin /etc/silta/auth/check/oauth-token
-   # or
-   sudo install -m 0600 /dev/stdin /etc/silta/auth/check/api-key
-   ```
-   Paste the token, press Enter, then Ctrl-D.
-4. Check the installed Claude Code using `sudo systemctl start silta-contract-check`. A run takes several minutes and costs about a dollar at the API prices. The command returns when the run is over and fails if any check failed. See which checks failed with `sudo journalctl -b -u silta-contract-check`.
-5. If the check fails, either revert to the backed-up version or install the version listed in [README](../README.md#project-status) following the procedure above.
-6. Restart the sessions onto the new version at a quiet moment:
+3. Check Claude Code for compatibility following the steps in [Checking the Claude Code contract](#checking-the-claude-code-contract).
+4. If the check succeeds, you can try running real sessions with this Claude Code. If the check fails, either revert to the backed-up version or install the version listed in [README](../README.md#project-status) following the procedure above.
+5. Restart the sessions onto the new version at a quiet moment:
    ```bash
    sudo systemctl restart silta-session.target
    ```
 
-A failed check keeps its traces under `/var/lib/silta/check/logs/`; `/usr/lib/silta/silta-contract-check --replay <dir>` runs the assertions over them again. The same script runs on a developer's machine from the repository (`deploy/silta-contract-check`), with the developer's own `claude` and login.
 
 ## Troubleshooting
+
+### Session alerts
+
+If `siltad` receives no response from a session (outgoing message, reaction, or file) within 10 minutes after delivering a user message to it, it sends an alert to the person with `role = "owner"` in `siltad.toml`. Check the logs of the affected session to find out why it is silent.
+
+### Inspecting the logs
 
 Inspect `siltad` & `silta-session` logs for errors with:
 ```bash
@@ -153,3 +151,40 @@ sudo journalctl -u silta-session@user-1
 ```
 
 A `silta-session` unit that exited with status 79 (`sudo systemctl status silta-session@user-1`) stopped on purpose: Claude Code cannot run the configured model (for example, because the installed version does not know the name or the account has no access to it). The reason is provided on the `model:` line in its journal. Fix the cause and start it again with `sudo systemctl start silta-session@user-1`.
+
+### Recovering a session if the request was flagged
+
+High-risk requests on cyber and bio topics may be flagged and refused by the model provider. In this case Claude Code would normally downgrade the model to a weaker one for the rest of the session. Because running a session with a weaker model damages the user experience, falling back to a weaker model is disabled. Such a session will likely keep refusing and stop responding to user messages. The person with the `role = "owner"` will receive the silent session alert in this case as usual.
+
+The following procedure might allow resuming the session with the original model. Replace `<name>` with the session name from `siltad.toml`.
+
+1. Set the model to a weaker one in a drop-in unit with `sudo systemctl edit silta-session@<name>`:
+   ```
+   [Service]
+   Environment=SILTA_MODEL=claude-opus-5
+   ```
+   Try gradually weaker models. Starting with `claude-opus-5` is recommended at the time of writing.
+   Make systemd re-read the drop-in with `sudo systemctl daemon-reload`.
+2. Restart the session with this model using `sudo systemctl restart silta-session@<name>`, then manually trigger a handoff and compaction:
+   ```
+   sudo runuser -u silta-<name> -- touch /var/lib/silta/<name>/rotate-requested
+   ```
+3. Wait for the compaction step to finish (see the journal), stop the session with `sudo systemctl stop silta-session@<name>`, remove the drop-in with the model override using `sudo systemctl revert silta-session@<name>` (edit instead if you set other overrides in the drop-in), then issue `sudo systemctl daemon-reload`.
+4. Start the session again with the original model: `sudo systemctl start silta-session@<name>`.
+5. If the original model refuses again after step 4, the refused exchange still in the compaction summary is what triggers it. Keep the session on the weaker model until enough conversation has passed for it to leave the summary's message tail (about a hundred messages), then repeat the procedure. Alternatively, remove the session ID file `/var/lib/silta/<name>/session-id` and let `silta-session` start a fresh session. The workspace files and memory notes, including the last handoff note, are kept, but the conversation itself is not: the assistant starts from its notes rather than from the chat history.
+
+### Checking the Claude Code contract
+
+Run the contract checker before trying a Claude Code version not yet tested for compatibility, and before submitting a bug report:
+
+1. Make sure you have a credential installed for the contract checker: exactly one of `oauth-token` (for a subscription token from `claude setup-token`) or `api-key` (for Anthropic API key) under `/etc/silta/auth/check`:
+   ```bash
+   sudo install -m 0600 /dev/stdin /etc/silta/auth/check/oauth-token
+   # or
+   sudo install -m 0600 /dev/stdin /etc/silta/auth/check/api-key
+   ```
+   Paste the token, press Enter, then Ctrl-D.
+2. Check the installed Claude Code using `sudo systemctl start silta-contract-check`. A run takes several minutes and costs about a dollar at the API prices. The command returns when the run is over and fails if any check failed. See which checks failed with `sudo journalctl -b -u silta-contract-check`.
+3. Each run of `silta-contract-check` writes a report as `/var/lib/silta/check/logs/<date>/report-<versions>.txt` with statuses of all checks. The exact file path is printed as the last line in the journal after the run. Attach this report to an issue if you are submitting a bug report.
+
+A failed check keeps its traces under `/var/lib/silta/check/logs/`; `/usr/lib/silta/silta-contract-check --replay <dir>` runs the assertions over them again. During development, the same script can be run on a developer's machine from the repository (`deploy/silta-contract-check`), with the developer's own `claude` and login. Attach the report from a real deployment, not from the developer's machine, when submitting a bug report.
