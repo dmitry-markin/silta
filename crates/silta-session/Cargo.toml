@@ -1,6 +1,8 @@
 [package]
 name = "silta-session"
 description = "Launcher and supervisor of one Silta session: runs Claude Code headless, reduces its output to a privacy-preserving journal log, rotates the session when its context grows past a size threshold"
+keywords = ["matrix", "claude", "assistant", "ai", "chatbot"]
+categories = ["command-line-utilities"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

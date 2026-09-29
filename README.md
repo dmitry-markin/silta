@@ -12,11 +12,11 @@ Family AI assistant that runs on Claude Code and speaks Matrix. Keeps its memory
 
 ## Features
 
-1. Claude Code as the harness: one long-lived session per person, plus a shared session for the family rooms. Each person uses their own Claude subscription (via `claude setup-token`) or Anthropic API key.
-2. Remembers people, tasks, and conversation state across context limits and restarts (see [Context compaction and continuity](#context-compaction-and-continuity)).
-3. Direct & group Matrix rooms with read receipts, typing indicators, reactions, attachments, quoting, and threads.
-4. Web search & research, with results delivered as PDFs (including phone-sized rendering).
-5. Periodic & scheduled tasks.
+- Claude Code as the harness: one long-lived session per person, plus a shared session for the family rooms. Each person uses their own Claude subscription (via `claude setup-token`) or Anthropic API key.
+- Remembers people, tasks, and conversation state across context limits and restarts (see [Context compaction and continuity](#context-compaction-and-continuity)).
+- Direct & group Matrix rooms with read receipts, typing indicators, reactions, attachments, quoting, and threads.
+- Web search & research, with results delivered as PDFs (including phone-sized rendering).
+- Periodic & scheduled tasks.
 
 ## Security
 
