@@ -1,7 +1,11 @@
-//! Shared types of the silta bridge: the socket protocol between `siltad` and its
-//! session plugins, the daemon configuration with its routing rules, JSON-lines
-//! framing, files over the socket, and small text helpers. Everything here is pure
-//! and unit-tested; the Matrix code lives in `siltad`, the socket clients in the binaries.
+#![doc = include_str!("../README.md")]
+//!
+//! ## Internals
+//!
+//! Shared types of the Silta assistant: the socket protocol between `siltad` and its session
+//! plugins, the daemon configuration with its routing rules, JSON-lines framing, files over
+//! the socket, and small text helpers. Everything here is pure and unit-tested; the Matrix
+//! code lives in `siltad`, the socket clients in the binaries.
 
 pub mod alert;
 pub mod backlog;

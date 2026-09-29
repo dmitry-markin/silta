@@ -1,4 +1,4 @@
-//! `siltad` as a library: the pieces the daemon binary and the test client share.
+#![doc = include_str!("../README.md")]
 
 pub mod alert;
 pub mod backup;

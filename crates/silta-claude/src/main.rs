@@ -1,9 +1,11 @@
-//! `silta-claude`: the Claude Code channel plugin for the silta bridge.
+#![doc = include_str!("../README.md")]
+//!
+//! ## Internals
 //!
 //! An MCP stdio server that connects to `siltad`'s Unix socket, announces its session
 //! name, turns daemon events into `notifications/claude/channel`, and forwards the
-//! `reply` tool to the daemon. It exits on stdin EOF, on SIGTERM/SIGINT, and when its
-//! parent dies, so it never outlives its session.
+//! `reply` and other tools to the daemon. It exits on stdin EOF, on SIGTERM/SIGINT,
+//! and when its parent dies, so it never outlives its session.
 
 mod daemon;
 mod mcp;
@@ -21,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-/// Claude Code channel plugin for the silta bridge. Reads its session name and the
+/// Claude Code channel plugin for the Silta assistant. Reads its session name and the
 /// daemon socket from the environment; holds no Matrix credentials.
 #[derive(Parser, Debug)]
 #[command(name = "silta-claude", version = env!("SILTA_VERSION"))]
