@@ -1,6 +1,6 @@
 [package]
 name = "silta"
-description = "Shared types for the silta bridge: socket protocol, daemon configuration, routing, line framing"
+description = "Shared crate of the Silta assistant: socket protocol, configuration types and paths"
 keywords = ["matrix", "claude", "assistant", "ai", "chatbot"]
 version.workspace = true
 edition.workspace = true

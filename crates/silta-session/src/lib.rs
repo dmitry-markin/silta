@@ -1,4 +1,16 @@
 #![doc = include_str!("../README.md")]
+//!
+//! ## Internals
+//!
+//! `silta-session` runs Claude Code headless in stream-json mode, owns its stdin and
+//! stdout, sends the host line that starts the first turn, reduces every output line to
+//! a journal line (the conversation's texts never reach the journal), resumes the saved
+//! session id across restarts as long as its transcript exists, and rotates the session
+//! when its context has grown and it is idle, or when Claude Code wanted to compact on
+//! its own: a handoff note first, then a `/compact` in place (a fresh id only when the
+//! compaction fails), with memory and transcript copied to `backups/` before and after
+//! the handoff. Closing stdin is the graceful stop; a session that does not exit within
+//! the grace is killed.
 
 pub mod contract;
 pub mod rotation;
