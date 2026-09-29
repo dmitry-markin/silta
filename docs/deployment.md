@@ -140,7 +140,7 @@ You can try using the latest version of Claude Code after checking it for compat
 
 ### Session alerts
 
-If `siltad` receives no response from a session (outgoing message, reaction, or file) within 10 minutes after delivering a user message to it, it sends an alert to a person with `role = "owner"` in `siltad.toml`. Check the logs of the affected session to find out why it is silent.
+If `siltad` receives no response from a session (outgoing message, reaction, or file) within 10 minutes after delivering a user message to it, it sends an alert to the person with `role = "owner"` in `siltad.toml`. Check the logs of the affected session to find out why it is silent.
 
 ### Inspecting the logs
 
@@ -154,15 +154,16 @@ A `silta-session` unit that exited with status 79 (`sudo systemctl status silta-
 
 ### Recovering a session if the request was flagged
 
-High-risk requests on cyber and bio topics may be flagged and refused by the model provider. In this case Claude Code downgrades the model to a weaker one for the rest of the session. Because running a session with a weaker model damages user experience, `silta-session` terminates Claude Code in this case and does not automatically restart it (flagged content in the context would lead to a model being downgraded again). The person with the `role = "owner"` will receive the silent session alert in this case as usual.
+High-risk requests on cyber and bio topics may be flagged and refused by the model provider. In this case Claude Code would noramally downgrade the model to a weaker one for the rest of the session. Because running a session with a weaker model damages user experience, falling back to a weaker model is disabled. Such a session will likely keep refusing and stop responding to user messages. The person with the `role = "owner"` will receive the silent session alert in this case as usual.
 
 The following procedure might allow resuming the session with the original model. Replace `<name>` with the session name from `siltad.toml`.
 
-1. Set a model Claude Code downgraded the session to in a drop-in unit with `sudo systemctl edit silta-session@<name>`:
+1. Set a model to a weaker one in a drop-in unit with `sudo systemctl edit silta-session@<name>`:
    ```
    [Service]
-   Environment=SILTA_MODEL=claude-opus-4-8  # replace with the downgraded model's name
+   Environment=SILTA_MODEL=claude-opus-5
    ```
+   Try gradually weaker models. Starting with `claude-opus-5` is recommended at the time of writing.
    Make systemd re-read the drop-in with `sudo systemctl daemon-reload`.
 2. Restart the session with this model using `sudo systemctl restart silta-session@<name>`, then manually trigger a handoff and compaction:
    ```
@@ -170,10 +171,11 @@ The following procedure might allow resuming the session with the original model
    ```
 3. Wait for the compaction step to finish (see the journal), stop the session with `sudo systemctl stop silta-session@<name>`, remove the drop-in with the model override using `sudo systemctl revert silta-session@<name>` (edit instead if you set other overrides in the drop-in), then issue `sudo systemctl daemon-reload`.
 4. Start the session again with the original model: `sudo systemctl start silta-session@<name>`.
+5. If the original model refuses again after step 4, the refused exchange still in the compaction summary is the one flagged. Keep the session on the fallback model until enough conversation has passed for it to leave the summary's message tail (about a hundred messages), then repeat the procedure. Alternatively, remove the session ID file `/var/lib/silta/<user>/session-id` and let `silta-session` start a fresh session. The workspace files and memory notes, including the last handoff note, are kept, but the conversation itself is not: the assistant starts from its notes rather than from the chat history.
 
 ### Checking the Claude Code contract
 
-Follow these steps to check if the API contract with Claude Code holds if you want to try running a new version of Claude Code not yet tested for compatibility, or before submitting a bug report:
+Run the contract checker before trying a Claude Code version not yet tested for compatibility, and before submitting a bug report:
 
 1. Make sure you have a credential installed for the contract checker: exactly one of `oauth-token` (for a subscription token from `claude setup-token`) or `api-key` (for Anthropic API key) under `/etc/silta/auth/check`:
    ```bash

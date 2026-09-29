@@ -90,7 +90,7 @@ The Claude Code version tested to work is 2.1.283. Newer versions may break the 
 2. A running `Monitor` task blocks the graceful stop, so the supervisor waits out its timeout and restarts the session before compaction. Session continuity is unaffected.
 3. Support for third-party gateways (like OpenRouter) is implemented, but effectively dormant until Anthropic extends the Claude Code channels beta to them.
 4. Some sites block web fetch requests coming from datacenter IPs, making the research less efficient. Such sites are in the minority, and this can be worked around by using a residential IP for the network egress of the VM or session's Linux user.
-5. If the request is refused by content filters (relevant for cyber/bio topics), the session is stopped instead of allowing it to proceed with a weaker model. Follow [the manual recovery procedure](docs/deployment.md#recovering-a-session-if-the-request-was-flagged) to resume such session.
+5. If a request is refused by the model provider's safety classifiers (relevant for cyber/bio topics), the session stays on the original model and will likely keep refusing, since the classifiers judge the whole context. It does not fall back to a weaker model, which would change the assistant without anyone noticing. Follow [the manual recovery procedure](docs/deployment.md#recovering-a-session-if-the-request-was-flagged) to resume such a session.
 
 ## Deployment
 
