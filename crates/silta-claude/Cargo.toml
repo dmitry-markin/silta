@@ -1,6 +1,6 @@
 [package]
 name = "silta-claude"
-description = "Claude Code channel plugin for the silta bridge: an MCP stdio server that talks to siltad"
+description = "Claude Code channel plugin of the Silta assistant: an MCP server that delivers user messages and provides the Matrix tools"
 keywords = ["matrix", "claude", "assistant", "ai", "chatbot"]
 categories = ["command-line-utilities"]
 version.workspace = true
