@@ -1,8 +1,8 @@
 [package]
 name = "siltad"
 description = "Silta assistant daemon: the Matrix client that routes rooms to the assistant's sessions"
-keywords = ["matrix", "claude", "assistant", "ai", "chatbot"]
 categories = ["command-line-utilities"]
+keywords.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
