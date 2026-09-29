@@ -30,10 +30,24 @@
   "feedbackDrafts": "off",
   "attribution": { "sessionUrl": false },
   "remoteControl": { "shareHostProfile": "off" },
+  "claudeMdExcludes": [
+    "/var/lib/silta/*/**/.claude/rules/**",
+    "/var/lib/silta/*/**/AGENTS.md",
+    "/var/lib/silta/*/**/CLAUDE.local.md",
+    "/var/lib/silta/*/**/CLAUDE.md"
+  ],
   "sandbox": {
     "enabled": true,
     "failIfUnavailable": true,
     "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyWrite": [
+        "~/workspace/.claude",
+        "~/workspace/AGENTS.md",
+        "~/workspace/CLAUDE.local.md",
+        "~/workspace/CLAUDE.md"
+      ]
+    },
     "credentials": {
       "envVars": [
         { "name": "CLAUDE_CODE_OAUTH_TOKEN", "mode": "deny" },
@@ -45,27 +59,56 @@
   },
   "permissions": {
     "disableBypassPermissionsMode": "disable",
+    "allow": [
+      "mcp__plugin_silta-claude_silta",
+      "CronCreate",
+      "CronList",
+      "CronDelete"
+    ],
     "deny": [
-      "Read(//run/credentials/**)",
       "Read(//proc/**)",
+      "Read(//run/credentials/**)",
+      "Edit(//var/lib/silta/*/.cache/**)",
+      "Edit(//var/lib/silta/*/.claude.json)",
+      "Edit(//var/lib/silta/*/.claude/AGENTS.md)",
+      "Edit(//var/lib/silta/*/.claude/CLAUDE.md)",
+      "Edit(//var/lib/silta/*/.claude/agents/**)",
+      "Edit(//var/lib/silta/*/.claude/commands/**)",
+      "Edit(//var/lib/silta/*/.claude/daemon.json)",
+      "Edit(//var/lib/silta/*/.claude/daemon/**)",
+      "Edit(//var/lib/silta/*/.claude/hooks/**)",
+      "Edit(//var/lib/silta/*/.claude/jobs/**)",
+      "Edit(//var/lib/silta/*/.claude/launch.json)",
+      "Edit(//var/lib/silta/*/.claude/loop.md)",
+      "Edit(//var/lib/silta/*/.claude/output-styles/**)",
+      "Edit(//var/lib/silta/*/.claude/plugins/**)",
+      "Edit(//var/lib/silta/*/.claude/policy-limits.json)",
+      "Edit(//var/lib/silta/*/.claude/projects/*/*.jsonl)",
+      "Edit(//var/lib/silta/*/.claude/remote-settings.json)",
+      "Edit(//var/lib/silta/*/.claude/routines/**)",
+      "Edit(//var/lib/silta/*/.claude/rules/**)",
+      "Edit(//var/lib/silta/*/.claude/scheduled_tasks.json)",
       "Edit(//var/lib/silta/*/.claude/settings.json)",
       "Edit(//var/lib/silta/*/.claude/settings.local.json)",
-      "Edit(//var/lib/silta/*/.claude/plugins/**)",
-      "Edit(//var/lib/silta/*/.claude/agents/**)",
+      "Edit(//var/lib/silta/*/.claude/shell-snapshots/**)",
       "Edit(//var/lib/silta/*/.claude/skills/**)",
-      "Edit(//var/lib/silta/*/.claude/hooks/**)",
-      "Edit(//var/lib/silta/*/.claude/commands/**)",
-      "Edit(//var/lib/silta/*/.claude/projects/*/*.jsonl)",
-      "Edit(//var/lib/silta/*/.claude.json)",
-      "Edit(//var/lib/silta/*/.cache/**)",
+      "Edit(//var/lib/silta/*/.claude/workflows/**)",
       "Edit(//var/lib/silta/*/.config/**)",
       "Edit(//var/lib/silta/*/.local/**)",
+      "Edit(//var/lib/silta/*/AGENTS.md)",
+      "Edit(//var/lib/silta/*/CLAUDE.local.md)",
+      "Edit(//var/lib/silta/*/CLAUDE.md)",
+      "Edit(//var/lib/silta/*/backups/**)",
+      "Edit(//var/lib/silta/*/rotate-requested)",
+      "Edit(//var/lib/silta/*/rotation.json)",
       "Edit(//var/lib/silta/*/session-id)",
       "Edit(//var/lib/silta/*/session.err)",
       "Edit(//var/lib/silta/*/session.fifo)",
-      "Edit(//var/lib/silta/*/rotate-requested)",
-      "Edit(//var/lib/silta/*/rotation.json)",
-      "Edit(//var/lib/silta/*/backups/**)"
+      "Edit(//var/lib/silta/*/workspace/**/.claude/**)",
+      "Edit(//var/lib/silta/*/workspace/**/AGENTS.md)",
+      "Edit(//var/lib/silta/*/workspace/**/CLAUDE.local.md)",
+      "Edit(//var/lib/silta/*/workspace/**/CLAUDE.md)",
+      "Edit(//var/lib/silta/*/workspace/.mcp.json)"
     ]
   },
   "promptCacheTtl": "1h",
