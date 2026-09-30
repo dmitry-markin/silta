@@ -26,6 +26,7 @@ env:
   # The typst version shipped with Silta. docs/deployment.md and the md2pdf skill are
   # tuned against it; bump it in a PR, with a look at the rendered PDFs.
   TYPST_VERSION: "0.15.1"
+  TYPST_COMMIT: "9dfd3a08500b7896045f907433cf7b4b02434fad"
   CARGO_TERM_COLOR: always
 
 permissions:
@@ -132,7 +133,11 @@ jobs:
         run: |
           git clone --depth 1 --branch "v$TYPST_VERSION" https://github.com/typst/typst.git
           commit=$(git -C typst rev-parse HEAD)
-          echo "typst v$TYPST_VERSION is commit $commit"
+          if [[ "$commit" != "$TYPST_COMMIT" ]]; then
+            echo "::error::typst tag v$TYPST_VERSION is $commit, expected $TYPST_COMMIT"
+            exit 1
+          fi
+          echo "typst v$TYPST_VERSION is the expected commit $commit"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
       # The same command as in docs/deployment.md, with upstream's lock file honoured.
