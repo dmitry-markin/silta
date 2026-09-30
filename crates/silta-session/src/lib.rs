@@ -269,6 +269,11 @@ async fn supervise(cfg: &Config, shutdown: &CancellationToken) -> (i32, String) 
                 )
             }
             Outcome::Exit(code) => return (code, format!("claude exited on its own with {code}")),
+            // A one-turn run that ended for a restart stays down like any other: a
+            // restart would send the line again.
+            Outcome::Ended { code: 1, reason } if cfg.one_shot() => {
+                return (EXIT_EMERGENCY, format!("emergency mode: {reason}"))
+            }
             Outcome::Ended { code, reason } => return (code, reason),
             Outcome::Again { not_before: pause } => not_before = pause,
         }
@@ -484,6 +489,7 @@ async fn run_once(
         stopping: None,
         after: None,
         kill: false,
+        deadline: None,
         tracker: Tracker::new(
             Limits {
                 enabled: rotate,
@@ -545,27 +551,8 @@ async fn run_once(
             eprintln!("emergency: the line of SILTA_EMERGENCY_LINE is not sent, this start is not a plain resume");
             intro(&cfg.session, start.kind)
         }
-        Some(line) => {
-            // The state the line is about to change, kept apart from the rotations'.
-            match paths.snapshot("before-emergency", &start.id, cfg.backups_keep) {
-                Ok(snap) => eprintln!(
-                    "emergency: snapshot {} ({} memory files, transcript {})",
-                    snap.name,
-                    snap.memory_files,
-                    if snap.transcript {
-                        "copied"
-                    } else {
-                        "not found"
-                    }
-                ),
-                Err(err) => eprintln!("emergency: snapshot failed: {err}"),
-            }
-            eprintln!(
-                "emergency: sending the line of SILTA_EMERGENCY_LINE ({} bytes) in place of the start line; no messages are taken and nothing is rotated",
-                line.len()
-            );
-            line.clone()
-        }
+        // The one-turn line: its snapshot and its cap are taken when it goes out.
+        Some(line) => line.clone(),
         None => intro(&cfg.session, start.kind),
     };
     if cfg.window.is_some() {
@@ -577,10 +564,15 @@ async fn run_once(
         .await;
         run.intro = Some((line, now + cfg.window_wait));
     } else {
-        run.send(&line).await;
+        run.start(&line).await;
     }
 
-    let started = now;
+    // A one-turn line that compacts: a turn that ends before the compaction is not its.
+    let compaction = one_shot
+        && cfg
+            .emergency
+            .as_deref()
+            .is_some_and(|line| line.starts_with("/compact"));
     let mut readers_open = true;
     let mut no_conversation = false;
     let mut ticks: u64 = 0;
@@ -613,6 +605,13 @@ async fn run_once(
                         }
                         stream::Event::CompactionFailed if one_shot => {
                             compact_failed = true;
+                        }
+                        // A turn queued ahead of the command (a timer's, a background
+                        // task's) ends first.
+                        stream::Event::Result { is_error: false, .. }
+                            if compaction && !compacted && !compact_failed =>
+                        {
+                            eprintln!("emergency: a turn ended with neither a compaction boundary nor a failure; still waiting for the compaction");
                         }
                         stream::Event::Result { is_error, .. } if one_shot => {
                             let what = if compacted {
@@ -686,7 +685,7 @@ async fn run_once(
                     }
                 } else if one_shot {
                     // The compaction's cap bounds the emergency turn.
-                    if now >= started + cfg.limits.compact {
+                    if run.deadline.is_some_and(|deadline| now >= deadline) {
                         run.end(
                             EXIT_EMERGENCY,
                             format!(
@@ -748,7 +747,12 @@ async fn run_once(
             // Only a saved id that no longer resumes is dropped, so that a start that
             // fails for any other reason (an expired token, the network) keeps the
             // conversation.
-            if start.resume && no_conversation {
+            if start.resume && no_conversation && one_shot {
+                eprintln!(
+                    "session {} cannot be resumed; its id is kept, emergency mode drops nothing",
+                    start.id
+                );
+            } else if start.resume && no_conversation {
                 eprintln!(
                     "session {} cannot be resumed; a new session starts on the next run",
                     start.id
@@ -779,6 +783,8 @@ struct Run<'a> {
     after: Option<Outcome>,
     /// The run was ended by [`Run::end`]: claude is killed rather than waited for.
     kill: bool,
+    /// The cap on the turn of the one-turn emergency line, from when the line went out.
+    deadline: Option<Instant>,
     tracker: Tracker,
     /// What the handoff request found on disk, while the handoff turn is awaited.
     watch: Option<HandoffWatch>,
@@ -809,13 +815,43 @@ impl Run<'_> {
         match max_tokens {
             Some(n) if n >= want => {
                 eprintln!("model: Claude Code measures the context of {model} against {n} tokens");
-                self.send(&line).await;
+                self.start(&line).await;
             }
             Some(n) => self.end(EXIT_MODEL, format!(
                 "Claude Code measures the context of {model} against {n} tokens, below CLAUDE_CODE_AUTO_COMPACT_WINDOW={want}: this version does not know the model's window or the configured window is above the model's"
             )),
             None => self.end(EXIT_MODEL, "Claude Code refused the window check (get_context_usage): this version cannot be held to a window".to_owned()),
         }
+    }
+
+    /// Sends the line that starts the first turn. The one-turn emergency line goes out
+    /// after a copy of the state it is about to change, kept apart from the rotations',
+    /// and its turn is capped from here.
+    async fn start(&mut self, line: &str) {
+        if self.cfg.one_shot() {
+            match self
+                .paths
+                .snapshot("before-emergency", self.id, self.cfg.backups_keep)
+            {
+                Ok(snap) => eprintln!(
+                    "emergency: snapshot {} ({} memory files, transcript {})",
+                    snap.name,
+                    snap.memory_files,
+                    if snap.transcript {
+                        "copied"
+                    } else {
+                        "not found"
+                    }
+                ),
+                Err(err) => eprintln!("emergency: snapshot failed: {err}"),
+            }
+            eprintln!(
+                "emergency: sending the line of SILTA_EMERGENCY_LINE ({} bytes) in place of the start line; no messages are taken and nothing is rotated",
+                line.len()
+            );
+            self.deadline = Some(Instant::now() + self.cfg.limits.compact);
+        }
+        self.send(line).await;
     }
 
     /// A turn switched to the `--fallback-model`: a trigger that points at the model

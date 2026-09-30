@@ -1000,6 +1000,39 @@ async fn emergency_mode_sends_its_line_once_and_stays_down() {
     let snaps: Vec<String> = fx.snapshots().iter().map(|p| name(p)).collect();
     assert_eq!(snaps.len(), 2, "{snaps:?}");
     assert!(snaps.iter().all(|s| s.ends_with("-before-emergency")));
+
+    // An unanswered window check stays down too, and leaves no snapshot: no line
+    // went out.
+    fx.set("fake-mode", "nowindow");
+    assert_eq!(
+        silta_session::run(&emergency, CancellationToken::new()).await,
+        EXIT_EMERGENCY
+    );
+    assert_eq!(fx.log().matches("line /compact").count(), 2);
+    assert_eq!(fx.snapshots().len(), 2);
+
+    // A turn that ends ahead of the command is not the compaction.
+    fx.set("fake-mode", "busycompact");
+    assert_eq!(
+        silta_session::run(&emergency, CancellationToken::new()).await,
+        EXIT_EMERGENCY
+    );
+    let log = fx.log();
+    assert!(
+        log.find(&format!("aside {first}")).unwrap()
+            < log.rfind(&format!("compact {first}")).unwrap(),
+        "{log}"
+    );
+    assert_eq!(log.matches(&format!("compact {first}")).count(), 2, "{log}");
+    assert_eq!(fx.snapshots().len(), 3);
+
+    // A resume claude refuses keeps the id of the session being rescued.
+    fx.set("fake-mode", "noresume");
+    assert_eq!(
+        silta_session::run(&emergency, CancellationToken::new()).await,
+        EXIT_EMERGENCY
+    );
+    assert_eq!(fx.id(), first);
     fs::remove_dir_all(&fx.home).unwrap();
 }
 
