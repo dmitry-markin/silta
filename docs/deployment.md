@@ -15,7 +15,7 @@
    ```bash
    sudo apt install pandoc fonts-dejavu fonts-noto-core fonts-noto-color-emoji curl
    sudo dpkg -i typst-cli_0.15.1-1_amd64.deb
-   sudo dpkg -i silta_0.5.1_amd64.deb
+   sudo dpkg -i silta_0.6.0_amd64.deb
    sudo apt install -f
    ```
    The last command will satisfy the dependencies of Silta itself and finish the package configuration. It will also print the remaining steps needed to configure Silta. They are listed here from the next step.
@@ -117,7 +117,7 @@ You can try using the latest version of Claude Code after checking it for compat
    ```bash
    sudo apt install git
    git clone https://github.com/dmitry-markin/silta.git
-   cd silta && git checkout v0.5.1  # replace v0.5.1 with the latest stable version
+   cd silta && git checkout v0.6.0  # replace v0.6.0 with the latest stable version
    ./build-deb.sh
    ```
    `build-deb.sh` will print the `.deb` package location.
