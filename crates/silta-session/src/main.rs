@@ -7,7 +7,7 @@ use clap::Parser;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
-use silta_session::{rotation::Limits, Auth, Config};
+use silta_session::{rotation::Limits, Auth, Config, Emergency};
 
 /// Runs one Silta session headless for silta-session@<name>.service.
 #[derive(Parser, Debug)]
@@ -102,6 +102,17 @@ struct Args {
     /// under the state directory's backups/.
     #[arg(long, env = "SILTA_BACKUPS_KEEP", default_value_t = 10)]
     backups_keep: usize,
+
+    /// Emergency mode: resume the saved session, send this line in place of the host
+    /// line that starts it (a /compact with other instructions), and exit with 80 at
+    /// the end of its turn. Empty is off.
+    #[arg(long, env = "SILTA_EMERGENCY_LINE")]
+    emergency_line: Option<String>,
+
+    /// With an emergency line that is a prompt, not a slash command (0/1): send it in
+    /// place of the host line of a resume and let the session run as usual.
+    #[arg(long, env = "SILTA_EMERGENCY_ACCEPT_MESSAGES", default_value = "0", value_parser = parse_switch)]
+    emergency_accept_messages: bool,
 }
 
 fn parse_switch(s: &str) -> Result<bool, String> {
@@ -130,6 +141,13 @@ fn main() -> ExitCode {
         }
     };
     eprintln!("authenticating with {auth:?}");
+    let emergency = args
+        .emergency_line
+        .as_deref()
+        .and_then(|line| Emergency::new(line, args.emergency_accept_messages));
+    if args.emergency_accept_messages && matches!(emergency, Some(Emergency::OneShot(_))) {
+        eprintln!("emergency: SILTA_EMERGENCY_ACCEPT_MESSAGES is ignored, the line is a slash command that no model answers; running its one turn only");
+    }
     let cfg = Config {
         session: args.session,
         state: args.state,
@@ -154,6 +172,7 @@ fn main() -> ExitCode {
             retry_pause: Duration::from_secs(args.rotate_retry_seconds),
         },
         backups_keep: args.backups_keep,
+        emergency,
     };
 
     let runtime = match tokio::runtime::Runtime::new() {

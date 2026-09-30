@@ -8,7 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use silta_session::{compact, handoff, rotation::Limits, Auth, Config, EXIT_MODEL};
+use silta_session::{
+    compact, handoff, rotation::Limits, Auth, Config, Emergency, EXIT_EMERGENCY, EXIT_MODEL,
+};
 use tokio_util::sync::CancellationToken;
 
 struct Fixture {
@@ -51,6 +53,7 @@ impl Fixture {
                 retry_pause: Duration::from_secs(3),
             },
             backups_keep: 3,
+            emergency: None,
         }
     }
 
@@ -929,6 +932,189 @@ async fn a_first_turn_without_an_answer_keeps_the_channel_closed_and_restarts() 
     assert!(!log.contains("ready"), "the channel stays closed: {log}");
     assert!(!fx.home.join("channel-ready").exists());
     fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
+async fn emergency_mode_sends_its_line_once_and_stays_down() {
+    let fx = Fixture::new("emergency");
+    fx.set("fake-context", "10");
+    let cfg = fx.config();
+    let emergency = Config {
+        emergency: Emergency::new("/compact Leave the refused exchange out.", false),
+        ..fx.config()
+    };
+    // Nothing to resume: no claude is started.
+    assert_eq!(
+        silta_session::run(&emergency, CancellationToken::new()).await,
+        EXIT_EMERGENCY
+    );
+    assert!(starts(&fx.log()).is_empty());
+
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    fx.until(10, |l| l.contains("ready after answer")).await;
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    let first = fx.id();
+
+    // A compaction that fails: the pending rotation stays on record, and neither the
+    // start line nor a handoff request went out.
+    fx.set("rotate-requested", "test");
+    fx.set("fake-mode", "nocompact");
+    assert_eq!(
+        silta_session::run(&emergency, CancellationToken::new()).await,
+        EXIT_EMERGENCY
+    );
+    let log = fx.log();
+    assert_eq!(starts(&log)[1], format!("start {first} resumed"));
+    assert!(log.contains(&format!("compact-failed {first}")), "{log}");
+    assert!(fx.home.join("rotate-requested").exists());
+
+    // One that goes through: the line as given, the rotation cleared, claude stopped
+    // by the end of its stdin, and the channel closed all along.
+    fx.set("fake-mode", "ok");
+    assert_eq!(
+        silta_session::run(&emergency, CancellationToken::new()).await,
+        EXIT_EMERGENCY
+    );
+    let log = fx.log();
+    assert_eq!(starts(&log).len(), 3, "{log}");
+    assert_eq!(
+        log.matches("line /compact Leave the refused exchange out.")
+            .count(),
+        2
+    );
+    assert!(log.contains(&format!("compact {first}")), "{log}");
+    assert_eq!(log.matches(&format!("eof {first}")).count(), 3, "{log}");
+    assert!(
+        !log.contains("restarted at") && !log.contains(handoff()),
+        "{log}"
+    );
+    assert_eq!(log.matches("ready after answer").count(), 1, "{log}");
+    assert!(!fx.home.join("channel-ready").exists());
+    assert!(!fx.home.join("rotate-requested").exists());
+    assert_eq!(fx.id(), first);
+    let snaps: Vec<String> = fx.snapshots().iter().map(|p| name(p)).collect();
+    assert_eq!(snaps.len(), 2, "{snaps:?}");
+    assert!(snaps.iter().all(|s| s.ends_with("-before-emergency")));
+
+    // An unanswered window check stays down too, and leaves no snapshot: no line
+    // went out.
+    fx.set("fake-mode", "nowindow");
+    assert_eq!(
+        silta_session::run(&emergency, CancellationToken::new()).await,
+        EXIT_EMERGENCY
+    );
+    assert_eq!(fx.log().matches("line /compact").count(), 2);
+    assert_eq!(fx.snapshots().len(), 2);
+
+    // A turn that ends ahead of the command is not the compaction.
+    fx.set("fake-mode", "busycompact");
+    assert_eq!(
+        silta_session::run(&emergency, CancellationToken::new()).await,
+        EXIT_EMERGENCY
+    );
+    let log = fx.log();
+    assert!(
+        log.find(&format!("aside {first}")).unwrap()
+            < log.rfind(&format!("compact {first}")).unwrap(),
+        "{log}"
+    );
+    assert_eq!(log.matches(&format!("compact {first}")).count(), 2, "{log}");
+    assert_eq!(fx.snapshots().len(), 3);
+
+    // A resume claude refuses keeps the id of the session being rescued.
+    fx.set("fake-mode", "noresume");
+    assert_eq!(
+        silta_session::run(&emergency, CancellationToken::new()).await,
+        EXIT_EMERGENCY
+    );
+    assert_eq!(fx.id(), first);
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
+async fn an_emergency_line_that_accepts_messages_starts_a_usual_session() {
+    let fx = Fixture::new("emergency-accept");
+    fx.set("fake-context", "10");
+    let cfg = Config {
+        emergency: Emergency::new("The session has started in emergency mode.", true),
+        ..fx.config()
+    };
+    // No saved session: the new conversation gets its own start line.
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    let log = fx.until(10, |l| l.contains("ready after answer")).await;
+    assert!(log.contains("line Session test started") && !log.contains("emergency mode"));
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    let first = fx.id();
+
+    // The resume gets the line, opens the channel, and rotates on the marker as any
+    // session does.
+    fx.set("rotate-requested", "test");
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    let log = fx
+        .until(20, |l| l.contains("line Context was compacted at"))
+        .await;
+    assert!(log.contains("line The session has started in emergency mode."));
+    assert!(!log.contains("restarted at"), "{log}");
+    assert_eq!(log.matches("ready after answer").count(), 2, "{log}");
+    assert!(log.contains(&format!("handoff {first}")) && log.contains(&format!("compact {first}")));
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+
+    // A slash command is run as the one turn whatever the switch says.
+    let slash = Config {
+        emergency: Emergency::new(" /compact Short.", true),
+        ..cfg.clone()
+    };
+    assert_eq!(
+        silta_session::run(&slash, CancellationToken::new()).await,
+        EXIT_EMERGENCY
+    );
+    assert_eq!(fx.log().matches("ready after answer").count(), 2);
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[test]
+fn the_emergency_line_decides_its_mode() {
+    let one = |line: &str| Some(Emergency::OneShot(line.to_owned()));
+    assert_eq!(Emergency::new("  \n", true), None);
+    assert_eq!(
+        Emergency::new(" /compact Short. ", false),
+        one("/compact Short.")
+    );
+    assert_eq!(
+        Emergency::new(" /compact Short.", true),
+        one("/compact Short.")
+    );
+    assert_eq!(Emergency::new("/clear", true), one("/clear"));
+    assert_eq!(Emergency::new("Say OK.", false), one("Say OK."));
+    assert_eq!(
+        Emergency::new("Say OK.", true),
+        Some(Emergency::Prompt("Say OK.".into()))
+    );
+    // A path is prose, not a command.
+    assert_eq!(
+        Emergency::new("/var/lib/notes says what to leave out.", true),
+        Some(Emergency::Prompt(
+            "/var/lib/notes says what to leave out.".into()
+        ))
+    );
 }
 
 /// Starts a session with `auth` and returns the credential variables claude saw.
