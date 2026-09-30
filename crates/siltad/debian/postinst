@@ -25,20 +25,25 @@ case "$1" in
         deb-systemd-invoke try-restart siltad.service >/dev/null || true
       else
         cat <<'NOTE'
-silta: next steps, as root
-  1. install Claude Code once, as the claude user:
-       runuser -u claude -- bash -c "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- 2.1.283"
-       (replace 2.1.283 with the tested version named in the Silta release notes)
-  2. silta-session-add <name> for each person and "hub" if the assistant should join group rooms
-     (the daemon refuses to start while a configured session's user does not exist)
-  3. give each mind its credential, as silta-session-add prints: one file in
-     /etc/silta/auth/<name>, oauth-token (claude setup-token) or api-key (Claude Console)
-  4. edit /etc/silta/siltad.toml: the homeserver, the bot's password, the people, the sessions
-  5. systemctl start siltad
-  6. for the md2pdf and research skills (PDF generation), otherwise they fail at use:
-       apt install pandoc fonts-dejavu fonts-noto-core fonts-noto-color-emoji
+Silta: next steps
+  1. Install Claude Code once, as the claude user:
+       sudo runuser -u claude -- bash -c "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- 2.1.283"
+       (replace 2.1.283 with the tested version named in the Silta release notes).
+  2. Install the packages for the md2pdf and research skills (PDF generation), otherwise they
+     fail at use:
+       sudo apt install pandoc fonts-dejavu fonts-noto-core fonts-noto-color-emoji
      and typst from the Silta release, or by hand from https://github.com/typst/typst
      (packaged with cargo-deb).
+  3. Add a session for each person and "hub" if the assistant should join group rooms
+     (the daemon refuses to start while a configured session's user does not exist):
+       sudo silta-session-add <name>
+  4. Give each session its credential, as silta-session-add prints: one file in
+     /etc/silta/auth/<name>, oauth-token (claude setup-token) or api-key (Claude Console).
+  5. Edit /etc/silta/siltad.toml: the homeserver, the assistant's password, the people, the sessions.
+  6. Restart the Matrix daemon with the updated config:
+       sudo systemctl restart siltad
+  7. Enable and run each session, as instructed by silta-session-add in step 3:
+       sudo systemctl enable --now silta-session@<name>
 NOTE
       fi
     fi

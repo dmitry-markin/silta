@@ -3,7 +3,7 @@ members = ["crates/silta", "crates/siltad", "crates/silta-claude", "crates/silta
 resolver = "2"
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.93"
 license = "Apache-2.0 OR MIT"
@@ -11,7 +11,7 @@ repository = "https://github.com/dmitry-markin/silta"
 keywords = ["matrix", "claude", "assistant", "ai", "chatbot"]
 
 [workspace.dependencies]
-silta = { path = "crates/silta", version = "0.5.1" }
+silta = { path = "crates/silta", version = "0.6.0" }
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
