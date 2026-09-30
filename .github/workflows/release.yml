@@ -85,6 +85,7 @@ jobs:
           deb=$(ls target/debian/silta_*_amd64.deb)
           dpkg-deb --info "$deb"
           dpkg-deb --contents "$deb"
+          echo "sha256sum:"
           sha256sum "$deb"
 
       # Records "this file was built by this run of this workflow at this commit", checked
@@ -143,6 +144,7 @@ jobs:
         run: |
           deb=$(ls typst/target/debian/typst-cli_*_amd64.deb)
           dpkg-deb --info "$deb"
+          echo "sha256sum:"
           sha256sum "$deb"
 
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -189,7 +191,7 @@ jobs:
             sha256sum ./*.deb | sed 's|\./||'
             echo '```'
             echo
-            echo "Each file also carries a build provenance attestation: \`gh attestation verify <file> --owner ${GITHUB_REPOSITORY_OWNER}\`."
+            echo "Each file also carries a build provenance attestation: \`gh attestation verify --owner ${GITHUB_REPOSITORY_OWNER} <file>\`."
             echo
             echo "\`typst-cli\` is an unmodified build of [typst](https://github.com/typst/typst) $TYPST_VERSION (tag \`v$TYPST_VERSION\`, commit \`$TYPST_COMMIT\`), packaged with \`cargo deb\` in the same run and redistributed under its Apache-2.0 licence."
           } > "$RUNNER_TEMP/notes.md"
