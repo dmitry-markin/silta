@@ -43,5 +43,5 @@ elif hash=$(git rev-parse --short HEAD 2>/dev/null); then
     deb_version=(--deb-version "$version+g$hash$dirty")
 fi
 
-cargo build --release --workspace
+cargo build --locked --release --workspace
 cargo deb -p siltad --no-build "${deb_version[@]}" "$@"

@@ -1,0 +1,207 @@
+# Release: builds the Silta .deb and the pinned typst-cli .deb in public, so the packages
+# attached to a release come from a run anyone can inspect.
+#
+# On a version tag push the workflow builds both packages, creates a draft release titled
+# after the tag, attaches the two .debs and writes their SHA-256 hashes, the run link and
+# the typst provenance into the release notes; the changelog text is added by hand before
+# the draft is published. Run by hand (workflow_dispatch) it only builds and keeps the
+# packages as run artifacts: for testing the workflow, or for checking a build.
+#
+# Each package is built in its own job, in a fresh debian:13 container without a build
+# cache, so nothing from an earlier run or from the other package is in the environment.
+# Third-party actions are pinned to commit SHAs, as in ci.yml; only GitHub's own are used.
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Revision to build (tag, branch or commit); the current branch when empty"
+        required: false
+        type: string
+
+env:
+  # The typst version shipped with Silta. docs/deployment.md and the md2pdf skill are
+  # tuned against it; bump it in a PR, with a look at the rendered PDFs.
+  TYPST_VERSION: "0.15.1"
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  build-silta:
+    name: Build silta .deb (Debian 13)
+    runs-on: ubuntu-latest
+    container: debian:13
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      # The packages docs/deployment.md tells the operator to install, plus what the
+      # actions need inside a bare container: git for checkout, curl and CA certificates
+      # for rustup. build-essential brings dpkg-dev, which cargo-deb needs for `$auto`.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates
+
+      # Full history with tags: build-deb.sh derives the package version from
+      # `git describe`, and a shallow checkout would name the package after the commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.3 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install cargo-deb
+        run: cargo install --locked cargo-deb
+
+      # A tag v0.6.0 must build the crates at version 0.6.0, or the release would carry a
+      # package whose --version disagrees with its name.
+      - name: Check that the tag matches the crate version
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(cargo pkgid -p siltad)
+          version=${version##*[#@]}
+          if [[ "v$version" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME but workspace version is $version"
+            exit 1
+          fi
+
+      - name: Build the package
+        run: ./build-deb.sh
+
+      - name: Inspect the package
+        run: |
+          deb=$(ls target/debian/silta_*_amd64.deb)
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          sha256sum "$deb"
+
+      # Records "this file was built by this run of this workflow at this commit", checked
+      # with `gh attestation verify <file> --owner dmitry-markin`.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: target/debian/silta_*_amd64.deb
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: silta-deb
+          path: target/debian/silta_*_amd64.deb
+          if-no-files-found: error
+
+  build-typst:
+    name: Build typst-cli .deb (Debian 13)
+    runs-on: ubuntu-latest
+    container: debian:13
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      commit: ${{ steps.clone.outputs.commit }}
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl ca-certificates
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.3 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install cargo-deb
+        run: cargo install --locked cargo-deb
+
+      # An unmodified checkout of the upstream tag; the commit it resolves to goes into
+      # the release notes.
+      - name: Clone typst
+        id: clone
+        run: |
+          git clone --depth 1 --branch "v$TYPST_VERSION" https://github.com/typst/typst.git
+          commit=$(git -C typst rev-parse HEAD)
+          echo "typst v$TYPST_VERSION is commit $commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      # The same command as in docs/deployment.md, with upstream's lock file honoured.
+      - name: Build the package
+        working-directory: typst
+        run: cargo deb -p typst-cli -- --locked
+
+      - name: Inspect the package
+        run: |
+          deb=$(ls typst/target/debian/typst-cli_*_amd64.deb)
+          dpkg-deb --info "$deb"
+          sha256sum "$deb"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: typst/target/debian/typst-cli_*_amd64.deb
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: typst-cli-deb
+          path: typst/target/debian/typst-cli_*_amd64.deb
+          if-no-files-found: error
+
+  release:
+    name: Draft the release
+    if: github.ref_type == 'tag'
+    needs: [build-silta, build-typst]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TYPST_COMMIT: ${{ needs.build-typst.outputs.commit }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      # The generated part of the notes: hashes in `sha256sum -c` form, the run that made
+      # the files, and where the typst package comes from. The changelog entry goes above
+      # the marker line before the draft is published.
+      - name: Write the release notes
+        working-directory: dist
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "_Release notes go here._"
+            echo
+            echo "## Packages"
+            echo
+            echo "Both packages were built by [this run]($run_url) of the release workflow from tag \`$GITHUB_REF_NAME\` (commit \`$GITHUB_SHA\`). Check the hashes with \`sha256sum -c\`:"
+            echo
+            echo '```'
+            sha256sum ./*.deb | sed 's|\./||'
+            echo '```'
+            echo
+            echo "Each file also carries a build provenance attestation: \`gh attestation verify <file> --owner ${GITHUB_REPOSITORY_OWNER}\`."
+            echo
+            echo "\`typst-cli\` is an unmodified build of [typst](https://github.com/typst/typst) $TYPST_VERSION (tag \`v$TYPST_VERSION\`, commit \`$TYPST_COMMIT\`), packaged with \`cargo deb\` in the same run and redistributed under its Apache-2.0 licence."
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Create the draft release
+        working-directory: dist
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            ./*.deb
