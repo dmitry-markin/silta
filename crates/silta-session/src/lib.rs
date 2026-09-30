@@ -82,26 +82,54 @@ pub struct Config {
     pub stop_grace: Duration,
     pub limits: Limits,
     pub backups_keep: usize,
-    /// Emergency mode, the unit's `SILTA_EMERGENCY_LINE` in a drop-in: the saved session
-    /// is resumed and this line is sent in place of the host line that starts it (a
-    /// `/compact` with instructions of the operator's own, for a session whose
-    /// compaction is refused). The run takes no messages, rotates nothing, and ends
-    /// with [`EXIT_EMERGENCY`] at the end of that one turn.
-    pub emergency: Option<String>,
-    /// The unit's `SILTA_EMERGENCY_ACCEPT_MESSAGES`, for an emergency line that is a
-    /// prompt rather than a command: the line replaces only the host line of a plain
-    /// resume, and the session then runs as usual, messages and rotation included. A
-    /// line that is a slash command is never run this way: no model answers it.
-    pub emergency_accept: bool,
+    /// Emergency mode, from a drop-in of the unit.
+    pub emergency: Option<Emergency>,
 }
 
 impl Config {
     /// Emergency mode of the one-turn kind: the line, then [`EXIT_EMERGENCY`].
     fn one_shot(&self) -> bool {
-        self.emergency
-            .as_deref()
-            .is_some_and(|line| !self.emergency_accept || line.starts_with('/'))
+        matches!(self.emergency, Some(Emergency::OneShot(_)))
     }
+}
+
+/// Emergency mode, the unit's `SILTA_EMERGENCY_LINE` in a drop-in, for a session whose
+/// compaction is refused: the line is sent to the resumed session in place of the host
+/// line that starts it. [`Emergency::new`] decides the kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Emergency {
+    /// The saved session is resumed for this one line (a `/compact` with instructions
+    /// of the operator's own): the run takes no messages, rotates nothing, and ends
+    /// with [`EXIT_EMERGENCY`] at the end of that turn.
+    OneShot(String),
+    /// A prompt, with the unit's `SILTA_EMERGENCY_ACCEPT_MESSAGES`: the line replaces
+    /// only the host line of a plain resume, and the session then runs as usual,
+    /// messages and rotation included.
+    Prompt(String),
+}
+
+impl Emergency {
+    /// The mode of `line`, none when it is blank. `accept` asks for the session to run
+    /// on after the line, which a slash command never gets: no model answers it, and
+    /// the first turn of a session must be answered.
+    pub fn new(line: &str, accept: bool) -> Option<Self> {
+        let line = line.trim();
+        if line.is_empty() {
+            None
+        } else if accept && !is_command(line) {
+            Some(Emergency::Prompt(line.to_owned()))
+        } else {
+            Some(Emergency::OneShot(line.to_owned()))
+        }
+    }
+}
+
+/// A slash command: the first word is a `/` and a name. A path (`/var/lib/…`) is prose.
+fn is_command(line: &str) -> bool {
+    line.split_whitespace()
+        .next()
+        .and_then(|word| word.strip_prefix('/'))
+        .is_some_and(|name| !name.is_empty() && !name.contains('/'))
 }
 
 /// The variables that decide how Claude Code authenticates and where.
@@ -223,9 +251,6 @@ async fn supervise(cfg: &Config, shutdown: &CancellationToken) -> (i32, String) 
     }
     paths.prune_cache();
     let mut not_before = None;
-    if cfg.emergency_accept && cfg.one_shot() {
-        eprintln!("emergency: SILTA_EMERGENCY_ACCEPT_MESSAGES is ignored, the line is a slash command that no model answers; running its one turn only");
-    }
     loop {
         if shutdown.is_cancelled() {
             return (0, "stopped between two runs of claude".to_owned());
@@ -540,19 +565,19 @@ async fn run_once(
     let line = match &cfg.emergency {
         // Only a plain resume: a fresh conversation and a handoff retry keep their own
         // lines, which the line was not written for.
-        Some(line) if !one_shot && start.kind == Kind::Resumed => {
+        Some(Emergency::Prompt(line)) if start.kind == Kind::Resumed => {
             eprintln!(
                 "emergency: sending the line of SILTA_EMERGENCY_LINE ({} bytes) in place of the start line; the session then runs as usual, and gets the line at every restart until the variable is removed",
                 line.len()
             );
             line.clone()
         }
-        Some(_) if !one_shot => {
+        Some(Emergency::Prompt(_)) => {
             eprintln!("emergency: the line of SILTA_EMERGENCY_LINE is not sent, this start is not a plain resume");
             intro(&cfg.session, start.kind)
         }
-        // The one-turn line: its snapshot and its cap are taken when it goes out.
-        Some(line) => line.clone(),
+        // Its snapshot and its cap are taken when it goes out.
+        Some(Emergency::OneShot(line)) => line.clone(),
         None => intro(&cfg.session, start.kind),
     };
     if cfg.window.is_some() {
@@ -568,11 +593,8 @@ async fn run_once(
     }
 
     // A one-turn line that compacts: a turn that ends before the compaction is not its.
-    let compaction = one_shot
-        && cfg
-            .emergency
-            .as_deref()
-            .is_some_and(|line| line.starts_with("/compact"));
+    let compaction =
+        matches!(&cfg.emergency, Some(Emergency::OneShot(line)) if line.starts_with("/compact"));
     let mut readers_open = true;
     let mut no_conversation = false;
     let mut ticks: u64 = 0;

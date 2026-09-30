@@ -8,7 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use silta_session::{compact, handoff, rotation::Limits, Auth, Config, EXIT_EMERGENCY, EXIT_MODEL};
+use silta_session::{
+    compact, handoff, rotation::Limits, Auth, Config, Emergency, EXIT_EMERGENCY, EXIT_MODEL,
+};
 use tokio_util::sync::CancellationToken;
 
 struct Fixture {
@@ -52,7 +54,6 @@ impl Fixture {
             },
             backups_keep: 3,
             emergency: None,
-            emergency_accept: false,
         }
     }
 
@@ -939,7 +940,7 @@ async fn emergency_mode_sends_its_line_once_and_stays_down() {
     fx.set("fake-context", "10");
     let cfg = fx.config();
     let emergency = Config {
-        emergency: Some("/compact Leave the refused exchange out.".into()),
+        emergency: Emergency::new("/compact Leave the refused exchange out.", false),
         ..fx.config()
     };
     // Nothing to resume: no claude is started.
@@ -1041,8 +1042,7 @@ async fn an_emergency_line_that_accepts_messages_starts_a_usual_session() {
     let fx = Fixture::new("emergency-accept");
     fx.set("fake-context", "10");
     let cfg = Config {
-        emergency: Some("The session has started in emergency mode.".into()),
-        emergency_accept: true,
+        emergency: Emergency::new("The session has started in emergency mode.", true),
         ..fx.config()
     };
     // No saved session: the new conversation gets its own start line.
@@ -1079,7 +1079,7 @@ async fn an_emergency_line_that_accepts_messages_starts_a_usual_session() {
 
     // A slash command is run as the one turn whatever the switch says.
     let slash = Config {
-        emergency: Some("/compact Short.".into()),
+        emergency: Emergency::new(" /compact Short.", true),
         ..cfg.clone()
     };
     assert_eq!(
@@ -1088,6 +1088,33 @@ async fn an_emergency_line_that_accepts_messages_starts_a_usual_session() {
     );
     assert_eq!(fx.log().matches("ready after answer").count(), 2);
     fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[test]
+fn the_emergency_line_decides_its_mode() {
+    let one = |line: &str| Some(Emergency::OneShot(line.to_owned()));
+    assert_eq!(Emergency::new("  \n", true), None);
+    assert_eq!(
+        Emergency::new(" /compact Short. ", false),
+        one("/compact Short.")
+    );
+    assert_eq!(
+        Emergency::new(" /compact Short.", true),
+        one("/compact Short.")
+    );
+    assert_eq!(Emergency::new("/clear", true), one("/clear"));
+    assert_eq!(Emergency::new("Say OK.", false), one("Say OK."));
+    assert_eq!(
+        Emergency::new("Say OK.", true),
+        Some(Emergency::Prompt("Say OK.".into()))
+    );
+    // A path is prose, not a command.
+    assert_eq!(
+        Emergency::new("/var/lib/notes says what to leave out.", true),
+        Some(Emergency::Prompt(
+            "/var/lib/notes says what to leave out.".into()
+        ))
+    );
 }
 
 /// Starts a session with `auth` and returns the credential variables claude saw.

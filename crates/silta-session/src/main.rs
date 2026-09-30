@@ -7,7 +7,7 @@ use clap::Parser;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
-use silta_session::{rotation::Limits, Auth, Config};
+use silta_session::{rotation::Limits, Auth, Config, Emergency};
 
 /// Runs one Silta session headless for silta-session@<name>.service.
 #[derive(Parser, Debug)]
@@ -141,6 +141,13 @@ fn main() -> ExitCode {
         }
     };
     eprintln!("authenticating with {auth:?}");
+    let emergency = args
+        .emergency_line
+        .as_deref()
+        .and_then(|line| Emergency::new(line, args.emergency_accept_messages));
+    if args.emergency_accept_messages && matches!(emergency, Some(Emergency::OneShot(_))) {
+        eprintln!("emergency: SILTA_EMERGENCY_ACCEPT_MESSAGES is ignored, the line is a slash command that no model answers; running its one turn only");
+    }
     let cfg = Config {
         session: args.session,
         state: args.state,
@@ -165,11 +172,7 @@ fn main() -> ExitCode {
             retry_pause: Duration::from_secs(args.rotate_retry_seconds),
         },
         backups_keep: args.backups_keep,
-        emergency: args
-            .emergency_line
-            .map(|line| line.trim().to_owned())
-            .filter(|line| !line.is_empty()),
-        emergency_accept: args.emergency_accept_messages,
+        emergency,
     };
 
     let runtime = match tokio::runtime::Runtime::new() {
