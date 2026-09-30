@@ -4,8 +4,8 @@
 //! `--verbose` is mandatory with `--output-format stream-json` and nothing turns the
 //! message content off, so each JSON line becomes one short line that keeps what an
 //! operator needs (session start, API retries and their status, the result of every
-//! turn with its usage, which tools a message used, an error's text) and drops the
-//! texts of the conversation. A line that is not JSON (Claude Code's own stderr, when it
+//! turn with its usage, which tools a message used, an error's text, a notice or a
+//! refusal whole) and drops the texts of the conversation. A line that is not JSON (Claude Code's own stderr, when it
 //! is fed through here) passes unchanged.
 
 use serde_json::{Map, Value};
@@ -243,6 +243,21 @@ fn system(map: &Map<String, Value>) -> String {
             len_of(map, "mcp_servers"),
             len_of(map, "plugins"),
         );
+    }
+    // A notice of Claude Code (a hook's message, a warning of its own) and a refusal are
+    // written out whole, every field as it came: they are what explains a turn or a
+    // compaction that did not go through, and their text is Claude Code's or the API's,
+    // though a hook's message may quote what it was run for.
+    if matches!(
+        subtype,
+        "informational" | "model_refusal_fallback" | "model_refusal_no_fallback"
+    ) {
+        let parts: Vec<String> = map
+            .iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "type" | "subtype"))
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        return format!("system {subtype}: {}", parts.join(" "));
     }
     // Other system lines are short and operational (api_retry with its status, compaction
     // boundaries); keep their scalar fields and the size of lists, drop nested content
@@ -508,6 +523,21 @@ mod tests {
             Event::ModelFallback {
                 trigger: "last_resort".into()
             }
+        );
+    }
+
+    #[test]
+    fn notices_and_refusals_are_written_out_whole() {
+        let notice = r#"{"type":"system","subtype":"informational","content":"PreCompact says: two words\nand a line","level":"notice","uuid":"n1","session_id":"af92"}"#;
+        assert_eq!(
+            summarize(notice),
+            r#"system informational: content="PreCompact says: two words\nand a line" level="notice" session_id="af92" uuid="n1""#
+        );
+        assert_eq!(read(notice).1, Event::Other);
+        let refusal = r#"{"type":"system","subtype":"model_refusal_no_fallback","original_model":"claude-opus-5-5","request_id":null,"api_refusal_category":"reasoning_extraction","api_refusal_explanation":"The request was refused.","content":"Claude declined","uuid":"r1","session_id":"af92"}"#;
+        assert_eq!(
+            summarize(refusal),
+            r#"system model_refusal_no_fallback: api_refusal_category="reasoning_extraction" api_refusal_explanation="The request was refused." content="Claude declined" original_model="claude-opus-5-5" request_id=null session_id="af92" uuid="r1""#
         );
     }
 

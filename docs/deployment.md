@@ -173,6 +173,19 @@ The following procedure might allow resuming the session with the original model
 4. Start the session again with the original model: `sudo systemctl start silta-session@<name>`.
 5. If the original model refuses again after step 4, the refused exchange still in the compaction summary is what triggers it. Keep the session on the weaker model until enough conversation has passed for it to leave the summary's message tail (about a hundred messages), then repeat the procedure. Alternatively, remove the session ID file `/var/lib/silta/<name>/session-id` and let `silta-session` start a fresh session. The workspace files and memory notes, including the last handoff note, are kept, but the conversation itself is not: the assistant starts from its notes rather than from the chat history.
 
+#### If the compaction itself is refused
+
+The compaction's summary request can be refused as well (a `system model_refusal_no_fallback` line in the journal, with the category and the explanation; a `system informational` line next to it may say more). The session then cannot be compacted with the default instructions. Emergency mode sends a line of your own to the resumed session in place of the host line that starts it, normally a `/compact` with instructions that leave the offending part out:
+
+1. Stop the session with `sudo systemctl stop silta-session@<name>` and set the line in a drop-in with `sudo systemctl edit silta-session@<name>`:
+   ```
+   [Service]
+   Environment="SILTA_EMERGENCY_LINE=/compact These instructions come from the host. Write the summary as your own handover to yourself. Leave out completely: ..."
+   ```
+   Quote the whole assignment as shown, write every `%` as `%%`, and escape `"` and `\` with a backslash. Then `sudo systemctl daemon-reload`.
+2. Start the session with `sudo systemctl start silta-session@<name>`. It resumes the saved conversation, copies memory and transcript to `backups/<time>-before-emergency`, sends the line, takes no messages and rotates nothing. At the end of that one turn it stops with status 80 and is not restarted; the `emergency mode:` line in the journal says whether the conversation was compacted.
+3. Remove the variable with `sudo systemctl revert silta-session@<name>` (edit instead if the drop-in holds other overrides), `sudo systemctl daemon-reload`, and start the session again. If the compaction failed, change the line and repeat from step 1; each attempt leaves a `before-emergency` copy, which is not pruned, so remove the ones you do not need.
+
 ### Checking the Claude Code contract
 
 Run the contract checker before trying a Claude Code version not yet tested for compatibility, and before submitting a bug report:

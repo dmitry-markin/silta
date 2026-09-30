@@ -102,6 +102,12 @@ struct Args {
     /// under the state directory's backups/.
     #[arg(long, env = "SILTA_BACKUPS_KEEP", default_value_t = 10)]
     backups_keep: usize,
+
+    /// Emergency mode: resume the saved session, send this line in place of the host
+    /// line that starts it (a /compact with other instructions), and exit with 80 at
+    /// the end of its turn. Empty is off.
+    #[arg(long, env = "SILTA_EMERGENCY_LINE")]
+    emergency_line: Option<String>,
 }
 
 fn parse_switch(s: &str) -> Result<bool, String> {
@@ -154,6 +160,10 @@ fn main() -> ExitCode {
             retry_pause: Duration::from_secs(args.rotate_retry_seconds),
         },
         backups_keep: args.backups_keep,
+        emergency: args
+            .emergency_line
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty()),
     };
 
     let runtime = match tokio::runtime::Runtime::new() {
