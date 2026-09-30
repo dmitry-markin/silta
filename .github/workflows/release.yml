@@ -86,6 +86,7 @@ jobs:
           deb=$(ls target/debian/silta_*_amd64.deb)
           dpkg-deb --info "$deb"
           dpkg-deb --contents "$deb"
+          echo
           echo "sha256sum:"
           sha256sum "$deb"
 
