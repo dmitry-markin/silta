@@ -108,6 +108,11 @@ struct Args {
     /// the end of its turn. Empty is off.
     #[arg(long, env = "SILTA_EMERGENCY_LINE")]
     emergency_line: Option<String>,
+
+    /// With an emergency line that is a prompt, not a slash command (0/1): send it in
+    /// place of the host line of a resume and let the session run as usual.
+    #[arg(long, env = "SILTA_EMERGENCY_ACCEPT_MESSAGES", default_value = "0", value_parser = parse_switch)]
+    emergency_accept_messages: bool,
 }
 
 fn parse_switch(s: &str) -> Result<bool, String> {
@@ -164,6 +169,7 @@ fn main() -> ExitCode {
             .emergency_line
             .map(|line| line.trim().to_owned())
             .filter(|line| !line.is_empty()),
+        emergency_accept: args.emergency_accept_messages,
     };
 
     let runtime = match tokio::runtime::Runtime::new() {

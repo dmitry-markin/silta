@@ -89,6 +89,8 @@ Restart=always
 # line (a `/compact` with other instructions, for a session whose compaction is refused),
 # no messages are taken, and the session stays down after that one turn until the
 # variable is removed. In a drop-in, quote the whole assignment and double every `%`.
+# With `SILTA_EMERGENCY_ACCEPT_MESSAGES=1` and a line that is a prompt, not a slash
+# command, the line replaces the start line of a resume and the session runs as usual.
 RestartPreventExitStatus=79 80
 RestartSec=10
 RestartSteps=6

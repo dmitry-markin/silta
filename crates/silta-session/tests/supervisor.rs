@@ -52,6 +52,7 @@ impl Fixture {
             },
             backups_keep: 3,
             emergency: None,
+            emergency_accept: false,
         }
     }
 
@@ -999,6 +1000,60 @@ async fn emergency_mode_sends_its_line_once_and_stays_down() {
     let snaps: Vec<String> = fx.snapshots().iter().map(|p| name(p)).collect();
     assert_eq!(snaps.len(), 2, "{snaps:?}");
     assert!(snaps.iter().all(|s| s.ends_with("-before-emergency")));
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+#[tokio::test]
+async fn an_emergency_line_that_accepts_messages_starts_a_usual_session() {
+    let fx = Fixture::new("emergency-accept");
+    fx.set("fake-context", "10");
+    let cfg = Config {
+        emergency: Some("The session has started in emergency mode.".into()),
+        emergency_accept: true,
+        ..fx.config()
+    };
+    // No saved session: the new conversation gets its own start line.
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    let log = fx.until(10, |l| l.contains("ready after answer")).await;
+    assert!(log.contains("line Session test started") && !log.contains("emergency mode"));
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+    let first = fx.id();
+
+    // The resume gets the line, opens the channel, and rotates on the marker as any
+    // session does.
+    fx.set("rotate-requested", "test");
+    let stop = CancellationToken::new();
+    let run = tokio::spawn({
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        async move { silta_session::run(&cfg, stop).await }
+    });
+    let log = fx
+        .until(20, |l| l.contains("line Context was compacted at"))
+        .await;
+    assert!(log.contains("line The session has started in emergency mode."));
+    assert!(!log.contains("restarted at"), "{log}");
+    assert_eq!(log.matches("ready after answer").count(), 2, "{log}");
+    assert!(log.contains(&format!("handoff {first}")) && log.contains(&format!("compact {first}")));
+    stop.cancel();
+    assert_eq!(run.await.unwrap(), 0);
+
+    // A slash command is run as the one turn whatever the switch says.
+    let slash = Config {
+        emergency: Some("/compact Short.".into()),
+        ..cfg.clone()
+    };
+    assert_eq!(
+        silta_session::run(&slash, CancellationToken::new()).await,
+        EXIT_EMERGENCY
+    );
+    assert_eq!(fx.log().matches("ready after answer").count(), 2);
     fs::remove_dir_all(&fx.home).unwrap();
 }
 

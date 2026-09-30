@@ -88,6 +88,20 @@ pub struct Config {
     /// compaction is refused). The run takes no messages, rotates nothing, and ends
     /// with [`EXIT_EMERGENCY`] at the end of that one turn.
     pub emergency: Option<String>,
+    /// The unit's `SILTA_EMERGENCY_ACCEPT_MESSAGES`, for an emergency line that is a
+    /// prompt rather than a command: the line replaces only the host line of a plain
+    /// resume, and the session then runs as usual, messages and rotation included. A
+    /// line that is a slash command is never run this way: no model answers it.
+    pub emergency_accept: bool,
+}
+
+impl Config {
+    /// Emergency mode of the one-turn kind: the line, then [`EXIT_EMERGENCY`].
+    fn one_shot(&self) -> bool {
+        self.emergency
+            .as_deref()
+            .is_some_and(|line| !self.emergency_accept || line.starts_with('/'))
+    }
 }
 
 /// The variables that decide how Claude Code authenticates and where.
@@ -209,11 +223,14 @@ async fn supervise(cfg: &Config, shutdown: &CancellationToken) -> (i32, String) 
     }
     paths.prune_cache();
     let mut not_before = None;
+    if cfg.emergency_accept && cfg.one_shot() {
+        eprintln!("emergency: SILTA_EMERGENCY_ACCEPT_MESSAGES is ignored, the line is a slash command that no model answers; running its one turn only");
+    }
     loop {
         if shutdown.is_cancelled() {
             return (0, "stopped between two runs of claude".to_owned());
         }
-        let start = if cfg.emergency.is_some() {
+        let start = if cfg.one_shot() {
             // Only the saved conversation: the line is not for a new one, and the
             // rotation's records are left as they are.
             match paths.read_id().filter(|id| paths.transcript(id).is_some()) {
@@ -245,7 +262,7 @@ async fn supervise(cfg: &Config, shutdown: &CancellationToken) -> (i32, String) 
         };
         match run_once(cfg, &paths, &start, not_before, shutdown).await {
             Outcome::Exit(code) if shutdown.is_cancelled() => return (code, "stopped".to_owned()),
-            Outcome::Exit(code) if cfg.emergency.is_some() => {
+            Outcome::Exit(code) if cfg.one_shot() => {
                 return (
                     EXIT_EMERGENCY,
                     format!("emergency mode: claude exited on its own with {code}"),
@@ -456,8 +473,9 @@ async fn run_once(
     }
 
     let now = Instant::now();
-    // Emergency mode rotates nothing: its one turn is the operator's.
-    let rotate = cfg.limits.enabled && cfg.emergency.is_none();
+    // Emergency mode of the one-turn kind rotates nothing: its turn is the operator's.
+    let one_shot = cfg.one_shot();
+    let rotate = cfg.limits.enabled && !one_shot;
     let mut run = Run {
         cfg,
         paths,
@@ -514,6 +532,19 @@ async fn run_once(
         _ => {}
     }
     let line = match &cfg.emergency {
+        // Only a plain resume: a fresh conversation and a handoff retry keep their own
+        // lines, which the line was not written for.
+        Some(line) if !one_shot && start.kind == Kind::Resumed => {
+            eprintln!(
+                "emergency: sending the line of SILTA_EMERGENCY_LINE ({} bytes) in place of the start line; the session then runs as usual, and gets the line at every restart until the variable is removed",
+                line.len()
+            );
+            line.clone()
+        }
+        Some(_) if !one_shot => {
+            eprintln!("emergency: the line of SILTA_EMERGENCY_LINE is not sent, this start is not a plain resume");
+            intro(&cfg.session, start.kind)
+        }
         Some(line) => {
             // The state the line is about to change, kept apart from the rotations'.
             match paths.snapshot("before-emergency", &start.id, cfg.backups_keep) {
@@ -577,13 +608,13 @@ async fn run_once(
                         stream::Event::ModelFallback { trigger } => run.fallback(trigger),
                         // The emergency turn: its end is the end of the run, and the
                         // channel stays closed whatever answers.
-                        stream::Event::Compacted { auto: false } if cfg.emergency.is_some() => {
+                        stream::Event::Compacted { auto: false } if one_shot => {
                             compacted = true;
                         }
-                        stream::Event::CompactionFailed if cfg.emergency.is_some() => {
+                        stream::Event::CompactionFailed if one_shot => {
                             compact_failed = true;
                         }
-                        stream::Event::Result { is_error, .. } if cfg.emergency.is_some() => {
+                        stream::Event::Result { is_error, .. } if one_shot => {
                             let what = if compacted {
                                 // The rotation that was pending, if any, is done by hand.
                                 paths.clear_rotation();
@@ -597,7 +628,7 @@ async fn run_once(
                             };
                             run.done(format!("emergency mode: {what}"));
                         }
-                        _ if cfg.emergency.is_some() => {}
+                        _ if one_shot => {}
                         // The handler for channel messages is in place from the first
                         // turn's `init`; the first answer of a model shows that the model
                         // serves.
@@ -653,7 +684,7 @@ async fn run_once(
                             ),
                         );
                     }
-                } else if cfg.emergency.is_some() {
+                } else if one_shot {
                     // The compaction's cap bounds the emergency turn.
                     if now >= started + cfg.limits.compact {
                         run.end(
