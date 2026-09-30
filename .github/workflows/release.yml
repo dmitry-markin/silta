@@ -114,7 +114,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential pkg-config git curl ca-certificates
+            build-essential pkg-config git curl ca-certificates libssl-dev
 
       - name: Install Rust
         run: |
