@@ -130,6 +130,8 @@ You can try using the latest version of Claude Code after checking it for compat
    ```
    The resulting `.deb` is located in `target/debian`, e.g. `target/debian/typst-cli_0.15.1-1_amd64.deb`.
 
+Install both packages as in step 3 of [Installing for the first time](#installing-for-the-first-time).
+
 ## Troubleshooting
 
 ### Session alerts
