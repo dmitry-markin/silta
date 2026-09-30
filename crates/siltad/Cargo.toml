@@ -1,6 +1,6 @@
 [package]
 name = "siltad"
-description = "Silta assistant daemon: the Matrix client that routes rooms to the assistant's sessions"
+description = "family AI assistant that runs on Claude Code and speaks Matrix"
 categories = ["command-line-utilities"]
 keywords.workspace = true
 version.workspace = true
@@ -39,10 +39,13 @@ revision = ""
 maintainer = "Dmitry Markin <dmitry@markin.tech>"
 copyright = "2026 Dmitry Markin"
 extended-description = """\
-Silta, the family assistant: siltad owns the bot's Matrix device and routes rooms to \
-Claude Code sessions ("minds") over a Unix socket; silta-claude is the channel plugin a \
-session runs. One systemd unit for the daemon, one template unit per mind, a helper that \
-adds a mind, a daily backup of the store."""
+Silta, a family AI assistant that runs on Claude Code and speaks Matrix. siltad owns \
+the assistant's Matrix device and delivers room messages to Claude Code sessions over \
+Unix sockets; silta-session supervises one session, running Claude Code headless with \
+the channel plugin silta-claude, which gives the assistant its Matrix tools. One \
+systemd unit for the daemon, one template unit per session, a helper that adds a \
+session, a daily backup of the store, and silta-contract-check for checking a Claude \
+Code version for compatibility."""
 section = "net"
 priority = "optional"
 depends = "$auto, systemd, passwd, bubblewrap, socat, python3"
