@@ -42,7 +42,7 @@
    ```
 8. Install `typst` (also needed for PDF rendering) from source using `cargo-deb`:
    ```bash
-   sudo apt install libssl-dev  # build dependency
+   sudo apt install libssl-dev  # build dependency of typst
    git clone https://github.com/typst/typst.git
    cd typst && git checkout v0.15.1  # replace v0.15.1 with the latest stable version
    cargo deb -p typst-cli
