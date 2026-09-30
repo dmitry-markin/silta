@@ -5,8 +5,8 @@
 //! message content off, so each JSON line becomes one short line that keeps what an
 //! operator needs (session start, API retries and their status, the result of every
 //! turn with its usage, which tools a message used, an error's text, a notice or a
-//! refusal whole) and drops the texts of the conversation. A line that is not JSON (Claude Code's own stderr, when it
-//! is fed through here) passes unchanged.
+//! refusal whole) and drops the texts of the conversation. A line that is not JSON
+//! (Claude Code's own stderr, when it is fed through here) passes unchanged.
 
 use serde_json::{Map, Value};
 
