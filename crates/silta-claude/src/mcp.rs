@@ -5,8 +5,8 @@ use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, sync::Arc};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, ContentBlock, CustomNotification, Implementation, InitializeResult,
-        JsonObject, ProtocolVersion, ServerCapabilities, ServerInfo, ServerNotification,
+        CallToolResult, ContentBlock, CustomNotification, Implementation, JsonObject,
+        ProtocolVersion, ServerCapabilities, ServerConfig, ServerNotification,
     },
     service::{NotificationContext, RoleServer},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
@@ -556,13 +556,13 @@ fn channel_params(inbound: &Inbound) -> serde_json::Value {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for SiltaChannel {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut capabilities = ServerCapabilities::builder().enable_tools().build();
         capabilities.experimental = Some(BTreeMap::from([(
             "claude/channel".to_owned(),
             JsonObject::new(),
         )]));
-        InitializeResult::new(capabilities)
+        ServerConfig::new(capabilities)
             .with_server_info(Implementation::new(
                 "silta-claude",
                 env!("CARGO_PKG_VERSION"),
