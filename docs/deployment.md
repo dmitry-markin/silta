@@ -10,9 +10,9 @@
 1. Create a Debian VM, either a cloud VM instance or a VM on an always-on machine. Do not install a Debian desktop environment: it comes with additional components and widens the attack surface (e.g., polkit). Debian 13 is recommended at the time of writing.
 
    Do not try to install the assistant on your regular machine: it uses global settings applied to all assistant sessions that would also apply to your own Claude Code sessions, making them unusable.
-2. Download Silta and typst (used for PDF renedering) `.deb` packages from the latest GitHub release at https://github.com/dmitry-markin/silta/releases. The packages are automatically built by a GitHub workflow from the tag matching the version in the release. Alternatively, [build from source](#building-from-source).
+2. Download the `.deb` packages of Silta and typst (used for PDF rendering) from the latest release at https://github.com/dmitry-markin/silta/releases. Both packages are built at the release tag by the workflow in the repository at that tag; the release notes carry their SHA-256 hashes and a link to the run that built them. Alternatively, [build from source](#building-from-source).
 3. Install the dependencies needed for PDF rendering, typst, and Silta.
-   ```
+   ```bash
    sudo apt install pandoc fonts-dejavu fonts-noto-core fonts-noto-color-emoji
    sudo dpkg -i typst-cli_0.15.1-1_amd64.deb
    sudo dpkg -i silta_0.5.1_amd64.deb
@@ -55,13 +55,8 @@
 
 ## Updating Silta
 
-1. With the repository cloned during the initial setup, build and install the new version with:
-   ```bash
-   cd silta && git fetch && git checkout <version>       # use the latest stable <version>
-   ./build-deb.sh
-   sudo dpkg -i target/debian/silta_<version>_amd64.deb  # use the path printed by build-deb.sh above
-   ```
-2. Update Claude Code to the tested version stated in [README](../README.md#project-status) following the procedure in [Updating Claude Code](#updating-claude-code) below.
+1. Download the new Silta `.deb` from the latest release and install it with `dpkg -i`. Install the typst `.deb` too if the release notes name a new typst version. Alternatively, [build from source](#building-from-source).
+2. Update Claude Code to the tested version stated in the release notes following the procedure in [Updating Claude Code](#updating-claude-code) below.
 3. Restart the services:
    ```bash
    sudo systemctl restart siltad
@@ -75,7 +70,7 @@ Claude Code is installed under the `claude` user and never updates itself. To in
 ### Installing the tested version
 
 1. Back up the entire `/opt/claude` with the currently installed version (if any) in case you need to revert to it.
-2. Install the tested version listed in [README](../README.md#project-status), providing it as `<version>` in the following command:
+2. Install the tested version listed in [README](../README.md#project-status) or release notes, providing it as `<version>` in the following command:
    ```bash
    sudo runuser -u claude -- bash -c \
        "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- <version>"
@@ -130,9 +125,8 @@ You can try using the latest version of Claude Code after checking it for compat
    ```bash
    sudo apt install libssl-dev  # build dependency of typst
    git clone https://github.com/typst/typst.git
-   cd typst && git checkout v0.15.1  # replace v0.15.1 with the typst version from Silta release
+   cd typst && git checkout v0.15.1  # replace v0.15.1 with the typst version from the Silta release
    cargo deb -p typst-cli
-   sudo dpkg -i target/debian/typst-cli_0.15.1-1_amd64.deb  # replace with the .deb for your version
    ```
    The resulting `.deb` is located in `target/debian`, e.g. `target/debian/typst-cli_0.15.1-1_amd64.deb`.
 
