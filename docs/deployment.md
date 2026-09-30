@@ -3,7 +3,7 @@
 ## Prerequisites
 
 1. Matrix account for the assistant.
-2. Dedicated headless Debian VM for the deployment.
+2. Dedicated headless Debian VM for the deployment. 2 vCPU, 4 GB of RAM and 32 GB of disk are enough to run the assistant for a family. Building from source requires 8 GB of RAM.
 
 ## Installing for the first time
 
