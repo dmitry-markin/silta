@@ -3,94 +3,60 @@
 ## Prerequisites
 
 1. Matrix account for the assistant.
-2. Dedicated headless Debian VM for the deployment.
+2. Dedicated headless Debian VM for the deployment. 2 vCPU, 4 GB of RAM and 32 GB of disk are enough to run the assistant for a family. Building from source requires 8 GB of RAM.
 
 ## Installing for the first time
 
 1. Create a Debian VM, either a cloud VM instance or a VM on an always-on machine. Do not install a Debian desktop environment: it comes with additional components and widens the attack surface (e.g., polkit). Debian 13 is recommended at the time of writing.
 
    Do not try to install the assistant on your regular machine: it uses global settings applied to all assistant sessions that would also apply to your own Claude Code sessions, making them unusable.
-2. Install Rust in the VM, following the instructions from https://rustup.rs/. Only the user that will build the packages needs Rust.
-3. Install build dependencies:
+2. Download the `.deb` packages of Silta and typst (used for PDF rendering) from the latest release at https://github.com/dmitry-markin/silta/releases. Both packages are built at the release tag by the workflow in the repository at that tag; the release notes carry their SHA-256 hashes and a link to the run that built them. Alternatively, [build from source](#building-from-source).
+3. Install the dependencies needed for PDF rendering, typst, and Silta.
    ```bash
-   sudo apt install build-essential pkg-config
-   ```
-   and `cargo-deb` for packaging:
-   ```bash
-   cargo install --locked cargo-deb
-   ```
-4. Clone the repo and build the `.deb` package:
-   ```bash
-   sudo apt install git
-   git clone https://github.com/dmitry-markin/silta.git
-   cd silta && git checkout v0.5.1  # replace v0.5.1 with the latest stable version
-   ./build-deb.sh
-   ```
-5. The last command above will print the `.deb` package location. Install it using `dpkg -i`. E.g., for v0.5.1 the command is:
-   ```bash
-   sudo dpkg -i target/debian/silta_0.5.1-1_amd64.deb
-   ```
-6. Finish `.deb` package installation by satisfying its dependencies with:
-   ```bash
+   sudo apt install pandoc fonts-dejavu fonts-noto-core fonts-noto-color-emoji curl
+   sudo dpkg -i typst-cli_0.15.1-1_amd64.deb
+   sudo dpkg -i silta_0.5.1_amd64.deb
    sudo apt install -f
    ```
-   On the first installation this command prints the remaining steps. They are listed here starting from the next step.
-
-7. Install the packages needed for PDF rendering from apt with the following command:
+   The last command will satisfy the dependencies of Silta itself and finish the package configuration. It will also print the remaining steps needed to configure Silta. They are listed here from the next step.
+4. Install Claude Code following the procedure in [Installing the tested version](#installing-the-tested-version) below.
+5. Edit `/etc/silta/siltad.toml` and fill in the assistant's Matrix `homeserver_url`, `user_id`, and `password`. You may also want to change the assistant's name in `/etc/silta/persona.md`.
+6. Add at least one assistant session with:
    ```bash
-   sudo apt install pandoc fonts-dejavu fonts-noto-core fonts-noto-color-emoji
+   sudo silta-session-add user-1  # user-1 can be any opaque identifier
    ```
-8. Install `typst` (also needed for PDF rendering) from source using `cargo-deb`:
-   ```bash
-   sudo apt install libssl-dev  # build dependency of typst
-   git clone https://github.com/typst/typst.git
-   cd typst && git checkout v0.15.1  # replace v0.15.1 with the latest stable version
-   cargo deb -p typst-cli
-   sudo dpkg -i target/debian/typst-cli_0.15.1-1_amd64.deb  # replace with the .deb for your version
-   ```
-9. Install Claude Code following the procedure in [Installing the tested version](#installing-the-tested-version) below.
-10. Edit `/etc/silta/siltad.toml` and fill in the assistant's Matrix `homeserver_url`, `user_id`, and `password`. You may also want to change the assistant's name in `/etc/silta/persona.md`.
-11. Add at least one assistant session with:
-    ```bash
-    sudo silta-session-add user-1  # user-1 can be any opaque identifier
-    ```
-    This will create the system user `silta-user-1` and initialize a Claude Code workspace in its home directory `/var/lib/silta/user-1`. Do not use a person's real name as the session name: it becomes a system user, visible to every session on the VM. The command also prints the steps needed to enable the session. They are listed here from the next step.
-12. Add the person and the session to `/etc/silta/siltad.toml`:
-    ```toml
-    [[people]]
-    name = "Bob"
-    role = "owner"
-    addresses = ["@bob:example.org"]
+   This will create the system user `silta-user-1` and initialize a Claude Code workspace in its home directory `/var/lib/silta/user-1`. Do not use a person's real name as the session name: it becomes a system user, visible to every session on the VM. The command also prints the steps needed to enable the session. They are listed here from the next step.
+7. Add the person and the session to `/etc/silta/siltad.toml`:
+   ```toml
+   [[people]]
+   name = "Bob"
+   role = "owner"
+   addresses = ["@bob:example.org"]
 
-    [[sessions]]
-    name = "user-1"
-    receive = { people = ["Bob"] }
-    user = "silta-user-1"
-    ```
-    Group rooms are served by a separate hub session with `receive = "groups"`. Add it the same way if the assistant should join shared rooms.
-13. Add exactly one of: `/etc/silta/auth/user-1/oauth-token` (for a personal session using Claude subscription, generated by `claude setup-token`) or `/etc/silta/auth/user-1/api-key` (for a session using Anthropic API key). The file must be owned by root with 0600 permissions.
-    ```bash
-    sudo install -m 0600 /dev/stdin /etc/silta/auth/user-1/oauth-token
-    # or
-    sudo install -m 0600 /dev/stdin /etc/silta/auth/user-1/api-key
-    ```
-    Paste the token, press Enter, then Ctrl-D.
-14. Restart `siltad` for the new config to take effect and enable session `user-1`:
-    ```bash
-    sudo systemctl restart siltad
-    sudo systemctl enable --now silta-session@user-1
-    ```
-15. You can now message the assistant from `@bob:example.org`. It will automatically accept the invitation and answer you.
+   [[sessions]]
+   name = "user-1"
+   receive = { people = ["Bob"] }
+   user = "silta-user-1"
+   ```
+   Group rooms are served by a separate hub session with `receive = "groups"`. Add it the same way if the assistant should join shared rooms.
+8. Add exactly one of: `/etc/silta/auth/user-1/oauth-token` (for a personal session using Claude subscription, generated by `claude setup-token`) or `/etc/silta/auth/user-1/api-key` (for a session using Anthropic API key). The file must be owned by root with 0600 permissions.
+   ```bash
+   sudo install -m 0600 /dev/stdin /etc/silta/auth/user-1/oauth-token
+   # or
+   sudo install -m 0600 /dev/stdin /etc/silta/auth/user-1/api-key
+   ```
+   Paste the token, press Enter, then Ctrl-D.
+9. Restart `siltad` for the new config to take effect and enable session `user-1`:
+   ```bash
+   sudo systemctl restart siltad
+   sudo systemctl enable --now silta-session@user-1
+   ```
+10. You can now message the assistant from `@bob:example.org`. It will automatically accept the invitation and answer you.
 
 ## Updating Silta
 
-1. With the repository cloned during the initial setup, build and install the new version with:
-   ```bash
-   cd silta && git fetch && git checkout <version>       # use the latest stable <version>
-   ./build-deb.sh
-   sudo dpkg -i target/debian/silta_<version>_amd64.deb  # use the path printed by build-deb.sh above
-   ```
-2. Update Claude Code to the tested version stated in [README](../README.md#project-status) following the procedure in [Updating Claude Code](#updating-claude-code) below.
+1. Download the new Silta `.deb` from the latest release and install it with `dpkg -i`. Install the typst `.deb` too if the release notes name a new typst version. Alternatively, [build from source](#building-from-source).
+2. Update Claude Code to the tested version stated in the release notes following the procedure in [Updating Claude Code](#updating-claude-code) below.
 3. Restart the services:
    ```bash
    sudo systemctl restart siltad
@@ -104,7 +70,7 @@ Claude Code is installed under the `claude` user and never updates itself. To in
 ### Installing the tested version
 
 1. Back up the entire `/opt/claude` with the currently installed version (if any) in case you need to revert to it.
-2. Install the tested version listed in [README](../README.md#project-status), providing it as `<version>` in the following command:
+2. Install the tested version listed in [README](../README.md#project-status) or release notes, providing it as `<version>` in the following command:
    ```bash
    sudo runuser -u claude -- bash -c \
        "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- <version>"
@@ -136,6 +102,35 @@ You can try using the latest version of Claude Code after checking it for compat
    sudo systemctl restart silta-session.target
    ```
 
+## Building from source
+
+1. Install Rust following the instructions at https://rustup.rs/. Only the Linux user that will build the packages needs Rust.
+2. Install common build dependencies:
+   ```bash
+   sudo apt install build-essential pkg-config
+   ```
+   and `cargo-deb` for packaging:
+   ```bash
+   cargo install --locked cargo-deb
+   ```
+3. Build Silta:
+   ```bash
+   sudo apt install git
+   git clone https://github.com/dmitry-markin/silta.git
+   cd silta && git checkout v0.5.1  # replace v0.5.1 with the latest stable version
+   ./build-deb.sh
+   ```
+   `build-deb.sh` will print the `.deb` package location.
+4. Build `typst`:
+   ```bash
+   sudo apt install libssl-dev  # build dependency of typst
+   git clone https://github.com/typst/typst.git
+   cd typst && git checkout v0.15.1  # replace v0.15.1 with the typst version from the Silta release
+   cargo deb -p typst-cli
+   ```
+   The resulting `.deb` is located in `target/debian`, e.g. `target/debian/typst-cli_0.15.1-1_amd64.deb`.
+
+Install both packages as in step 3 of [Installing for the first time](#installing-for-the-first-time).
 
 ## Troubleshooting
 
