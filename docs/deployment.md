@@ -13,7 +13,7 @@
 2. Download the `.deb` packages of Silta and typst (used for PDF rendering) from the latest release at https://github.com/dmitry-markin/silta/releases. Both packages are built at the release tag by the workflow in the repository at that tag; the release notes carry their SHA-256 hashes and a link to the run that built them. Alternatively, [build from source](#building-from-source).
 3. Install the dependencies needed for PDF rendering, typst, and Silta.
    ```bash
-   sudo apt install pandoc fonts-dejavu fonts-noto-core fonts-noto-color-emoji
+   sudo apt install pandoc fonts-dejavu fonts-noto-core fonts-noto-color-emoji curl
    sudo dpkg -i typst-cli_0.15.1-1_amd64.deb
    sudo dpkg -i silta_0.5.1_amd64.deb
    sudo apt install -f

@@ -27,8 +27,9 @@ case "$1" in
         cat <<'NOTE'
 silta: next steps, as root
   1. install Claude Code once, as the claude user:
-       runuser -u claude -- bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
-  2. silta-session-add hub, then silta-session-add <name> for each person
+       runuser -u claude -- bash -c 'curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.283'
+       (replace 2.1.283 with the tested version named in the Silta release notes)
+  2. silta-session-add <name> for each person and 'hub'
      (the daemon refuses to start while a configured session's user does not exist)
   3. give each mind its credential, as silta-session-add prints: one file in
      /etc/silta/auth/<name>, oauth-token (claude setup-token) or api-key (Claude Console)
@@ -36,7 +37,8 @@ silta: next steps, as root
   5. systemctl start siltad
   6. for the md2pdf and research skills (PDF generation), otherwise they fail at use:
        apt install pandoc fonts-dejavu fonts-noto-core fonts-noto-color-emoji
-     and typst by hand from https://github.com/typst/typst (packaged with cargo-deb).
+     and typst from the Silta release, or by hand from https://github.com/typst/typst
+     (packaged with cargo-deb).
 NOTE
       fi
     fi
