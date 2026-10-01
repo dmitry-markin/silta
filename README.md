@@ -2,8 +2,6 @@
 
 [![crates.io](https://img.shields.io/crates/v/silta.svg)](https://crates.io/crates/silta) [![CI](https://github.com/dmitry-markin/silta/actions/workflows/ci.yml/badge.svg)](https://github.com/dmitry-markin/silta/actions/workflows/ci.yml) [![License Apache-2.0 OR MIT](https://img.shields.io/badge/License-Apache--2.0%20OR%20MIT-blue)](#license)
 
-Family AI assistant that runs on Claude Code and speaks Matrix. Keeps its memory and the thread of a conversation across context limits, so it always stays the same assistant.
-
 Silta is for the adults of a family: each person uses their own Claude account, and [Anthropic's consumer terms](https://www.anthropic.com/legal/consumer-terms) require users to be 18 or older and forbid sharing an account.
 
 <p align="center">
@@ -11,6 +9,8 @@ Silta is for the adults of a family: each person uses their own Claude account, 
   &nbsp;&nbsp;&nbsp;
   <img src="docs/images/pdf-report-phone.webp" width="280" height="363" alt="PDF report">
 </p>
+
+Family AI assistant that runs on Claude Code and speaks Matrix. Keeps its memory and the thread of a conversation across context limits, so it always stays the same assistant.
 
 ## Features
 
