@@ -10,6 +10,8 @@ Family AI assistant that runs on Claude Code and speaks Matrix. Keeps its memory
   <img src="docs/images/pdf-report-phone.webp" width="280" height="363" alt="PDF report">
 </p>
 
+Silta is for the adults of a family: each person uses their own Claude account, and [Anthropic's consumer terms](https://www.anthropic.com/legal/consumer-terms) require users to be 18 or older and forbid sharing an account.
+
 ## Features
 
 - Claude Code as the harness: one long-lived session per person, plus a shared session for the family rooms. Each person uses their own Claude subscription (via `claude setup-token`) or Anthropic API key.
