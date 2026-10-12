@@ -1,10 +1,12 @@
 //! `siltad`: owns the bot's Matrix device and routes rooms to assistant sessions.
 
-use std::{collections::HashMap, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{
+    collections::HashMap, os::unix::fs::MetadataExt, path::PathBuf, process::ExitCode, sync::Arc,
+};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use silta::config::{Config, ConfigError, Routing};
+use silta::config::{Config, Routing};
 use siltad::{
     alert, backup,
     daemon::{now_ms, Daemon, Settings},
@@ -80,19 +82,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
-    let config = if args.config.as_os_str() == "-" {
-        let text = std::io::read_to_string(std::io::stdin())
-            .context("cannot read the configuration from standard input")?;
-        Config::parse(&text).map_err(|err| match err {
-            ConfigError::Parse { source, .. } => ConfigError::Parse {
-                path: "standard input".into(),
-                source,
-            },
-            other => other,
-        })?
-    } else {
-        Config::load(&args.config)?
-    };
+    let config = Config::load(&args.config)?;
     match args.command {
         Some(Command::Backup { to, keep }) => {
             backup::run(&config.state_dir, &to, keep, &backup::stamp(now_ms()))?;
@@ -118,8 +108,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         config.alert_grace_secs,
         config.socket.display()
     );
+    let _lock = session::lock_state_dir(&config.state_dir)?;
     let client = session::build_client(&config.matrix.homeserver_url, &config.state_dir).await?;
     session::login_or_restore(&client, &config.state_dir, &credentials(&config)).await?;
+    session::report_cross_signing(&client).await;
     if let Some(name) = &config.matrix.display_name {
         session::ensure_display_name(&client, name).await;
     }
@@ -192,21 +184,26 @@ fn credentials(config: &Config) -> session::Credentials<'_> {
     }
 }
 
-/// `siltad reset-cross-signing`. Refuses while the daemon answers on its socket: two
-/// processes holding the same crypto store each keep their own copy of the device's
-/// keys in memory, and the daemon would never see the new identity.
+/// `siltad reset-cross-signing`, as the owner of the state directory: files another
+/// user creates in the store (root's, say) would keep the daemon from opening it.
 async fn reset_cross_signing(config: &Config) -> anyhow::Result<()> {
-    match tokio::net::UnixStream::connect(&config.socket).await {
-        Ok(_) => anyhow::bail!(
-            "siltad is running (it answers on {}); stop it first",
-            config.socket.display()
-        ),
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => anyhow::bail!(
-            "cannot tell whether siltad is running ({}: {err}); run as the daemon's user",
-            config.socket.display()
-        ),
-        Err(_) => {}
+    let owner = std::fs::metadata(&config.state_dir)
+        .with_context(|| {
+            format!(
+                "cannot read {}; start siltad once before resetting",
+                config.state_dir.display()
+            )
+        })?
+        .uid();
+    let uid = nix::unistd::geteuid().as_raw();
+    if owner != uid {
+        anyhow::bail!(
+            "{} belongs to uid {owner} but this command runs as uid {uid}; run it as the \
+             daemon's user",
+            config.state_dir.display()
+        );
     }
+    let _lock = session::lock_state_dir(&config.state_dir)?;
     let client = session::build_client(&config.matrix.homeserver_url, &config.state_dir).await?;
     session::login_or_restore(&client, &config.state_dir, &credentials(config)).await?;
     session::reset_cross_signing(&client, &config.matrix.password).await

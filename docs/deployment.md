@@ -150,14 +150,14 @@ A `silta-session` unit that exited with status 79 (`sudo systemctl status silta-
 
 ### Messages marked as sent by an unverified device
 
-If clients mark the assistant's messages "Encrypted by a device not verified by its owner" and the `siltad` journal says `cross-signing is not complete` after the first login, another client (for example Element, when the account was registered there) set up the account's cross-signing, and `siltad` does not have its private keys. Replace the account's cross-signing identity with a new one owned by `siltad`:
+If clients mark the assistant's messages "Encrypted by a device not verified by its owner" and the `siltad` journal says `this device is not signed by the account's cross-signing identity` at start, another client (for example Element, when the account was registered there) set up the account's cross-signing, and `siltad` does not have its private keys. Replace the account's cross-signing identity with a new one owned by `siltad`:
 
 1. Stop the daemon with `sudo systemctl stop siltad`.
 2. Run the reset as the daemon's user, with the configuration on standard input:
    ```bash
    sudo sh -c 'runuser -u silta -- siltad --config - reset-cross-signing < /etc/silta/siltad.toml'
    ```
-   On a homeserver with OAuth 2.0 accounts, such as matrix.org, the command prints an approval URL. Open it, log in as the assistant's account and approve the reset within two minutes. Other homeservers accept the password from `siltad.toml`.
+   On a homeserver with OAuth 2.0 accounts, such as matrix.org, the command prints an approval URL. Open it, log in as the assistant's account and approve the reset within two minutes. Other homeservers accept the password from `siltad.toml`. If the command fails or is interrupted, run it again: until a reset succeeds, the device works unsigned as before. The command refuses to run while `siltad` runs, and when the device is already signed.
 3. Start the daemon with `sudo systemctl start siltad`.
 
 The other sessions of the assistant's account, such as the Element session it was registered with, become unverified, and people who verified the assistant see a warning that its identity changed. They can verify it again.
