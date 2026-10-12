@@ -16,7 +16,7 @@ replay_window_secs = 7200   # a message waits this long for its session, or is r
 [matrix]
 homeserver_url = "https://matrix.example.org"
 user_id        = "@silta:example.org"
-password       = "CHANGE-ME"      # used only for the first login; the saved session is used afterwards
+password       = "CHANGE-ME"      # used for the first login and by `siltad reset-cross-signing`; the saved session is used otherwise
 device_id      = "silta"        # the bot's one and only device
 device_name    = "Silta"
 display_name   = "Silta"        # the account's name in clients, set at start when it differs

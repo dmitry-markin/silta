@@ -4,7 +4,7 @@ use std::{collections::HashMap, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use silta::config::{Config, Routing};
+use silta::config::{Config, ConfigError, Routing};
 use siltad::{
     alert, backup,
     daemon::{now_ms, Daemon, Settings},
@@ -32,7 +32,8 @@ const DEFAULT_LOG_FILTER: &str = "info,\
 #[derive(Parser, Debug)]
 #[command(name = "siltad", version = env!("SILTA_VERSION"))]
 struct Args {
-    /// Configuration file.
+    /// Configuration file, or `-` for standard input (to run a command as the daemon's
+    /// user, who cannot read the root-owned file).
     #[arg(long, default_value = "/etc/silta/siltad.toml")]
     config: PathBuf,
 
@@ -50,6 +51,11 @@ enum Command {
         #[arg(long, default_value_t = 7)]
         keep: usize,
     },
+    /// Replace the account's cross-signing identity with one owned by this device and
+    /// sign the device with it (the daemon must be stopped). On a homeserver with OAuth
+    /// 2.0 accounts, such as matrix.org, approve the reset at the printed URL within
+    /// two minutes.
+    ResetCrossSigning,
 }
 
 #[tokio::main]
@@ -74,10 +80,26 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
-    let config = Config::load(&args.config)?;
-    if let Some(Command::Backup { to, keep }) = args.command {
-        backup::run(&config.state_dir, &to, keep, &backup::stamp(now_ms()))?;
-        return Ok(());
+    let config = if args.config.as_os_str() == "-" {
+        let text = std::io::read_to_string(std::io::stdin())
+            .context("cannot read the configuration from standard input")?;
+        Config::parse(&text).map_err(|err| match err {
+            ConfigError::Parse { source, .. } => ConfigError::Parse {
+                path: "standard input".into(),
+                source,
+            },
+            other => other,
+        })?
+    } else {
+        Config::load(&args.config)?
+    };
+    match args.command {
+        Some(Command::Backup { to, keep }) => {
+            backup::run(&config.state_dir, &to, keep, &backup::stamp(now_ms()))?;
+            return Ok(());
+        }
+        Some(Command::ResetCrossSigning) => return reset_cross_signing(&config).await,
+        None => {}
     }
     for warning in config.warnings() {
         warn!("{warning}");
@@ -97,18 +119,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         config.socket.display()
     );
     let client = session::build_client(&config.matrix.homeserver_url, &config.state_dir).await?;
-    session::login_or_restore(
-        &client,
-        &config.state_dir,
-        &session::Credentials {
-            homeserver_url: &config.matrix.homeserver_url,
-            user_id: &config.matrix.user_id,
-            password: &config.matrix.password,
-            device_id: &config.matrix.device_id,
-            device_name: &config.matrix.device_name,
-        },
-    )
-    .await?;
+    session::login_or_restore(&client, &config.state_dir, &credentials(&config)).await?;
     if let Some(name) = &config.matrix.display_name {
         session::ensure_display_name(&client, name).await;
     }
@@ -169,6 +180,36 @@ async fn run(args: Args) -> anyhow::Result<()> {
     sync?;
     info!("stopped");
     Ok(())
+}
+
+fn credentials(config: &Config) -> session::Credentials<'_> {
+    session::Credentials {
+        homeserver_url: &config.matrix.homeserver_url,
+        user_id: &config.matrix.user_id,
+        password: &config.matrix.password,
+        device_id: &config.matrix.device_id,
+        device_name: &config.matrix.device_name,
+    }
+}
+
+/// `siltad reset-cross-signing`. Refuses while the daemon answers on its socket: two
+/// processes holding the same crypto store each keep their own copy of the device's
+/// keys in memory, and the daemon would never see the new identity.
+async fn reset_cross_signing(config: &Config) -> anyhow::Result<()> {
+    match tokio::net::UnixStream::connect(&config.socket).await {
+        Ok(_) => anyhow::bail!(
+            "siltad is running (it answers on {}); stop it first",
+            config.socket.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => anyhow::bail!(
+            "cannot tell whether siltad is running ({}: {err}); run as the daemon's user",
+            config.socket.display()
+        ),
+        Err(_) => {}
+    }
+    let client = session::build_client(&config.matrix.homeserver_url, &config.state_dir).await?;
+    session::login_or_restore(&client, &config.state_dir, &credentials(config)).await?;
+    session::reset_cross_signing(&client, &config.matrix.password).await
 }
 
 /// The uid behind each session's `user`, looked up once: a session whose user does not

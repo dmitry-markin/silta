@@ -11,8 +11,8 @@ use anyhow::{bail, Context, Result};
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::RequestConfig,
-    encryption::{BackupDownloadStrategy, EncryptionSettings},
-    ruma::api::error::ErrorKind,
+    encryption::{BackupDownloadStrategy, CrossSigningResetAuthType, EncryptionSettings},
+    ruma::api::{client::uiaa, error::ErrorKind},
     Client,
 };
 use tracing::{info, warn};
@@ -158,7 +158,11 @@ pub async fn login_or_restore(
         .await;
     match client.encryption().cross_signing_status().await {
         Some(status) if status.is_complete() => info!("cross-signing bootstrapped"),
-        status => warn!("cross-signing is not complete ({status:?}); the device works unsigned"),
+        status => warn!(
+            "cross-signing is not complete ({status:?}); the device works unsigned. If the \
+             account's cross-signing was set up by another client, stop siltad and run \
+             `siltad reset-cross-signing`"
+        ),
     }
 
     let session = client
@@ -168,6 +172,64 @@ pub async fn login_or_restore(
     write_private(&session_file, &serde_json::to_string_pretty(&session)?)?;
     info!(user = %session.meta.user_id, device = %session.meta.device_id, "logged in, session saved to {}", session_file.display());
     Ok(())
+}
+
+/// Replace the account's cross-signing identity with a new one whose private keys stay
+/// in this device's store, and sign this device with it. For an account whose identity
+/// another client created (Element does at registration): without its private keys the
+/// device works unsigned, and clients mark its messages as sent by an unverified device.
+/// The other sessions of the account and the people who verified it see the identity
+/// change.
+///
+/// A homeserver with password UIA takes the configured password. One with OAuth 2.0
+/// accounts (matrix.org) asks the owner to approve the reset in a browser; the SDK
+/// retries the upload for two minutes while waiting for the approval.
+pub async fn reset_cross_signing(client: &Client, password: &str) -> Result<()> {
+    let encryption = client.encryption();
+    encryption.wait_for_e2ee_initialization_tasks().await;
+    let Some(handle) = encryption
+        .reset_cross_signing()
+        .await
+        .context("cannot reset cross-signing")?
+    else {
+        info!("the homeserver accepted the new cross-signing keys without authentication");
+        return check_cross_signing(client).await;
+    };
+    let auth = match handle.auth_type() {
+        CrossSigningResetAuthType::Uiaa(info) => {
+            let user_id = client
+                .user_id()
+                .context("no user id after login")?
+                .to_owned();
+            let mut password = uiaa::Password::new(user_id.into(), password.to_owned());
+            password.session = info.session.clone();
+            uiaa::AuthData::Password(password)
+        }
+        CrossSigningResetAuthType::OAuth(info) => {
+            warn!(
+                "approve the cross-signing reset within two minutes at {}",
+                info.approval_url
+            );
+            let mut oauth = uiaa::OAuth::new();
+            oauth.session = info.session.clone();
+            uiaa::AuthData::OAuth(oauth)
+        }
+    };
+    handle
+        .auth(Some(auth))
+        .await
+        .context("the homeserver did not accept the new cross-signing keys")?;
+    check_cross_signing(client).await
+}
+
+async fn check_cross_signing(client: &Client) -> Result<()> {
+    match client.encryption().cross_signing_status().await {
+        Some(status) if status.is_complete() => {
+            info!("cross-signing reset; this device is signed by the new identity");
+            Ok(())
+        }
+        status => bail!("cross-signing is still not complete after the reset ({status:?})"),
+    }
 }
 
 /// M_UNKNOWN_TOKEN or M_MISSING_TOKEN: the saved session is dead.
