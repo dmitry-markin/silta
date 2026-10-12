@@ -206,12 +206,12 @@ pub enum SendPolicy {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("cannot read {path}: {source}")]
+    #[error("cannot read {path}")]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("cannot parse {path}: {source}")]
+    #[error("cannot parse {path}")]
     Parse {
         path: PathBuf,
         source: toml::de::Error,
