@@ -82,7 +82,7 @@ async fn run() -> Result<()> {
     let client = build_client(&homeserver, &prepared).await?;
     login_or_restore(
         &client,
-        &state_dir,
+        &prepared,
         &Credentials {
             homeserver_url: &homeserver,
             user_id: &user,

@@ -5,6 +5,7 @@ use std::{
     io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
@@ -21,9 +22,8 @@ use tracing::{info, warn};
 
 pub const SESSION_FILE: &str = "session.json";
 pub const STORE_DIR: &str = "store";
-/// Held by the daemon and by `reset-cross-signing` while they use the store: two
-/// processes on one crypto store each keep their own copy of the device's keys in
-/// memory and overwrite each other's. `backup` only reads and does not take it.
+/// Held while a process uses the store: two processes on one crypto store would each
+/// keep the device's keys in memory and overwrite each other's. `backup` only reads.
 pub const LOCK_FILE: &str = "siltad.lock";
 
 pub struct Credentials<'a> {
@@ -77,10 +77,10 @@ pub async fn build_client(homeserver_url: &str, state_dir: &StateDir) -> Result<
 /// device id and save the session. Refuses a login onto an existing store.
 pub async fn login_or_restore(
     client: &Client,
-    state_dir: &Path,
+    state_dir: &StateDir,
     creds: &Credentials<'_>,
 ) -> Result<()> {
-    let session_file = state_dir.join(SESSION_FILE);
+    let session_file = state_dir.path().join(SESSION_FILE);
 
     if session_file.exists() {
         let text = fs::read_to_string(&session_file)
@@ -120,9 +120,6 @@ pub async fn login_or_restore(
         }
         return Ok(());
     }
-
-    // The store-without-session case was refused in `build_client`, before the builder
-    // created the (then empty) store.
 
     info!(
         user = creds.user_id,
@@ -168,9 +165,8 @@ pub async fn login_or_restore(
     Ok(())
 }
 
-/// The state directory, prepared and locked by [`prepare_state_dir`]; [`build_client`]
-/// takes it, so the store is never opened without the lock. The lock lasts as long as
-/// this value.
+/// The state directory, locked for as long as this value lives. [`build_client`] takes
+/// it, so the store is never opened without the lock.
 #[derive(Debug)]
 pub struct StateDir {
     path: PathBuf,
@@ -183,9 +179,8 @@ impl StateDir {
     }
 }
 
-/// Create `state_dir` (mode 0700) if needed and take its lock. Refuses a directory of
-/// another user: files created there (root's, say) would keep the daemon's user from
-/// opening its own store.
+/// Create `state_dir` (mode 0700) if needed and lock it. Refuses another user's
+/// directory: files created there (root's, say) would lock the daemon out of its store.
 pub fn prepare_state_dir(state_dir: &Path) -> Result<StateDir> {
     fs::create_dir_all(state_dir)
         .with_context(|| format!("cannot create {}", state_dir.display()))?;
@@ -195,7 +190,7 @@ pub fn prepare_state_dir(state_dir: &Path) -> Result<StateDir> {
     let uid = nix::unistd::geteuid().as_raw();
     if owner != uid {
         bail!(
-            "{} belongs to uid {owner} but siltad runs as uid {uid}; run it as the daemon's user",
+            "{} belongs to uid {owner} but this runs as uid {uid}; run it as the directory's owner",
             state_dir.display()
         );
     }
@@ -214,8 +209,7 @@ pub fn prepare_state_dir(state_dir: &Path) -> Result<StateDir> {
             _lock: file,
         }),
         Err(fs::TryLockError::WouldBlock) => bail!(
-            "another siltad process (the daemon, or a reset-cross-signing in progress) holds \
-             {}; stop it first",
+            "another process (the daemon, say) holds {}; stop it first",
             path.display()
         ),
         Err(fs::TryLockError::Error(err)) => {
@@ -224,13 +218,12 @@ pub fn prepare_state_dir(state_dir: &Path) -> Result<StateDir> {
     }
 }
 
-/// Whether the homeserver shows this device signed by the account's self-signing key,
-/// which is what clients check before marking its messages as sent by a device not
-/// verified by its owner. Asks the server: the local cross-signing status only says
-/// whether the private keys are in the store.
+/// Whether the homeserver shows this device signed by the account's cross-signing
+/// identity: clients mark the messages of an unsigned device. The local status would
+/// only say whether the private keys are in the store.
 pub async fn device_signed_on_server(client: &Client) -> Result<bool> {
     let encryption = client.encryption();
-    // The SDK's own key query and cross-signing bootstrap after a login or restore.
+    // The SDK's own key query and bootstrap after a login or restore.
     encryption.wait_for_e2ee_initialization_tasks().await;
     let user_id = client.user_id().context("not logged in")?;
     encryption
@@ -248,34 +241,27 @@ async fn own_device(client: &Client) -> Result<Device> {
         .context("this device is missing from the store")
 }
 
-/// Log whether the device is cross-signed, and how to fix it when it is not. Not fatal:
-/// an unsigned device works, its messages are only marked.
+/// Log whether the device is cross-signed, and the fix when it is not.
 pub async fn report_cross_signing(client: &Client) {
     match device_signed_on_server(client).await {
         Ok(true) => info!("this device is signed by the account's cross-signing identity"),
         Ok(false) => warn!(
             "this device is not signed by the account's cross-signing identity, so clients \
-             mark its messages as sent by an unverified device; when another client set up \
-             the account's cross-signing, stop siltad and run `siltad reset-cross-signing`"
+             mark its messages as sent by an unverified device; see \"Messages marked as sent \
+             by an unverified device\" in docs/deployment.md"
         ),
         Err(err) => warn!("cannot check whether this device is cross-signed: {err:#}"),
     }
 }
 
-/// Sign this device with a cross-signing identity whose private keys are in its store,
-/// replacing the account's identity when they are not. For an account whose identity
-/// another client created (Element does at registration): without its private keys the
-/// device works unsigned, and clients mark its messages as sent by an unverified device.
-/// A replacement shows as an identity change to the account's other sessions and to
-/// everyone who verified it, so a device the server already shows as signed is left
-/// alone.
+/// Sign this device with a cross-signing identity whose private keys are in the store,
+/// replacing the account's identity if needed (when another client, such as Element,
+/// created it). A replacement shows as an identity change to everyone who verified the
+/// account, so a device that is already signed is left alone.
 ///
-/// A previous run may have left private keys in the store: the SDK saves them before the
-/// upload is authorised, and the signature of the device is a separate upload after it.
-/// They are tried first, so a run after a partial failure does not replace the identity
-/// once more. Keys the server never took are gone by then (the SDK drops private keys
-/// that differ from the server's identity when it fetches the keys), so a failure to
-/// sign with the ones left is transient.
+/// Keys left in the store by an interrupted run are tried first, so a rerun does not
+/// replace the identity once more. The SDK drops stored keys that differ from the
+/// server's when it fetches them, so a failure to sign with the rest is transient.
 pub async fn reset_cross_signing(client: &Client, password: &str) -> Result<()> {
     if device_signed_on_server(client).await? {
         bail!(
@@ -308,9 +294,8 @@ pub async fn reset_cross_signing(client: &Client, password: &str) -> Result<()> 
     Ok(())
 }
 
-/// Upload a new cross-signing identity. A homeserver with password UIA takes the
-/// configured password; one with OAuth 2.0 accounts (matrix.org) asks the owner to
-/// approve in a browser while the SDK retries the upload for two minutes.
+/// Upload a new cross-signing identity, authorised with the configured password or, on a
+/// homeserver with OAuth 2.0 accounts (matrix.org), by the owner in a browser.
 async fn replace_identity(client: &Client, password: &str) -> Result<()> {
     let Some(handle) = client
         .encryption()
@@ -320,26 +305,12 @@ async fn replace_identity(client: &Client, password: &str) -> Result<()> {
     else {
         return Ok(());
     };
-    let auth = match handle.auth_type() {
+    let (auth, oauth) = match handle.auth_type() {
         CrossSigningResetAuthType::Uiaa(info) => {
-            // The SDK resends the auth every half second for two minutes while the server
-            // wants another stage: with a stage siltad cannot provide, that would be some
-            // 240 requests carrying the password.
-            if !info
-                .flows
-                .iter()
-                .any(|flow| flow.stages == [uiaa::AuthType::Password])
-            {
-                bail!(
-                    "the homeserver asks for more than the password to reset cross-signing \
-                     ({:?}), which siltad cannot provide",
-                    info.flows
-                );
-            }
             let user_id = client.user_id().context("not logged in")?.to_owned();
             let mut password = uiaa::Password::new(user_id.into(), password.to_owned());
             password.session = info.session.clone();
-            uiaa::AuthData::Password(password)
+            (uiaa::AuthData::Password(password), false)
         }
         CrossSigningResetAuthType::OAuth(info) => {
             // Not through tracing: a log filter must not hide what the owner has to do.
@@ -350,14 +321,29 @@ async fn replace_identity(client: &Client, password: &str) -> Result<()> {
             );
             let mut oauth = uiaa::OAuth::new();
             oauth.session = info.session.clone();
-            uiaa::AuthData::OAuth(oauth)
+            (uiaa::AuthData::OAuth(oauth), true)
         }
     };
-    match handle.auth(Some(auth)).await {
+    // The SDK retries every half second for two minutes until the server takes the
+    // upload: the time to approve in the browser, but with a password each retry only
+    // resends it to a server that wants another authentication stage.
+    let auth = handle.auth(Some(auth));
+    let result = if oauth {
+        auth.await
+    } else {
+        tokio::time::timeout(Duration::from_secs(10), auth)
+            .await
+            .unwrap_or(Err(matrix_sdk::Error::Timeout))
+    };
+    match result {
         Ok(()) => Ok(()),
-        Err(matrix_sdk::Error::Timeout) => {
+        Err(matrix_sdk::Error::Timeout) if oauth => {
             bail!("the reset was not approved within two minutes; run the command again")
         }
+        Err(matrix_sdk::Error::Timeout) => bail!(
+            "the homeserver did not accept the password within 10 seconds (it may want another \
+             authentication step, which siltad cannot provide); run the command again"
+        ),
         Err(err)
             if err
                 .as_uiaa_response()
@@ -423,7 +409,7 @@ mod tests {
         let first = prepare_state_dir(&dir).unwrap();
         assert_eq!(first.path(), dir);
         let err = prepare_state_dir(&dir).unwrap_err().to_string();
-        assert!(err.contains("another siltad process"), "{err}");
+        assert!(err.contains("another process"), "{err}");
         drop(first);
         prepare_state_dir(&dir).unwrap();
         fs::remove_dir_all(&dir).unwrap();

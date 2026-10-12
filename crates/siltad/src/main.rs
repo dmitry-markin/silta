@@ -51,10 +51,9 @@ enum Command {
         #[arg(long, default_value_t = 7)]
         keep: usize,
     },
-    /// Replace the account's cross-signing identity with one owned by this device and
-    /// sign the device with it (the daemon must be stopped). On a homeserver with OAuth
-    /// 2.0 accounts, such as matrix.org, approve the reset at the printed URL within
-    /// two minutes.
+    /// Sign this device with a cross-signing identity whose keys siltad holds, replacing
+    /// the account's identity if needed (stop the daemon first). On matrix.org and other OAuth 2.0
+    /// homeservers, approve at the printed URL within two minutes.
     ResetCrossSigning,
 }
 
@@ -108,7 +107,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     );
     let state_dir = session::prepare_state_dir(&config.state_dir)?;
     let client = session::build_client(&config.matrix.homeserver_url, &state_dir).await?;
-    session::login_or_restore(&client, &config.state_dir, &credentials(&config)).await?;
+    session::login_or_restore(&client, &state_dir, &credentials(&config)).await?;
     tokio::spawn({
         let client = client.clone();
         async move { session::report_cross_signing(&client).await }
@@ -185,11 +184,15 @@ fn credentials(config: &Config) -> session::Credentials<'_> {
     }
 }
 
-/// `siltad reset-cross-signing`, on the device the daemon logged in with: a reset before
-/// the first login would sign a device the daemon never used.
+/// `siltad reset-cross-signing`, on the daemon's saved session: before the first login
+/// it would sign a device the daemon never used.
 async fn reset_cross_signing(config: &Config) -> anyhow::Result<()> {
     // Before preparing the directory, which would create it as whoever runs this.
-    if !config.state_dir.join(session::SESSION_FILE).exists() {
+    let session_file = config.state_dir.join(session::SESSION_FILE);
+    if !session_file
+        .try_exists()
+        .with_context(|| format!("cannot read {}", session_file.display()))?
+    {
         anyhow::bail!(
             "no saved session in {}; start siltad once before resetting",
             config.state_dir.display()
@@ -197,7 +200,7 @@ async fn reset_cross_signing(config: &Config) -> anyhow::Result<()> {
     }
     let state_dir = session::prepare_state_dir(&config.state_dir)?;
     let client = session::build_client(&config.matrix.homeserver_url, &state_dir).await?;
-    session::login_or_restore(&client, &config.state_dir, &credentials(config)).await?;
+    session::login_or_restore(&client, &state_dir, &credentials(config)).await?;
     session::reset_cross_signing(&client, &config.matrix.password).await
 }
 

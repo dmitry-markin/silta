@@ -150,17 +150,17 @@ A `silta-session` unit that exited with status 79 (`sudo systemctl status silta-
 
 ### Messages marked as sent by an unverified device
 
-If clients mark the assistant's messages "Encrypted by a device not verified by its owner" and the `siltad` journal says `this device is not signed by the account's cross-signing identity` at start, another client (for example Element, when the account was registered there) set up the account's cross-signing, and `siltad` does not have its private keys. Replace the account's cross-signing identity with a new one owned by `siltad`:
+If clients mark the assistant's messages "Encrypted by a device not verified by its owner" and the `siltad` journal says `this device is not signed by the account's cross-signing identity`, another client (for example Element, when the account was registered there) set up the account's cross-signing without giving `siltad` the keys. Replace the identity with one owned by `siltad`:
 
 1. Stop the daemon with `sudo systemctl stop siltad`.
-2. Run the reset as the daemon's user, with the configuration on standard input:
+2. Run the reset as the daemon's user:
    ```bash
    sudo sh -c 'runuser -u silta -- siltad --config - reset-cross-signing < /etc/silta/siltad.toml'
    ```
-   On a homeserver with OAuth 2.0 accounts, such as matrix.org, the command prints an approval URL. Open it, log in as the assistant's account and approve the reset within two minutes. Other homeservers accept the password from `siltad.toml`. If the command fails or is interrupted, run it again: until a reset succeeds, the device works unsigned as before. The command refuses to run while `siltad` runs, and when the device is already signed.
+   On matrix.org and other homeservers with OAuth 2.0 accounts, open the printed URL, log in as the assistant's account and approve within two minutes. Other homeservers take the password from `siltad.toml`. If the command fails or is interrupted, run it again: until a reset succeeds, the device works unsigned as before. If it says another process holds the lock, a session restarting has started the daemon again; stop it and run the command again.
 3. Start the daemon with `sudo systemctl start siltad`.
 
-The other sessions of the assistant's account, such as the Element session it was registered with, become unverified, and people who verified the assistant see a warning that its identity changed. They can verify it again.
+The account's other sessions, such as the Element one it was registered with, become unverified, and people who verified the assistant see that its identity changed and can verify it again.
 
 ### Recovering a session if the request was flagged
 
