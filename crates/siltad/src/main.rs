@@ -106,8 +106,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         config.alert_grace_secs,
         config.socket.display()
     );
-    let _lock = session::prepare_state_dir(&config.state_dir)?;
-    let client = session::build_client(&config.matrix.homeserver_url, &config.state_dir).await?;
+    let state_dir = session::prepare_state_dir(&config.state_dir)?;
+    let client = session::build_client(&config.matrix.homeserver_url, &state_dir).await?;
     session::login_or_restore(&client, &config.state_dir, &credentials(&config)).await?;
     tokio::spawn({
         let client = client.clone();
@@ -188,14 +188,15 @@ fn credentials(config: &Config) -> session::Credentials<'_> {
 /// `siltad reset-cross-signing`, on the device the daemon logged in with: a reset before
 /// the first login would sign a device the daemon never used.
 async fn reset_cross_signing(config: &Config) -> anyhow::Result<()> {
-    let _lock = session::prepare_state_dir(&config.state_dir)?;
+    // Before preparing the directory, which would create it as whoever runs this.
     if !config.state_dir.join(session::SESSION_FILE).exists() {
         anyhow::bail!(
             "no saved session in {}; start siltad once before resetting",
             config.state_dir.display()
         );
     }
-    let client = session::build_client(&config.matrix.homeserver_url, &config.state_dir).await?;
+    let state_dir = session::prepare_state_dir(&config.state_dir)?;
+    let client = session::build_client(&config.matrix.homeserver_url, &state_dir).await?;
     session::login_or_restore(&client, &config.state_dir, &credentials(config)).await?;
     session::reset_cross_signing(&client, &config.matrix.password).await
 }

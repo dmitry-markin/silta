@@ -4,14 +4,16 @@ use std::{
     fs,
     io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Context, Result};
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::RequestConfig,
-    encryption::{BackupDownloadStrategy, CrossSigningResetAuthType, EncryptionSettings},
+    encryption::{
+        identities::Device, BackupDownloadStrategy, CrossSigningResetAuthType, EncryptionSettings,
+    },
     ruma::api::{client::uiaa, error::ErrorKind},
     Client,
 };
@@ -35,11 +37,10 @@ pub struct Credentials<'a> {
 /// Build the client with the sqlite store under `state_dir/store`. The configured
 /// homeserver URL is authoritative: a server-advertised base URL is never followed.
 ///
-/// `state_dir` must have been prepared with [`prepare_state_dir`].
-///
 /// Refuses to open a store that has no `session.json` next to it: the builder would
 /// happily open it, and a fresh login onto an old encryption store corrupts it.
-pub async fn build_client(homeserver_url: &str, state_dir: &Path) -> Result<Client> {
+pub async fn build_client(homeserver_url: &str, state_dir: &StateDir) -> Result<Client> {
+    let state_dir = state_dir.path();
     let session_file = state_dir.join(SESSION_FILE);
     let store_dir = state_dir.join(STORE_DIR);
     if !session_file.exists() && store_has_data(&store_dir) {
@@ -80,7 +81,6 @@ pub async fn login_or_restore(
     creds: &Credentials<'_>,
 ) -> Result<()> {
     let session_file = state_dir.join(SESSION_FILE);
-    let store_dir = state_dir.join(STORE_DIR);
 
     if session_file.exists() {
         let text = fs::read_to_string(&session_file)
@@ -123,7 +123,6 @@ pub async fn login_or_restore(
 
     // The store-without-session case was refused in `build_client`, before the builder
     // created the (then empty) store.
-    let _ = store_dir;
 
     info!(
         user = creds.user_id,
@@ -169,13 +168,30 @@ pub async fn login_or_restore(
     Ok(())
 }
 
-/// Create `state_dir` (mode 0700) if needed and take its lock, which lasts as long as
-/// the returned file. Refuses a directory of another user: files created there (root's,
-/// say) would keep the daemon's user from opening its own store.
-pub fn prepare_state_dir(state_dir: &Path) -> Result<fs::File> {
+/// The state directory, prepared and locked by [`prepare_state_dir`]; [`build_client`]
+/// takes it, so the store is never opened without the lock. The lock lasts as long as
+/// this value.
+#[derive(Debug)]
+pub struct StateDir {
+    path: PathBuf,
+    _lock: fs::File,
+}
+
+impl StateDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Create `state_dir` (mode 0700) if needed and take its lock. Refuses a directory of
+/// another user: files created there (root's, say) would keep the daemon's user from
+/// opening its own store.
+pub fn prepare_state_dir(state_dir: &Path) -> Result<StateDir> {
     fs::create_dir_all(state_dir)
         .with_context(|| format!("cannot create {}", state_dir.display()))?;
-    let owner = fs::metadata(state_dir)?.uid();
+    let owner = fs::metadata(state_dir)
+        .with_context(|| format!("cannot read {}", state_dir.display()))?
+        .uid();
     let uid = nix::unistd::geteuid().as_raw();
     if owner != uid {
         bail!(
@@ -193,7 +209,10 @@ pub fn prepare_state_dir(state_dir: &Path) -> Result<fs::File> {
         .open(&path)
         .with_context(|| format!("cannot open {}", path.display()))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(StateDir {
+            path: state_dir.to_owned(),
+            _lock: file,
+        }),
         Err(fs::TryLockError::WouldBlock) => bail!(
             "another siltad process (the daemon, or a reset-cross-signing in progress) holds \
              {}; stop it first",
@@ -218,11 +237,15 @@ pub async fn device_signed_on_server(client: &Client) -> Result<bool> {
         .request_user_identity(user_id)
         .await
         .context("cannot query the account's keys")?;
-    let device = encryption
+    Ok(own_device(client).await?.is_cross_signed_by_owner())
+}
+
+async fn own_device(client: &Client) -> Result<Device> {
+    client
+        .encryption()
         .get_own_device()
         .await?
-        .context("this device is missing from the store")?;
-    Ok(device.is_cross_signed_by_owner())
+        .context("this device is missing from the store")
 }
 
 /// Log whether the device is cross-signed, and how to fix it when it is not. Not fatal:
@@ -250,7 +273,9 @@ pub async fn report_cross_signing(client: &Client) {
 /// A previous run may have left private keys in the store: the SDK saves them before the
 /// upload is authorised, and the signature of the device is a separate upload after it.
 /// They are tried first, so a run after a partial failure does not replace the identity
-/// once more; when the server never took them, they are replaced like any other.
+/// once more. Keys the server never took are gone by then (the SDK drops private keys
+/// that differ from the server's identity when it fetches the keys), so a failure to
+/// sign with the ones left is transient.
 pub async fn reset_cross_signing(client: &Client, password: &str) -> Result<()> {
     if device_signed_on_server(client).await? {
         bail!(
@@ -258,19 +283,15 @@ pub async fn reset_cross_signing(client: &Client, password: &str) -> Result<()> 
              would only make everyone who verified the assistant verify it again"
         );
     }
-    let encryption = client.encryption();
-    if encryption
+    if client
+        .encryption()
         .cross_signing_status()
         .await
         .is_some_and(|status| status.is_complete())
     {
-        let device = encryption
-            .get_own_device()
-            .await?
-            .context("this device is missing from the store")?;
-        if let Err(err) = device.verify().await {
-            warn!("cannot sign this device with the stored cross-signing keys: {err}");
-        }
+        own_device(client).await?.verify().await.context(
+            "cannot sign this device with the stored cross-signing keys; run the command again",
+        )?;
         if device_signed_on_server(client).await? {
             info!("this device is signed by the cross-signing identity of a previous reset");
             return Ok(());
@@ -299,16 +320,26 @@ async fn replace_identity(client: &Client, password: &str) -> Result<()> {
     else {
         return Ok(());
     };
-    let (auth, timeout) = match handle.auth_type() {
+    let auth = match handle.auth_type() {
         CrossSigningResetAuthType::Uiaa(info) => {
+            // The SDK resends the auth every half second for two minutes while the server
+            // wants another stage: with a stage siltad cannot provide, that would be some
+            // 240 requests carrying the password.
+            if !info
+                .flows
+                .iter()
+                .any(|flow| flow.stages == [uiaa::AuthType::Password])
+            {
+                bail!(
+                    "the homeserver asks for more than the password to reset cross-signing \
+                     ({:?}), which siltad cannot provide",
+                    info.flows
+                );
+            }
             let user_id = client.user_id().context("not logged in")?.to_owned();
             let mut password = uiaa::Password::new(user_id.into(), password.to_owned());
             password.session = info.session.clone();
-            (
-                uiaa::AuthData::Password(password),
-                "the homeserver asks for more than the password (another authentication step), \
-                 which siltad cannot provide",
-            )
+            uiaa::AuthData::Password(password)
         }
         CrossSigningResetAuthType::OAuth(info) => {
             // Not through tracing: a log filter must not hide what the owner has to do.
@@ -319,19 +350,19 @@ async fn replace_identity(client: &Client, password: &str) -> Result<()> {
             );
             let mut oauth = uiaa::OAuth::new();
             oauth.session = info.session.clone();
-            (
-                uiaa::AuthData::OAuth(oauth),
-                "the reset was not approved within two minutes; run the command again",
-            )
+            uiaa::AuthData::OAuth(oauth)
         }
     };
     match handle.auth(Some(auth)).await {
         Ok(()) => Ok(()),
-        Err(matrix_sdk::Error::Timeout) => bail!("{timeout}"),
+        Err(matrix_sdk::Error::Timeout) => {
+            bail!("the reset was not approved within two minutes; run the command again")
+        }
         Err(err)
             if err
                 .as_uiaa_response()
-                .is_some_and(|info| info.auth_error.is_some()) =>
+                .and_then(|info| info.auth_error.as_ref())
+                .is_some_and(|error| error.kind == ErrorKind::Forbidden) =>
         {
             Err(err).context("the homeserver refused the password in siltad.toml")
         }
@@ -390,6 +421,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("siltad-lock-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let first = prepare_state_dir(&dir).unwrap();
+        assert_eq!(first.path(), dir);
         let err = prepare_state_dir(&dir).unwrap_err().to_string();
         assert!(err.contains("another siltad process"), "{err}");
         drop(first);
