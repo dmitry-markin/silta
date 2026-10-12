@@ -235,18 +235,12 @@ impl Config {
     /// Read, parse and validate a configuration file, or standard input when `path` is
     /// `-` (a command run as the daemon's user, who cannot read the root-owned file).
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
-        let stdin = path.as_os_str() == "-";
-        let name = if stdin {
-            PathBuf::from("standard input")
+        let (name, text) = if path.as_os_str() == "-" {
+            (PathBuf::from("standard input"), read_stdin())
         } else {
-            path.to_owned()
+            (path.to_owned(), std::fs::read_to_string(path))
         };
-        let text = if stdin {
-            read_stdin()
-        } else {
-            std::fs::read_to_string(path)
-        }
-        .map_err(|source| ConfigError::Io {
+        let text = text.map_err(|source| ConfigError::Io {
             path: name.clone(),
             source,
         })?;

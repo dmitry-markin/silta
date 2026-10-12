@@ -3,7 +3,7 @@
 use std::{
     fs,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
 };
 
@@ -35,12 +35,11 @@ pub struct Credentials<'a> {
 /// Build the client with the sqlite store under `state_dir/store`. The configured
 /// homeserver URL is authoritative: a server-advertised base URL is never followed.
 ///
+/// `state_dir` must have been prepared with [`prepare_state_dir`].
+///
 /// Refuses to open a store that has no `session.json` next to it: the builder would
 /// happily open it, and a fresh login onto an old encryption store corrupts it.
 pub async fn build_client(homeserver_url: &str, state_dir: &Path) -> Result<Client> {
-    fs::create_dir_all(state_dir)
-        .with_context(|| format!("cannot create {}", state_dir.display()))?;
-    fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
     let session_file = state_dir.join(SESSION_FILE);
     let store_dir = state_dir.join(STORE_DIR);
     if !session_file.exists() && store_has_data(&store_dir) {
@@ -170,11 +169,21 @@ pub async fn login_or_restore(
     Ok(())
 }
 
-/// Take the lock of `state_dir`, creating both if needed; the lock lasts as long as
-/// the returned file.
-pub fn lock_state_dir(state_dir: &Path) -> Result<fs::File> {
+/// Create `state_dir` (mode 0700) if needed and take its lock, which lasts as long as
+/// the returned file. Refuses a directory of another user: files created there (root's,
+/// say) would keep the daemon's user from opening its own store.
+pub fn prepare_state_dir(state_dir: &Path) -> Result<fs::File> {
     fs::create_dir_all(state_dir)
         .with_context(|| format!("cannot create {}", state_dir.display()))?;
+    let owner = fs::metadata(state_dir)?.uid();
+    let uid = nix::unistd::geteuid().as_raw();
+    if owner != uid {
+        bail!(
+            "{} belongs to uid {owner} but siltad runs as uid {uid}; run it as the daemon's user",
+            state_dir.display()
+        );
+    }
+    fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
     let path = state_dir.join(LOCK_FILE);
     let file = fs::OpenOptions::new()
         .write(true)
@@ -202,6 +211,8 @@ pub fn lock_state_dir(state_dir: &Path) -> Result<fs::File> {
 /// whether the private keys are in the store.
 pub async fn device_signed_on_server(client: &Client) -> Result<bool> {
     let encryption = client.encryption();
+    // The SDK's own key query and cross-signing bootstrap after a login or restore.
+    encryption.wait_for_e2ee_initialization_tasks().await;
     let user_id = client.user_id().context("not logged in")?;
     encryption
         .request_user_identity(user_id)
@@ -228,69 +239,44 @@ pub async fn report_cross_signing(client: &Client) {
     }
 }
 
-/// Replace the account's cross-signing identity with a new one whose private keys stay
-/// in this device's store, and sign this device with it. For an account whose identity
+/// Sign this device with a cross-signing identity whose private keys are in its store,
+/// replacing the account's identity when they are not. For an account whose identity
 /// another client created (Element does at registration): without its private keys the
 /// device works unsigned, and clients mark its messages as sent by an unverified device.
-/// The other sessions of the account and the people who verified it see the identity
-/// change, so a device the server already shows as signed is left alone.
+/// A replacement shows as an identity change to the account's other sessions and to
+/// everyone who verified it, so a device the server already shows as signed is left
+/// alone.
 ///
-/// A homeserver with password UIA takes the configured password. One with OAuth 2.0
-/// accounts (matrix.org) asks the owner to approve the reset in a browser; the SDK
-/// retries the upload for two minutes while waiting for the approval.
-///
-/// The SDK saves the new private keys before the upload is authorised, so a failed or
-/// interrupted reset leaves keys in the store that the server never accepted. Running
-/// the reset again replaces them; until then the device works unsigned as before.
+/// A previous run may have left private keys in the store: the SDK saves them before the
+/// upload is authorised, and the signature of the device is a separate upload after it.
+/// They are tried first, so a run after a partial failure does not replace the identity
+/// once more; when the server never took them, they are replaced like any other.
 pub async fn reset_cross_signing(client: &Client, password: &str) -> Result<()> {
-    let encryption = client.encryption();
-    encryption.wait_for_e2ee_initialization_tasks().await;
     if device_signed_on_server(client).await? {
         bail!(
             "this device is already signed by the account's cross-signing identity; a reset \
              would only make everyone who verified the assistant verify it again"
         );
     }
-    let handle = encryption
-        .reset_cross_signing()
+    let encryption = client.encryption();
+    if encryption
+        .cross_signing_status()
         .await
-        .context("cannot reset cross-signing; run the command again")?;
-    if let Some(handle) = handle {
-        let auth = match handle.auth_type() {
-            CrossSigningResetAuthType::Uiaa(info) => {
-                let user_id = client
-                    .user_id()
-                    .context("no user id after login")?
-                    .to_owned();
-                let mut password = uiaa::Password::new(user_id.into(), password.to_owned());
-                password.session = info.session.clone();
-                uiaa::AuthData::Password(password)
-            }
-            CrossSigningResetAuthType::OAuth(info) => {
-                // Not through tracing: a log filter must not hide what the owner has to do.
-                eprintln!(
-                    "\nLogged in as the assistant's account, approve the reset of its \
-                     cross-signing identity within two minutes at:\n\n    {}\n",
-                    info.approval_url
-                );
-                let mut oauth = uiaa::OAuth::new();
-                oauth.session = info.session.clone();
-                uiaa::AuthData::OAuth(oauth)
-            }
-        };
-        match handle.auth(Some(auth)).await {
-            Ok(()) => {}
-            Err(matrix_sdk::Error::Timeout) => {
-                bail!("the reset was not approved within two minutes; run the command again")
-            }
-            Err(err) => {
-                return Err(err).context(
-                    "the homeserver did not accept the new cross-signing keys; run the command \
-                     again",
-                )
-            }
+        .is_some_and(|status| status.is_complete())
+    {
+        let device = encryption
+            .get_own_device()
+            .await?
+            .context("this device is missing from the store")?;
+        if let Err(err) = device.verify().await {
+            warn!("cannot sign this device with the stored cross-signing keys: {err}");
+        }
+        if device_signed_on_server(client).await? {
+            info!("this device is signed by the cross-signing identity of a previous reset");
+            return Ok(());
         }
     }
+    replace_identity(client, password).await?;
     if !device_signed_on_server(client).await? {
         bail!(
             "the homeserver does not show this device signed by the new cross-signing \
@@ -299,6 +285,60 @@ pub async fn reset_cross_signing(client: &Client, password: &str) -> Result<()> 
     }
     info!("cross-signing reset; this device is signed by the new identity");
     Ok(())
+}
+
+/// Upload a new cross-signing identity. A homeserver with password UIA takes the
+/// configured password; one with OAuth 2.0 accounts (matrix.org) asks the owner to
+/// approve in a browser while the SDK retries the upload for two minutes.
+async fn replace_identity(client: &Client, password: &str) -> Result<()> {
+    let Some(handle) = client
+        .encryption()
+        .reset_cross_signing()
+        .await
+        .context("cannot reset cross-signing; run the command again")?
+    else {
+        return Ok(());
+    };
+    let (auth, timeout) = match handle.auth_type() {
+        CrossSigningResetAuthType::Uiaa(info) => {
+            let user_id = client.user_id().context("not logged in")?.to_owned();
+            let mut password = uiaa::Password::new(user_id.into(), password.to_owned());
+            password.session = info.session.clone();
+            (
+                uiaa::AuthData::Password(password),
+                "the homeserver asks for more than the password (another authentication step), \
+                 which siltad cannot provide",
+            )
+        }
+        CrossSigningResetAuthType::OAuth(info) => {
+            // Not through tracing: a log filter must not hide what the owner has to do.
+            eprintln!(
+                "\nLogged in as the assistant's account, approve the reset of its \
+                 cross-signing identity within two minutes at:\n\n    {}\n",
+                info.approval_url
+            );
+            let mut oauth = uiaa::OAuth::new();
+            oauth.session = info.session.clone();
+            (
+                uiaa::AuthData::OAuth(oauth),
+                "the reset was not approved within two minutes; run the command again",
+            )
+        }
+    };
+    match handle.auth(Some(auth)).await {
+        Ok(()) => Ok(()),
+        Err(matrix_sdk::Error::Timeout) => bail!("{timeout}"),
+        Err(err)
+            if err
+                .as_uiaa_response()
+                .is_some_and(|info| info.auth_error.is_some()) =>
+        {
+            Err(err).context("the homeserver refused the password in siltad.toml")
+        }
+        Err(err) => Err(err).context(
+            "the homeserver did not accept the new cross-signing keys; run the command again",
+        ),
+    }
 }
 
 /// M_UNKNOWN_TOKEN or M_MISSING_TOKEN: the saved session is dead.
@@ -349,11 +389,11 @@ mod tests {
     fn a_second_lock_of_the_state_dir_is_refused_until_the_first_is_dropped() {
         let dir = std::env::temp_dir().join(format!("siltad-lock-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let first = lock_state_dir(&dir).unwrap();
-        let err = lock_state_dir(&dir).unwrap_err().to_string();
+        let first = prepare_state_dir(&dir).unwrap();
+        let err = prepare_state_dir(&dir).unwrap_err().to_string();
         assert!(err.contains("another siltad process"), "{err}");
         drop(first);
-        lock_state_dir(&dir).unwrap();
+        prepare_state_dir(&dir).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 }

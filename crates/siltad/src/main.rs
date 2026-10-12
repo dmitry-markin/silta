@@ -1,8 +1,6 @@
 //! `siltad`: owns the bot's Matrix device and routes rooms to assistant sessions.
 
-use std::{
-    collections::HashMap, os::unix::fs::MetadataExt, path::PathBuf, process::ExitCode, sync::Arc,
-};
+use std::{collections::HashMap, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -108,10 +106,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
         config.alert_grace_secs,
         config.socket.display()
     );
-    let _lock = session::lock_state_dir(&config.state_dir)?;
+    let _lock = session::prepare_state_dir(&config.state_dir)?;
     let client = session::build_client(&config.matrix.homeserver_url, &config.state_dir).await?;
     session::login_or_restore(&client, &config.state_dir, &credentials(&config)).await?;
-    session::report_cross_signing(&client).await;
+    tokio::spawn({
+        let client = client.clone();
+        async move { session::report_cross_signing(&client).await }
+    });
     if let Some(name) = &config.matrix.display_name {
         session::ensure_display_name(&client, name).await;
     }
@@ -184,26 +185,16 @@ fn credentials(config: &Config) -> session::Credentials<'_> {
     }
 }
 
-/// `siltad reset-cross-signing`, as the owner of the state directory: files another
-/// user creates in the store (root's, say) would keep the daemon from opening it.
+/// `siltad reset-cross-signing`, on the device the daemon logged in with: a reset before
+/// the first login would sign a device the daemon never used.
 async fn reset_cross_signing(config: &Config) -> anyhow::Result<()> {
-    let owner = std::fs::metadata(&config.state_dir)
-        .with_context(|| {
-            format!(
-                "cannot read {}; start siltad once before resetting",
-                config.state_dir.display()
-            )
-        })?
-        .uid();
-    let uid = nix::unistd::geteuid().as_raw();
-    if owner != uid {
+    let _lock = session::prepare_state_dir(&config.state_dir)?;
+    if !config.state_dir.join(session::SESSION_FILE).exists() {
         anyhow::bail!(
-            "{} belongs to uid {owner} but this command runs as uid {uid}; run it as the \
-             daemon's user",
+            "no saved session in {}; start siltad once before resetting",
             config.state_dir.display()
         );
     }
-    let _lock = session::lock_state_dir(&config.state_dir)?;
     let client = session::build_client(&config.matrix.homeserver_url, &config.state_dir).await?;
     session::login_or_restore(&client, &config.state_dir, &credentials(config)).await?;
     session::reset_cross_signing(&client, &config.matrix.password).await
