@@ -1,7 +1,6 @@
 //! Event handlers and the sync loop.
 
 use std::{
-    collections::HashSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -41,7 +40,7 @@ use tracing::{debug, info, warn};
 use crate::{
     content::{self, Body, Media},
     daemon::{now_ms, Daemon, Dispatch, Shared},
-    joining::{merge, Held},
+    joining::{oldest_first, Held},
     outbound::{member_ids, room_shape},
     spool::{self, DownloadError},
 };
@@ -85,6 +84,10 @@ async fn on_invite(
         warn!(room = %room.room_id(), %inviter, "ignoring an invite from an unregistered account");
         return;
     };
+    if room.state() == RoomState::Joined {
+        debug!(room = %room.room_id(), %inviter, "ignoring an invite to a room already joined");
+        return;
+    }
     let Some(synced) = daemon.joins.open(room.room_id()) else {
         debug!(room = %room.room_id(), %inviter, "already joining on an earlier invite");
         return;
@@ -99,6 +102,12 @@ async fn on_invite(
                     info!(room = %room.room_id(), "joined");
                     break;
                 }
+                // The server joined us but the response was lost: the sync already
+                // shows the room joined, and a retry would fail on that.
+                Err(err) if room.state() == RoomState::Joined => {
+                    info!(room = %room.room_id(), "joined (the join request failed: {err})");
+                    break;
+                }
                 Err(err) if delay < Duration::from_secs(300) => {
                     warn!(room = %room.room_id(), "join failed ({err}), retrying in {delay:?}");
                     sleep(delay).await;
@@ -106,8 +115,7 @@ async fn on_invite(
                 }
                 Err(err) => {
                     warn!(room = %room.room_id(), "giving up joining: {err}");
-                    // Not joined, so nothing can be held; close the gate for a later invite.
-                    let _ = daemon.joins.take_or_close(room.room_id());
+                    daemon.joins.close(room.room_id());
                     return;
                 }
             }
@@ -117,8 +125,8 @@ async fn on_invite(
 }
 
 /// Deliver what a registered person sent before the bot joined, then whatever the gate
-/// held meanwhile, once each and oldest first, and only then let the room's events
-/// through directly.
+/// held meanwhile, oldest first, and only then let the room's events through directly.
+/// An event both fetched and held is delivered once: `admit` skips the second copy.
 async fn catch_up(daemon: &Shared, room: &Room, synced: &tokio::sync::Notify, invited_at_ms: u64) {
     let room_id = room.room_id();
     // A message older than the replay window at the invite is history, not the start
@@ -126,8 +134,8 @@ async fn catch_up(daemon: &Shared, room: &Room, synced: &tokio::sync::Notify, in
     let since_ms = invited_at_ms.saturating_sub(daemon.replay_window_ms);
     let fetched = fetch_before_join(daemon, room, since_ms).await;
     // A homeserver that already had the earlier messages sends them in the join's sync
-    // too. Waiting for that sync to be processed puts them among the held, where the
-    // merge drops the second copy, instead of letting them through after the gate.
+    // too. Waiting for that sync to be processed puts them among the held, so they are
+    // ordered with the fetched ones rather than coming through after the gate.
     if timeout(JOIN_SYNC_WAIT, synced.notified()).await.is_err() {
         warn!(
             room = %room_id,
@@ -137,13 +145,12 @@ async fn catch_up(daemon: &Shared, room: &Room, synced: &tokio::sync::Notify, in
     if !fetched.is_empty() {
         info!(room = %room_id, events = fetched.len(), "found events sent before the join");
     }
-    let mut seen = HashSet::new();
-    let mut batch = merge(&mut seen, [fetched, daemon.joins.take_or_close(room_id)]);
+    let mut batch = [fetched, daemon.joins.take_or_close(room_id)].concat();
     while !batch.is_empty() {
-        for event in batch {
+        for event in oldest_first(batch) {
             receive(daemon, room, event).await;
         }
-        batch = merge(&mut seen, [daemon.joins.take_or_close(room_id)]);
+        batch = daemon.joins.take_or_close(room_id);
     }
 }
 
@@ -158,6 +165,7 @@ async fn fetch_before_join(daemon: &Daemon, room: &Room, since_ms: u64) -> Vec<H
     let mut out = Vec::new();
     let mut past_join = false;
     let mut from = None;
+    let mut capped = true;
     for _ in 0..CATCH_UP_MAX_PAGES {
         let mut options = MessagesOptions::backward();
         options.limit = UInt::from(CATCH_UP_PAGE);
@@ -202,13 +210,16 @@ async fn fetch_before_join(daemon: &Daemon, room: &Room, since_ms: u64) -> Vec<H
         }
         match page.end {
             Some(end) if !page.chunk.is_empty() => from = Some(end),
-            _ => break,
+            _ => {
+                capped = false;
+                break;
+            }
         }
     }
-    if past_join {
-        warn!(room = %room_id, "stopped looking for events sent before the join after {CATCH_UP_MAX_PAGES} pages");
-    } else {
+    if !past_join {
         warn!(room = %room_id, "cannot find the bot's own join in the room's history");
+    } else if capped {
+        warn!(room = %room_id, "stopped looking for events sent before the join after {CATCH_UP_MAX_PAGES} pages");
     }
     out
 }
@@ -312,6 +323,15 @@ async fn admit<'a>(
                 room: kind,
             } => (session, person, kind),
         };
+    if !daemon.recent.first_sight(event_id) {
+        debug!(
+            dir = "in",
+            room = room_id,
+            event_id,
+            "not delivering a {what} that came by another path already"
+        );
+        return None;
+    }
     match verdict(
         ts,
         event_id,
@@ -419,18 +439,15 @@ async fn receive_message(
         }
         Body::Media(media) => {
             message.text = media.caption.clone();
+            let (daemon, room, session) = (Arc::clone(daemon), room.clone(), session.to_owned());
+            let job = async move {
+                fetch_attachment(&daemon, &mut message, media).await;
+                deliver(&daemon, &session, &room, message, ts);
+            };
             match download {
-                Download::Inline => {
-                    fetch_attachment(daemon, &mut message, media).await;
-                    deliver(daemon, session, room, message, ts);
-                }
+                Download::Inline => job.await,
                 Download::Background => {
-                    let session = session.to_owned();
-                    let (daemon, room) = (Arc::clone(daemon), room.clone());
-                    tokio::spawn(async move {
-                        fetch_attachment(&daemon, &mut message, media).await;
-                        deliver(&daemon, &session, &room, message, ts);
-                    });
+                    tokio::spawn(job);
                 }
             }
         }

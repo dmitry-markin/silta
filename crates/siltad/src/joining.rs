@@ -10,17 +10,18 @@
 //! is past the earlier.
 //!
 //! So from the invite until the catch-up is done, the sync handlers hold the room's
-//! events here, and the join task delivers held and fetched events together, once each
-//! and oldest first, before it lets the room through.
+//! events here, and the join task delivers held and fetched events together, oldest
+//! first, before it lets the room through. `Recent` makes an event that came by both
+//! paths, or through the sync after a late gate closed, go out once.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
 };
 
 use matrix_sdk::ruma::{
     events::{reaction::OriginalSyncReactionEvent, room::message::OriginalSyncRoomMessageEvent},
-    EventId, OwnedEventId, OwnedRoomId, RoomId,
+    EventId, OwnedRoomId, RoomId,
 };
 use tokio::sync::Notify;
 
@@ -110,6 +111,11 @@ impl Joins {
         }
     }
 
+    /// Close the gate of a room that was not joined, dropping whatever it held.
+    pub fn close(&self, room: &RoomId) {
+        self.gates.lock().unwrap().remove(room);
+    }
+
     /// Take what the room holds. When it holds nothing the gate closes in the same
     /// step, so no event can be held after the last take and then never delivered.
     pub fn take_or_close(&self, room: &RoomId) -> Vec<Held> {
@@ -125,19 +131,39 @@ impl Joins {
     }
 }
 
-/// Merge fetched and held events: once each, skipping those in `seen` (and adding the
-/// rest to it), oldest first. Server timestamps order them; ties keep arrival order.
-pub fn merge(
-    seen: &mut HashSet<OwnedEventId>,
-    batches: impl IntoIterator<Item = Vec<Held>>,
-) -> Vec<Held> {
-    let mut out: Vec<Held> = batches
-        .into_iter()
-        .flatten()
-        .filter(|e| seen.insert(e.event_id().to_owned()))
-        .collect();
-    out.sort_by_key(Held::ts);
-    out
+/// Order events by server timestamp, the order the watermark compares in; ties keep
+/// arrival order.
+pub fn oldest_first(mut events: Vec<Held>) -> Vec<Held> {
+    events.sort_by_key(Held::ts);
+    events
+}
+
+/// How many admitted event ids `Recent` remembers. A duplicate comes within one join's
+/// catch-up, a few dozen events at most.
+const RECENT_MAX: usize = 1000;
+
+/// The ids of the events admitted lately, across rooms.
+#[derive(Default)]
+pub struct Recent {
+    ids: Mutex<(HashSet<String>, VecDeque<String>)>,
+}
+
+impl Recent {
+    /// Remember the event; false when it was seen already.
+    pub fn first_sight(&self, event_id: &str) -> bool {
+        let mut guard = self.ids.lock().unwrap();
+        let (set, order) = &mut *guard;
+        if !set.insert(event_id.to_owned()) {
+            return false;
+        }
+        order.push_back(event_id.to_owned());
+        if order.len() > RECENT_MAX {
+            if let Some(old) = order.pop_front() {
+                set.remove(&old);
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -195,16 +221,20 @@ mod tests {
     }
 
     #[test]
-    fn merge_dedupes_and_orders() {
-        let mut seen = HashSet::new();
-        // Fetched history and a sync that brought part of it too, the sync's later
-        // message first among the held.
-        let fetched = vec![message("$2", 20), message("$1", 10)];
-        let held = vec![message("$3", 30), message("$2", 20)];
-        let out = merge(&mut seen, [fetched, held]);
-        assert_eq!(ids(&out), ["$1", "$2", "$3"]);
-        // A later drain skips what was delivered already.
-        let out = merge(&mut seen, [vec![message("$3", 30), message("$4", 40)]]);
-        assert_eq!(ids(&out), ["$4"]);
+    fn oldest_first_orders_fetched_and_held() {
+        // Fetched history comes newest first; the held follow it.
+        let events = vec![message("$2", 20), message("$1", 10), message("$3", 30)];
+        assert_eq!(ids(&oldest_first(events)), ["$1", "$2", "$3"]);
+    }
+
+    #[test]
+    fn recent_sees_each_event_once() {
+        let recent = Recent::default();
+        assert!(recent.first_sight("$a"));
+        assert!(!recent.first_sight("$a"));
+        for i in 0..RECENT_MAX {
+            assert!(recent.first_sight(&format!("$n{i}")));
+        }
+        assert!(recent.first_sight("$a"), "forgotten past the cap");
     }
 }
