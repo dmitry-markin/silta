@@ -23,7 +23,8 @@ use tracing::{info, warn};
 pub const SESSION_FILE: &str = "session.json";
 pub const STORE_DIR: &str = "store";
 /// Held while a process uses the store: two processes on one crypto store would each
-/// keep the device's keys in memory and overwrite each other's. `backup` only reads.
+/// keep the device's keys in memory and overwrite each other's. Not used by `backup`,
+/// which only reads.
 pub const LOCK_FILE: &str = "siltad.lock";
 
 pub struct Credentials<'a> {
@@ -241,7 +242,7 @@ async fn own_device(client: &Client) -> Result<Device> {
         .context("this device is missing from the store")
 }
 
-/// Log whether the device is cross-signed, and the fix when it is not.
+/// Log whether the device is cross-signed, suggesting the fix when it is not.
 pub async fn report_cross_signing(client: &Client) {
     match device_signed_on_server(client).await {
         Ok(true) => info!("this device is signed by the account's cross-signing identity"),
@@ -256,8 +257,8 @@ pub async fn report_cross_signing(client: &Client) {
 
 /// Sign this device with a cross-signing identity whose private keys are in the store,
 /// replacing the account's identity if needed (when another client, such as Element,
-/// created it). A replacement shows as an identity change to everyone who verified the
-/// account, so a device that is already signed is left alone.
+/// created it). A replacement shows as an identity change, so a device that is already
+/// signed is left alone.
 ///
 /// Keys left in the store by an interrupted run are tried first, so a rerun does not
 /// replace the identity once more. The SDK drops stored keys that differ from the
@@ -325,8 +326,9 @@ async fn replace_identity(client: &Client, password: &str) -> Result<()> {
         }
     };
     // The SDK retries every half second for two minutes until the server takes the
-    // upload: the time to approve in the browser, but with a password each retry only
-    // resends it to a server that wants another authentication stage.
+    // upload: the time to approve in the browser. With a password each retry only
+    // resends it to a server that wants another authentication stage, so we time out
+    // after 10 seconds.
     let auth = handle.auth(Some(auth));
     let result = if oauth {
         auth.await

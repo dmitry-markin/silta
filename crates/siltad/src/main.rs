@@ -187,7 +187,8 @@ fn credentials(config: &Config) -> session::Credentials<'_> {
 /// `siltad reset-cross-signing`, on the daemon's saved session: before the first login
 /// it would sign a device the daemon never used.
 async fn reset_cross_signing(config: &Config) -> anyhow::Result<()> {
-    // Before preparing the directory, which would create it as whoever runs this.
+    // Check the session file exists before preparing the directory, which would create it
+    // as whoever runs this.
     let session_file = config.state_dir.join(session::SESSION_FILE);
     if !session_file
         .try_exists()

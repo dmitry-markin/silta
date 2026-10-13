@@ -233,7 +233,7 @@ fn read_stdin() -> std::io::Result<String> {
 
 impl Config {
     /// Read, parse and validate a configuration file, or standard input when `path` is
-    /// `-` (a command run as the daemon's user, who cannot read the root-owned file).
+    /// `-` (for a command run as the daemon's user, who cannot read the root-owned file).
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         let (name, text) = if path.as_os_str() == "-" {
             (PathBuf::from("standard input"), read_stdin())

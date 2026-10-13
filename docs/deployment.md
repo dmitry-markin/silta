@@ -150,17 +150,17 @@ A `silta-session` unit that exited with status 79 (`sudo systemctl status silta-
 
 ### Messages marked as sent by an unverified device
 
-If clients mark the assistant's messages "Encrypted by a device not verified by its owner" and the `siltad` journal says `this device is not signed by the account's cross-signing identity`, another client (for example Element, when the account was registered there) set up the account's cross-signing without giving `siltad` the keys. Replace the identity with one owned by `siltad`:
+If clients mark the assistant's messages "Encrypted by a device not verified by its owner" and the `siltad` journal says `this device is not signed by the account's cross-signing identity`, another client (for example Element, when the account was registered there) set up the account's cross-signing. Replace the identity with one owned by `siltad`:
 
 1. Stop the daemon with `sudo systemctl stop siltad`.
 2. Run the reset as the daemon's user:
    ```bash
    sudo sh -c 'runuser -u silta -- siltad --config - reset-cross-signing < /etc/silta/siltad.toml'
    ```
-   On matrix.org and other homeservers with OAuth 2.0 accounts, open the printed URL, log in as the assistant's account and approve within two minutes. Other homeservers take the password from `siltad.toml`. If the command fails or is interrupted, run it again: until a reset succeeds, the device works unsigned as before. If it says another process holds the lock, a session restarting has started the daemon again; stop it and run the command again.
+   On matrix.org and other homeservers with OAuth 2.0 accounts, open the printed URL, log in as the assistant's account and approve within two minutes. Other homeservers take the password from `siltad.toml`. If the command fails or is interrupted, run it again: until a reset succeeds, the device works unsigned as before.
 3. Start the daemon with `sudo systemctl start siltad`.
 
-The account's other sessions, such as the Element one it was registered with, become unverified, and people who verified the assistant see that its identity changed and can verify it again.
+The account's other sessions, such as the Element one it was registered with, become unverified, so it is advised to end such sessions first. The users will also see the warning that the assistant's identity was reset.
 
 ### Recovering a session if the request was flagged
 
