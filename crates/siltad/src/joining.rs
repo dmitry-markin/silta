@@ -222,9 +222,12 @@ mod tests {
 
     #[test]
     fn oldest_first_orders_fetched_and_held() {
-        // Fetched history comes newest first; the held follow it.
-        let events = vec![message("$2", 20), message("$1", 10), message("$3", 30)];
+        // Fetched events in room order, then held ones that interleave with them.
+        let events = vec![message("$1", 10), message("$3", 30), message("$2", 20)];
         assert_eq!(ids(&oldest_first(events)), ["$1", "$2", "$3"]);
+        // Equal timestamps keep the order they came in.
+        let events = vec![message("$a", 10), message("$b", 10), message("$c", 5)];
+        assert_eq!(ids(&oldest_first(events)), ["$c", "$a", "$b"]);
     }
 
     #[test]

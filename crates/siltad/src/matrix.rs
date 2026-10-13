@@ -51,6 +51,10 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// what preceded the join anyway. A join is an event, so the sync long-poll returns
 /// with it at once; this only bounds a stalled sync.
 const JOIN_SYNC_WAIT: Duration = Duration::from_secs(60);
+/// How far before the invite a message still counts as the start of a conversation
+/// with the bot rather than room history. Element sends a new DM's first message
+/// seconds before its invite.
+const CATCH_UP_WINDOW: Duration = Duration::from_secs(300);
 /// The backward scan for messages sent before the join reads at most this much.
 const CATCH_UP_PAGE: u32 = 50;
 const CATCH_UP_MAX_PAGES: usize = 5;
@@ -129,10 +133,7 @@ async fn on_invite(
 /// An event both fetched and held is delivered once: `admit` skips the second copy.
 async fn catch_up(daemon: &Shared, room: &Room, synced: &tokio::sync::Notify, invited_at_ms: u64) {
     let room_id = room.room_id();
-    // A message older than the replay window at the invite is history, not the start
-    // of a conversation with the bot.
-    let since_ms = invited_at_ms.saturating_sub(daemon.replay_window_ms);
-    let mut fetched = fetch_before_join(daemon, room, since_ms).await;
+    let (mut fetched, since_ms) = fetch_before_join(daemon, room, invited_at_ms).await;
     // The scan reads newest first; reversed, the sort keeps room order among equal
     // timestamps.
     fetched.reverse();
@@ -161,18 +162,27 @@ async fn catch_up(daemon: &Shared, room: &Room, synced: &tokio::sync::Notify, in
 }
 
 /// Page backwards past the bot's own join and collect the messages and reactions sent
-/// before it, back to `since_ms`, the room's creation, or the page cap. Over federation
-/// this is also what makes the bot's homeserver fetch that history at all.
-async fn fetch_before_join(daemon: &Daemon, room: &Room, since_ms: u64) -> Vec<Held> {
+/// before it: all of those after the bot's invite, and those up to `CATCH_UP_WINDOW`
+/// before it, stopping at the room's creation or the page cap. The cut is measured from
+/// the invite event, so a daemon that was down when the invite came still finds the
+/// person's first messages; without the invite in sight it is measured from
+/// `invited_at_ms`, when the daemon saw it. Returns the events, newest first, and the
+/// cut. Over federation this is also what makes the bot's homeserver fetch that
+/// history at all.
+async fn fetch_before_join(daemon: &Daemon, room: &Room, invited_at_ms: u64) -> (Vec<Held>, u64) {
     let room_id = room.room_id();
+    let window_ms = CATCH_UP_WINDOW.as_millis() as u64;
+    let fallback_ms = invited_at_ms.saturating_sub(window_ms);
     let Some(own) = daemon.client.user_id() else {
-        return Vec::new();
+        return (Vec::new(), fallback_ms);
     };
-    let mut out = Vec::new();
+    let mut out: Vec<Held> = Vec::new();
     let mut past_join = false;
+    // Set at the bot's invite; nothing between the join and the invite is cut.
+    let mut since_ms = None;
     let mut from = None;
     let mut capped = true;
-    for _ in 0..CATCH_UP_MAX_PAGES {
+    'scan: for _ in 0..CATCH_UP_MAX_PAGES {
         let mut options = MessagesOptions::backward();
         options.limit = UInt::from(CATCH_UP_PAGE);
         options.from = from.take();
@@ -180,7 +190,9 @@ async fn fetch_before_join(daemon: &Daemon, room: &Room, since_ms: u64) -> Vec<H
             Ok(page) => page,
             Err(err) => {
                 warn!(room = %room_id, "cannot read what was sent before the join: {err}");
-                return out;
+                let since_ms = since_ms.unwrap_or(fallback_ms);
+                out.retain(|event| event.ts() >= since_ms);
+                return (out, since_ms);
             }
         };
         for event in &page.chunk {
@@ -189,11 +201,20 @@ async fn fetch_before_join(daemon: &Daemon, room: &Room, since_ms: u64) -> Vec<H
             };
             // What follows the join comes through sync.
             if !past_join {
-                past_join = is_own_join(&any, own);
+                past_join = is_own_membership(&any, own, MembershipState::Join);
                 continue;
             }
-            if u64::from(any.origin_server_ts().get()) < since_ms {
-                return out;
+            let ts = u64::from(any.origin_server_ts().get());
+            match since_ms {
+                None if is_own_membership(&any, own, MembershipState::Invite) => {
+                    since_ms = Some(ts.saturating_sub(window_ms));
+                    continue;
+                }
+                Some(since) if ts < since => {
+                    capped = false;
+                    break 'scan;
+                }
+                _ => {}
             }
             match any {
                 AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
@@ -210,7 +231,10 @@ async fn fetch_before_join(daemon: &Daemon, room: &Room, since_ms: u64) -> Vec<H
                     event_id = %e.event_id,
                     "cannot decrypt an event sent before the join (no room key for it)"
                 ),
-                AnySyncTimelineEvent::State(AnySyncStateEvent::RoomCreate(_)) => return out,
+                AnySyncTimelineEvent::State(AnySyncStateEvent::RoomCreate(_)) => {
+                    capped = false;
+                    break 'scan;
+                }
                 _ => {}
             }
         }
@@ -227,22 +251,34 @@ async fn fetch_before_join(daemon: &Daemon, room: &Room, since_ms: u64) -> Vec<H
     } else if capped {
         warn!(room = %room_id, "stopped looking for events sent before the join after {CATCH_UP_MAX_PAGES} pages");
     }
-    out
+    let since_ms = since_ms.unwrap_or_else(|| {
+        if past_join {
+            warn!(room = %room_id, "cannot find the bot's invite in the room's history, cutting from when the daemon saw it");
+        }
+        fallback_ms
+    });
+    out.retain(|event| event.ts() >= since_ms);
+    (out, since_ms)
 }
 
-/// The bot's own membership becoming `join`; a profile change keeps it `join`.
-fn is_own_join(event: &AnySyncTimelineEvent, own: &UserId) -> bool {
+/// The bot's own membership changing to `membership`, not an update that keeps it
+/// (a profile change is a `join` after a `join`).
+fn is_own_membership(
+    event: &AnySyncTimelineEvent,
+    own: &UserId,
+    membership: MembershipState,
+) -> bool {
     let AnySyncTimelineEvent::State(AnySyncStateEvent::RoomMember(SyncStateEvent::Original(m))) =
         event
     else {
         return false;
     };
     m.state_key == own
-        && m.content.membership == MembershipState::Join
+        && m.content.membership == membership
         && m.unsigned
             .prev_content
             .as_ref()
-            .is_none_or(|prev| prev.membership != MembershipState::Join)
+            .is_none_or(|prev| prev.membership != membership)
 }
 
 /// Where a received attachment is downloaded: off the sync loop, or in the join's
