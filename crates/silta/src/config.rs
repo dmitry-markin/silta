@@ -4,6 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    io::IsTerminal,
     path::{Path, PathBuf},
 };
 
@@ -205,12 +206,12 @@ pub enum SendPolicy {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("cannot read {path}: {source}")]
+    #[error("cannot read {path}")]
     Io {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("cannot parse {path}: {source}")]
+    #[error("cannot parse {path}")]
     Parse {
         path: PathBuf,
         source: toml::de::Error,
@@ -219,18 +220,32 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+/// Standard input to its end; a terminal would wait for the end without a word.
+fn read_stdin() -> std::io::Result<String> {
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Err(std::io::Error::other(
+            "it is a terminal; redirect the configuration file into it",
+        ));
+    }
+    std::io::read_to_string(stdin)
+}
+
 impl Config {
-    /// Read, parse and validate a configuration file.
+    /// Read, parse and validate a configuration file, or standard input when `path` is
+    /// `-` (for a command run as the daemon's user, who cannot read the root-owned file).
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-            path: path.to_owned(),
+        let (name, text) = if path.as_os_str() == "-" {
+            (PathBuf::from("standard input"), read_stdin())
+        } else {
+            (path.to_owned(), std::fs::read_to_string(path))
+        };
+        let text = text.map_err(|source| ConfigError::Io {
+            path: name.clone(),
             source,
         })?;
         Config::parse(&text).map_err(|err| match err {
-            ConfigError::Parse { source, .. } => ConfigError::Parse {
-                path: path.to_owned(),
-                source,
-            },
+            ConfigError::Parse { source, .. } => ConfigError::Parse { path: name, source },
             other => other,
         })
     }

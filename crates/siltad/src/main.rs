@@ -32,7 +32,8 @@ const DEFAULT_LOG_FILTER: &str = "info,\
 #[derive(Parser, Debug)]
 #[command(name = "siltad", version = env!("SILTA_VERSION"))]
 struct Args {
-    /// Configuration file.
+    /// Configuration file, or `-` for standard input (to run a command as the daemon's
+    /// user, who cannot read the root-owned file).
     #[arg(long, default_value = "/etc/silta/siltad.toml")]
     config: PathBuf,
 
@@ -50,6 +51,10 @@ enum Command {
         #[arg(long, default_value_t = 7)]
         keep: usize,
     },
+    /// Sign this device with a cross-signing identity whose keys siltad holds, replacing
+    /// the account's identity if needed (stop the daemon first). On matrix.org and other OAuth 2.0
+    /// homeservers, approve at the printed URL within two minutes.
+    ResetCrossSigning,
 }
 
 #[tokio::main]
@@ -75,9 +80,13 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> anyhow::Result<()> {
     let config = Config::load(&args.config)?;
-    if let Some(Command::Backup { to, keep }) = args.command {
-        backup::run(&config.state_dir, &to, keep, &backup::stamp(now_ms()))?;
-        return Ok(());
+    match args.command {
+        Some(Command::Backup { to, keep }) => {
+            backup::run(&config.state_dir, &to, keep, &backup::stamp(now_ms()))?;
+            return Ok(());
+        }
+        Some(Command::ResetCrossSigning) => return reset_cross_signing(&config).await,
+        None => {}
     }
     for warning in config.warnings() {
         warn!("{warning}");
@@ -96,19 +105,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
         config.alert_grace_secs,
         config.socket.display()
     );
-    let client = session::build_client(&config.matrix.homeserver_url, &config.state_dir).await?;
-    session::login_or_restore(
-        &client,
-        &config.state_dir,
-        &session::Credentials {
-            homeserver_url: &config.matrix.homeserver_url,
-            user_id: &config.matrix.user_id,
-            password: &config.matrix.password,
-            device_id: &config.matrix.device_id,
-            device_name: &config.matrix.device_name,
-        },
-    )
-    .await?;
+    let state_dir = session::prepare_state_dir(&config.state_dir)?;
+    let client = session::build_client(&config.matrix.homeserver_url, &state_dir).await?;
+    session::login_or_restore(&client, &state_dir, &credentials(&config)).await?;
+    tokio::spawn({
+        let client = client.clone();
+        async move { session::report_cross_signing(&client).await }
+    });
     if let Some(name) = &config.matrix.display_name {
         session::ensure_display_name(&client, name).await;
     }
@@ -169,6 +172,37 @@ async fn run(args: Args) -> anyhow::Result<()> {
     sync?;
     info!("stopped");
     Ok(())
+}
+
+fn credentials(config: &Config) -> session::Credentials<'_> {
+    session::Credentials {
+        homeserver_url: &config.matrix.homeserver_url,
+        user_id: &config.matrix.user_id,
+        password: &config.matrix.password,
+        device_id: &config.matrix.device_id,
+        device_name: &config.matrix.device_name,
+    }
+}
+
+/// `siltad reset-cross-signing`, on the daemon's saved session: before the first login
+/// it would sign a device the daemon never used.
+async fn reset_cross_signing(config: &Config) -> anyhow::Result<()> {
+    // Check the session file exists before preparing the directory, which would create it
+    // as whoever runs this.
+    let session_file = config.state_dir.join(session::SESSION_FILE);
+    if !session_file
+        .try_exists()
+        .with_context(|| format!("cannot read {}", session_file.display()))?
+    {
+        anyhow::bail!(
+            "no saved session in {}; start siltad once before resetting",
+            config.state_dir.display()
+        );
+    }
+    let state_dir = session::prepare_state_dir(&config.state_dir)?;
+    let client = session::build_client(&config.matrix.homeserver_url, &state_dir).await?;
+    session::login_or_restore(&client, &state_dir, &credentials(config)).await?;
+    session::reset_cross_signing(&client, &config.matrix.password).await
 }
 
 /// The uid behind each session's `user`, looked up once: a session whose user does not

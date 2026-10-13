@@ -148,6 +148,20 @@ sudo journalctl -u silta-session@user-1
 
 A `silta-session` unit that exited with status 79 (`sudo systemctl status silta-session@user-1`) stopped on purpose: Claude Code cannot run the configured model (for example, because the installed version does not know the name or the account has no access to it). The reason is provided on the `model:` line in its journal. Fix the cause and start it again with `sudo systemctl start silta-session@user-1`.
 
+### Messages marked as sent by an unverified device
+
+If clients mark the assistant's messages "Encrypted by a device not verified by its owner" and the `siltad` journal says `this device is not signed by the account's cross-signing identity`, another client (for example Element, when the account was registered there) set up the account's cross-signing. Replace the identity with one owned by `siltad`:
+
+1. Stop the daemon with `sudo systemctl stop siltad`.
+2. Run the reset as the daemon's user:
+   ```bash
+   sudo sh -c 'runuser -u silta -- siltad --config - reset-cross-signing < /etc/silta/siltad.toml'
+   ```
+   On matrix.org and other homeservers with OAuth 2.0 accounts, open the printed URL, log in as the assistant's account and approve within two minutes. Other homeservers take the password from `siltad.toml`. If the command fails or is interrupted, run it again: until a reset succeeds, the device works unsigned as before.
+3. Start the daemon with `sudo systemctl start siltad`.
+
+The account's other sessions, such as the Element one it was registered with, become unverified, so it is advised to end such sessions first. The users will also see the warning that the assistant's identity was reset.
+
 ### Recovering a session if the request was flagged
 
 High-risk requests on cyber and bio topics may be flagged and refused by the model provider. In this case Claude Code would normally downgrade the model to a weaker one for the rest of the session. Because running a session with a weaker model damages the user experience, falling back to a weaker model is disabled. Such a session will likely keep refusing and stop responding to user messages. The person with the `role = "owner"` will receive the silent session alert in this case as usual.

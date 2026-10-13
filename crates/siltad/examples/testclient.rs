@@ -46,7 +46,7 @@ use matrix_sdk::{
     },
     Client, Room, RoomState,
 };
-use siltad::session::{build_client, login_or_restore, Credentials};
+use siltad::session::{build_client, login_or_restore, prepare_state_dir, Credentials};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -78,10 +78,11 @@ async fn run() -> Result<()> {
     let user_id = UserId::parse(&user).context("TESTCLIENT_USER is not a Matrix user id")?;
     let state_dir = state_root.join(user_id.localpart());
 
-    let client = build_client(&homeserver, &state_dir).await?;
+    let prepared = prepare_state_dir(&state_dir)?;
+    let client = build_client(&homeserver, &prepared).await?;
     login_or_restore(
         &client,
-        &state_dir,
+        &prepared,
         &Credentials {
             homeserver_url: &homeserver,
             user_id: &user,
