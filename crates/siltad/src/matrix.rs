@@ -132,7 +132,10 @@ async fn catch_up(daemon: &Shared, room: &Room, synced: &tokio::sync::Notify, in
     // A message older than the replay window at the invite is history, not the start
     // of a conversation with the bot.
     let since_ms = invited_at_ms.saturating_sub(daemon.replay_window_ms);
-    let fetched = fetch_before_join(daemon, room, since_ms).await;
+    let mut fetched = fetch_before_join(daemon, room, since_ms).await;
+    // The scan reads newest first; reversed, the sort keeps room order among equal
+    // timestamps.
+    fetched.reverse();
     // A homeserver that already had the earlier messages sends them in the join's sync
     // too. Waiting for that sync to be processed puts them among the held, so they are
     // ordered with the fetched ones rather than coming through after the gate.
@@ -147,6 +150,9 @@ async fn catch_up(daemon: &Shared, room: &Room, synced: &tokio::sync::Notify, in
     }
     let mut batch = [fetched, daemon.joins.take_or_close(room_id)].concat();
     while !batch.is_empty() {
+        // The join's sync can bring history from before `since_ms` too, when the
+        // homeserver already had it; it is cut here as the scan cuts it.
+        batch.retain(|event| event.ts() >= since_ms);
         for event in oldest_first(batch) {
             receive(daemon, room, event).await;
         }
