@@ -29,7 +29,7 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::{alert::Silence, outbound, spool::Spool};
+use crate::{alert::Silence, joining::Joins, outbound, spool::Spool};
 
 /// Messages kept for a session that is not connected, per session.
 const BACKLOG_MAX: usize = 100;
@@ -62,6 +62,8 @@ pub struct Daemon {
     pub alerts: Mutex<Watch>,
     /// Named in the alerts, so the owner knows which machine to look at.
     pub hostname: String,
+    /// Rooms being joined, whose events wait for the catch-up on what preceded the join.
+    pub joins: Joins,
     marks: Marks,
     typing: Arc<Mutex<HashMap<OwnedRoomId, TypingTask>>>,
     typing_generation: Mutex<u64>,
@@ -120,6 +122,7 @@ impl Daemon {
             users,
             alerts: Mutex::new(alerts),
             hostname,
+            joins: Joins::default(),
             marks: Marks::load(state_dir.join(MARKS_FILE)),
             typing: Arc::new(Mutex::new(HashMap::new())),
             typing_generation: Mutex::new(0),

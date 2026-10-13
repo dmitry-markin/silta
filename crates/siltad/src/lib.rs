@@ -4,6 +4,7 @@ pub mod alert;
 pub mod backup;
 pub mod content;
 pub mod daemon;
+pub mod joining;
 pub mod matrix;
 pub mod outbound;
 pub mod server;

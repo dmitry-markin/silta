@@ -1,11 +1,16 @@
 //! Event handlers and the sync loop.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{bail, Result};
 use matrix_sdk::{
     config::SyncSettings,
     event_handler::Ctx,
+    room::MessagesOptions,
     ruma::{
         api::error::ErrorKind,
         events::{
@@ -15,9 +20,12 @@ use matrix_sdk::{
                 member::{MembershipState, StrippedRoomMemberEvent},
                 message::OriginalSyncRoomMessageEvent,
             },
+            AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
+            SyncStateEvent,
         },
+        UInt, UserId,
     },
-    Client, Room, RoomState,
+    Client, LoopCtrl, Room, RoomState,
 };
 use silta::{
     config::{DropReason, Inbound, PersonConfig},
@@ -32,13 +40,21 @@ use tracing::{debug, info, warn};
 
 use crate::{
     content::{self, Body, Media},
-    daemon::{Daemon, Dispatch, Shared},
+    daemon::{now_ms, Daemon, Dispatch, Shared},
+    joining::{merge, Held},
     outbound::{member_ids, room_shape},
     spool::{self, DownloadError},
 };
 
 /// A download that has not finished by then is given up.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a join waits for the sync to show the room as joined before it delivers
+/// what preceded the join anyway. A join is an event, so the sync long-poll returns
+/// with it at once; this only bounds a stalled sync.
+const JOIN_SYNC_WAIT: Duration = Duration::from_secs(60);
+/// The backward scan for messages sent before the join reads at most this much.
+const CATCH_UP_PAGE: u32 = 50;
+const CATCH_UP_MAX_PAGES: usize = 5;
 
 pub fn register_handlers(daemon: &Shared) {
     let client = daemon.client.clone();
@@ -49,7 +65,9 @@ pub fn register_handlers(daemon: &Shared) {
     client.add_event_handler(on_undecryptable);
 }
 
-/// Join rooms registered people invite the bot to; ignore everyone else.
+/// Join rooms registered people invite the bot to; ignore everyone else. The room's
+/// events wait at the gate until what was sent before the join is delivered: see
+/// `crate::joining`.
 async fn on_invite(
     event: StrippedRoomMemberEvent,
     room: Room,
@@ -67,14 +85,19 @@ async fn on_invite(
         warn!(room = %room.room_id(), %inviter, "ignoring an invite from an unregistered account");
         return;
     };
+    let Some(synced) = daemon.joins.open(room.room_id()) else {
+        debug!(room = %room.room_id(), %inviter, "already joining on an earlier invite");
+        return;
+    };
     info!(room = %room.room_id(), %inviter, person = %person.name, "joining on invite");
+    let invited_at_ms = now_ms();
     tokio::spawn(async move {
         let mut delay = Duration::from_secs(2);
         loop {
             match room.join().await {
                 Ok(()) => {
                     info!(room = %room.room_id(), "joined");
-                    return;
+                    break;
                 }
                 Err(err) if delay < Duration::from_secs(300) => {
                     warn!(room = %room.room_id(), "join failed ({err}), retrying in {delay:?}");
@@ -83,11 +106,141 @@ async fn on_invite(
                 }
                 Err(err) => {
                     warn!(room = %room.room_id(), "giving up joining: {err}");
+                    // Not joined, so nothing can be held; close the gate for a later invite.
+                    let _ = daemon.joins.take_or_close(room.room_id());
                     return;
                 }
             }
         }
+        catch_up(&daemon, &room, &synced, invited_at_ms).await;
     });
+}
+
+/// Deliver what a registered person sent before the bot joined, then whatever the gate
+/// held meanwhile, once each and oldest first, and only then let the room's events
+/// through directly.
+async fn catch_up(daemon: &Shared, room: &Room, synced: &tokio::sync::Notify, invited_at_ms: u64) {
+    let room_id = room.room_id();
+    // A message older than the replay window at the invite is history, not the start
+    // of a conversation with the bot.
+    let since_ms = invited_at_ms.saturating_sub(daemon.replay_window_ms);
+    let fetched = fetch_before_join(daemon, room, since_ms).await;
+    // A homeserver that already had the earlier messages sends them in the join's sync
+    // too. Waiting for that sync to be processed puts them among the held, where the
+    // merge drops the second copy, instead of letting them through after the gate.
+    if timeout(JOIN_SYNC_WAIT, synced.notified()).await.is_err() {
+        warn!(
+            room = %room_id,
+            "the sync has not shown the room as joined after {JOIN_SYNC_WAIT:?}, delivering what preceded the join without it"
+        );
+    }
+    if !fetched.is_empty() {
+        info!(room = %room_id, events = fetched.len(), "found events sent before the join");
+    }
+    let mut seen = HashSet::new();
+    let mut batch = merge(&mut seen, [fetched, daemon.joins.take_or_close(room_id)]);
+    while !batch.is_empty() {
+        for event in batch {
+            receive(daemon, room, event).await;
+        }
+        batch = merge(&mut seen, [daemon.joins.take_or_close(room_id)]);
+    }
+}
+
+/// Page backwards past the bot's own join and collect the messages and reactions sent
+/// before it, back to `since_ms`, the room's creation, or the page cap. Over federation
+/// this is also what makes the bot's homeserver fetch that history at all.
+async fn fetch_before_join(daemon: &Daemon, room: &Room, since_ms: u64) -> Vec<Held> {
+    let room_id = room.room_id();
+    let Some(own) = daemon.client.user_id() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut past_join = false;
+    let mut from = None;
+    for _ in 0..CATCH_UP_MAX_PAGES {
+        let mut options = MessagesOptions::backward();
+        options.limit = UInt::from(CATCH_UP_PAGE);
+        options.from = from.take();
+        let page = match room.messages(options).await {
+            Ok(page) => page,
+            Err(err) => {
+                warn!(room = %room_id, "cannot read what was sent before the join: {err}");
+                return out;
+            }
+        };
+        for event in &page.chunk {
+            let Ok(any) = event.raw().deserialize() else {
+                continue;
+            };
+            // What follows the join comes through sync.
+            if !past_join {
+                past_join = is_own_join(&any, own);
+                continue;
+            }
+            if u64::from(any.origin_server_ts().get()) < since_ms {
+                return out;
+            }
+            match any {
+                AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                    SyncMessageLikeEvent::Original(m),
+                )) => out.push(Held::Message(Box::new(m))),
+                AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Reaction(
+                    SyncMessageLikeEvent::Original(r),
+                )) => out.push(Held::Reaction(r)),
+                AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+                    SyncMessageLikeEvent::Original(e),
+                )) => warn!(
+                    room = %room_id,
+                    sender = %e.sender,
+                    event_id = %e.event_id,
+                    "cannot decrypt an event sent before the join (no room key for it)"
+                ),
+                AnySyncTimelineEvent::State(AnySyncStateEvent::RoomCreate(_)) => return out,
+                _ => {}
+            }
+        }
+        match page.end {
+            Some(end) if !page.chunk.is_empty() => from = Some(end),
+            _ => break,
+        }
+    }
+    if past_join {
+        warn!(room = %room_id, "stopped looking for events sent before the join after {CATCH_UP_MAX_PAGES} pages");
+    } else {
+        warn!(room = %room_id, "cannot find the bot's own join in the room's history");
+    }
+    out
+}
+
+/// The bot's own membership becoming `join`; a profile change keeps it `join`.
+fn is_own_join(event: &AnySyncTimelineEvent, own: &UserId) -> bool {
+    let AnySyncTimelineEvent::State(AnySyncStateEvent::RoomMember(SyncStateEvent::Original(m))) =
+        event
+    else {
+        return false;
+    };
+    m.state_key == own
+        && m.content.membership == MembershipState::Join
+        && m.unsigned
+            .prev_content
+            .as_ref()
+            .is_none_or(|prev| prev.membership != MembershipState::Join)
+}
+
+/// Where a received attachment is downloaded: off the sync loop, or in the join's
+/// catch-up, which must not deliver a later event first.
+#[derive(Clone, Copy)]
+enum Download {
+    Background,
+    Inline,
+}
+
+async fn receive(daemon: &Shared, room: &Room, event: Held) {
+    match event {
+        Held::Message(event) => receive_message(daemon, room, *event, Download::Inline).await,
+        Held::Reaction(event) => receive_reaction(daemon, room, event).await,
+    }
 }
 
 /// The routing and replay decisions shared by messages and reactions: the registered
@@ -196,6 +349,17 @@ async fn admit<'a>(
 /// owns the room; queue them while the session is away; skip what an earlier run
 /// delivered. Attachments are downloaded first, off the sync loop.
 async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, Ctx(daemon): Ctx<Shared>) {
+    if let Err(event) = daemon.joins.hold(room.room_id(), event) {
+        receive_message(&daemon, &room, event, Download::Background).await;
+    }
+}
+
+async fn receive_message(
+    daemon: &Shared,
+    room: &Room,
+    event: OriginalSyncRoomMessageEvent,
+    download: Download,
+) {
     if room.state() != RoomState::Joined {
         return;
     }
@@ -227,8 +391,7 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, Ctx(daemon)
         }
         Body::Text(_) | Body::Media(_) => {}
     }
-    let Some((session, person, kind)) =
-        admit(&daemon, &room, sender, event_id, ts, "message").await
+    let Some((session, person, kind)) = admit(daemon, room, sender, event_id, ts, "message").await
     else {
         return;
     };
@@ -252,16 +415,24 @@ async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, Ctx(daemon)
     match parsed.body {
         Body::Text(text) => {
             message.text = text;
-            deliver(&daemon, session, &room, message, ts);
+            deliver(daemon, session, room, message, ts);
         }
         Body::Media(media) => {
             message.text = media.caption.clone();
-            let session = session.to_owned();
-            let daemon = daemon.clone();
-            tokio::spawn(async move {
-                fetch_attachment(&daemon, &mut message, media).await;
-                deliver(&daemon, &session, &room, message, ts);
-            });
+            match download {
+                Download::Inline => {
+                    fetch_attachment(daemon, &mut message, media).await;
+                    deliver(daemon, session, room, message, ts);
+                }
+                Download::Background => {
+                    let session = session.to_owned();
+                    let (daemon, room) = (Arc::clone(daemon), room.clone());
+                    tokio::spawn(async move {
+                        fetch_attachment(&daemon, &mut message, media).await;
+                        deliver(&daemon, &session, &room, message, ts);
+                    });
+                }
+            }
         }
         Body::Edit | Body::Other(_) => {}
     }
@@ -348,6 +519,12 @@ fn note(message: &mut Event, line: String) {
 /// Reactions on the bot's own messages, from registered people, to the session that
 /// owns the room. Reactions on anything else are not the assistant's business.
 async fn on_reaction(event: OriginalSyncReactionEvent, room: Room, Ctx(daemon): Ctx<Shared>) {
+    if let Err(event) = daemon.joins.hold(room.room_id(), event) {
+        receive_reaction(&daemon, &room, event).await;
+    }
+}
+
+async fn receive_reaction(daemon: &Shared, room: &Room, event: OriginalSyncReactionEvent) {
     if room.state() != RoomState::Joined {
         return;
     }
@@ -361,8 +538,7 @@ async fn on_reaction(event: OriginalSyncReactionEvent, room: Room, Ctx(daemon): 
     let target = event.content.relates_to.event_id.clone();
     let key = event.content.relates_to.key.clone();
 
-    let Some((session, person, kind)) =
-        admit(&daemon, &room, sender, event_id, ts, "reaction").await
+    let Some((session, person, kind)) = admit(daemon, room, sender, event_id, ts, "reaction").await
     else {
         return;
     };
@@ -396,7 +572,7 @@ async fn on_reaction(event: OriginalSyncReactionEvent, room: Room, Ctx(daemon): 
         transcribed: false,
         attachments: Vec::new(),
     };
-    deliver(&daemon, session, &room, message, ts);
+    deliver(daemon, session, room, message, ts);
 }
 
 fn deliver(daemon: &Daemon, session: &str, room: &Room, event: Event, ts: u64) {
@@ -443,7 +619,14 @@ pub async fn sync_loop(daemon: Shared, cancel: CancellationToken) -> Result<()> 
         let started = Instant::now();
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
-            result = daemon.client.sync(settings) => match result {
+            // The callback runs once the response is processed and its event handlers
+            // have run, which is what a join's catch-up waits for.
+            result = daemon.client.sync_with_callback(settings, |response| {
+                for room in response.rooms.joined.keys() {
+                    daemon.joins.synced(room);
+                }
+                async { LoopCtrl::Continue }
+            }) => match result {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     if is_token_error(&err) {
