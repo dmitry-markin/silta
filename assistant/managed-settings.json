@@ -1,14 +1,15 @@
 {
   "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "marketplace": "silta-local", "plugin": "silta-claude" }
+  ],
   "hooks": {
     "PreCompact": [
       { "matcher": "auto",
         "hooks": [ { "type": "command", "command": "/usr/lib/silta/silta-precompact-block", "timeout": 30 } ] }
     ]
   },
-  "allowedChannelPlugins": [
-    { "marketplace": "silta-local", "plugin": "silta-claude" }
-  ],
+  "idleCompaction": false,
   "disableRemoteControl": true,
   "allowManagedHooksOnly": true,
   "disableSideloadFlags": true,
