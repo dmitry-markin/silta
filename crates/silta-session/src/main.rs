@@ -25,6 +25,13 @@ struct Args {
     #[arg(long, env = "SILTA_PERSONA", default_value = "/etc/silta/persona.md")]
     persona: PathBuf,
 
+    /// Whether Claude Code reuses the system prompt it recorded on the conversation's
+    /// first request (0/1): with 0 it renders the prompt, persona included, on every
+    /// request, so an edited persona reaches a resumed session. Unset leaves Claude
+    /// Code's default (recording, until the conversation is compacted).
+    #[arg(long, env = "SILTA_PROMPT_SNAPSHOT", value_parser = parse_switch)]
+    prompt_snapshot: Option<bool>,
+
     /// Claude Code; a versions/<n> path pins one.
     #[arg(
         long,
@@ -152,6 +159,7 @@ fn main() -> ExitCode {
         session: args.session,
         state: args.state,
         persona: args.persona,
+        prompt_snapshot: args.prompt_snapshot,
         claude_bin: args.claude_bin,
         plugin_bin: args.plugin_bin,
         socket: args.socket,

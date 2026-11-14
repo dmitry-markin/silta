@@ -62,6 +62,11 @@ pub struct Config {
     /// The state directory, the session's `HOME`.
     pub state: PathBuf,
     pub persona: PathBuf,
+    /// `--system-prompt-snapshot`: whether Claude Code sends the system prompt it
+    /// recorded on the conversation's first request (persona included) on every later
+    /// request and resume until a compaction, or renders it on each request. `None`
+    /// leaves Claude Code's default (recording and sending a cached version).
+    pub prompt_snapshot: Option<bool>,
     pub claude_bin: PathBuf,
     /// The channel plugin's binary, `SILTA_CLAUDE_BIN` for the plugin's `.mcp.json`.
     pub plugin_bin: PathBuf,
@@ -428,6 +433,10 @@ async fn run_once(
         "none",
     ]);
     cmd.arg("--append-system-prompt-file").arg(&cfg.persona);
+    if let Some(snapshot) = cfg.prompt_snapshot {
+        cmd.arg("--system-prompt-snapshot")
+            .arg(if snapshot { "on" } else { "off" });
+    }
     if let Some(model) = &cfg.model {
         cmd.arg("--model").arg(model);
     }
