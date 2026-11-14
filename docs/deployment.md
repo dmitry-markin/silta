@@ -162,6 +162,17 @@ If clients mark the assistant's messages "Encrypted by a device not verified by 
 
 The account's other sessions, such as the Element one it was registered with, become unverified, so it is advised to end such sessions first. The users will also see the warning that the assistant's identity was reset.
 
+### Applying an edited persona to a running session
+
+Claude Code keeps the system prompt, persona included, from a conversation's first request until it is compacted, so an edited `/etc/silta/persona.md` reaches a session only at its next rotation. To apply it at once to session `<name>` (from `siltad.toml`):
+
+1. Add a drop-in with `sudo systemctl edit silta-session@<name>`, then `sudo systemctl restart silta-session@<name>`:
+   ```
+   [Service]
+   Environment=SILTA_PROMPT_SNAPSHOT=0
+   ```
+2. After the next rotation, remove it with `sudo systemctl revert silta-session@<name>` (or `edit`, if the drop-in holds other overrides) and restart. Removing it earlier brings the old persona back.
+
 ### Recovering a session if the request was flagged
 
 High-risk requests on cyber and bio topics may be flagged and refused by the model provider. In this case Claude Code would normally downgrade the model to a weaker one for the rest of the session. Because running a session with a weaker model damages the user experience, falling back to a weaker model is disabled. Such a session will likely keep refusing and stop responding to user messages. The person with the `role = "owner"` will receive the silent session alert in this case as usual.
