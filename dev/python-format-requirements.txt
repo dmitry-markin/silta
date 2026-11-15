@@ -1,5 +1,5 @@
 # The formatters of deploy/silta-contract-check and deploy/silta-precompact-block, for CI's
-# "contract checker format" job and for a local check. Every package, black's own dependencies
+# "python format" job and for a local check. Every package, black's own dependencies
 # included, is pinned to a version and to the hashes of its files on PyPI, and installed with
 # `pip install --require-hashes`, so a replaced release fails the install instead of running.
 # Bumped by hand, when wanted: put the new black==/pycodestyle== pins in a file of their own
