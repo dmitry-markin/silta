@@ -102,9 +102,10 @@ jobs:
   contract-check-format:
     name: contract checker format
     runs-on: ubuntu-latest
-    # black at 100 columns and pycodestyle without the two codes black's style trips (E203,
-    # W503), from a venv (the runner's Python is externally managed) with every package
-    # pinned by hash in dev/contract-check-format-requirements.txt.
+    # The Python scripts under deploy/ (the checker and the PreCompact hook): black at 100
+    # columns and pycodestyle without the two codes black's style trips (E203, W503), from a
+    # venv (the runner's Python is externally managed) with every package pinned by hash in
+    # dev/contract-check-format-requirements.txt.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -112,9 +113,9 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/format"
           "$RUNNER_TEMP/format/bin/pip" install --require-hashes -r dev/contract-check-format-requirements.txt
 
-      - run: '"$RUNNER_TEMP/format/bin/black" --check --line-length 100 deploy/silta-contract-check'
+      - run: '"$RUNNER_TEMP/format/bin/black" --check --line-length 100 deploy/silta-contract-check deploy/silta-precompact-block'
 
-      - run: '"$RUNNER_TEMP/format/bin/pycodestyle" --max-line-length 100 --ignore E203,W503 deploy/silta-contract-check'
+      - run: '"$RUNNER_TEMP/format/bin/pycodestyle" --max-line-length 100 --ignore E203,W503 deploy/silta-contract-check deploy/silta-precompact-block'
 
   contract-check:
     name: contract check replay

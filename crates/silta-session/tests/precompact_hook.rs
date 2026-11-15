@@ -1,7 +1,8 @@
 //! The PreCompact hook (`deploy/silta-precompact-block`), run as Claude Code runs it: the
 //! hook input on stdin, the unit's environment. It blocks the main session's automatic
 //! compaction and leaves the `rotate-requested` marker the supervisor rotates on, and lets
-//! a subagent compact its own context without a marker.
+//! a subagent compact its own context without a marker. Input that is not a JSON object counts
+//! as the main session's.
 
 use std::{
     fs,
@@ -97,30 +98,76 @@ fn main_session_compaction_is_blocked_and_asks_for_a_rotation() {
 
 #[test]
 fn subagent_compaction_proceeds_without_a_marker() {
-    let hook = Hook::new("subagent");
-    let (code, stderr) = hook.run(SUBAGENT, &[]);
-    assert_eq!(code, 0, "stderr {stderr}");
-    assert!(stderr.is_empty(), "{stderr}");
-    assert_eq!(hook.marker(), None);
-
-    // Pretty-printed JSON too.
     let pretty = SUBAGENT.replace(",\"", ",\n  \"").replace("\":", "\": ");
-    let (code, _) = hook.run(&pretty, &[]);
-    assert_eq!(code, 0);
-    assert_eq!(hook.marker(), None);
+    let numeric = SUBAGENT.replace(r#""agent_id":"a4f2c9e1b7d3""#, r#""agent_id":7"#);
+    for (name, input) in [
+        ("subagent", SUBAGENT),
+        ("pretty", pretty.as_str()),
+        // Not a string today, but any value but null is a subagent's id.
+        ("numeric", numeric.as_str()),
+    ] {
+        let hook = Hook::new(name);
+        let (code, stderr) = hook.run(input, &[]);
+        assert_eq!(code, 0, "{name}: stderr {stderr}");
+        assert!(stderr.is_empty(), "{name}: {stderr}");
+        assert_eq!(hook.marker(), None, "{name}");
+    }
 }
 
 #[test]
-fn agent_id_inside_a_string_value_is_not_a_subagent() {
-    // Compaction instructions that quote the key: escaped quotes, so not a key.
-    let input = MAIN.replace(
+fn only_a_top_level_agent_id_is_a_subagent() {
+    let quoted = MAIN.replace(
         r#""custom_instructions":null"#,
         r#""custom_instructions":"keep \"agent_id\": \"x\" out""#,
     );
-    let hook = Hook::new("quoted");
-    let (code, stderr) = hook.run(&input, &[]);
-    assert_eq!(code, 2, "stderr {stderr}");
-    assert!(hook.marker().is_some());
+    let nested = MAIN.replace(
+        r#""effort":{"level":"high"}"#,
+        r#""effort":{"level":"high","agent_id":"a4f2c9e1b7d3"}"#,
+    );
+    let null = MAIN.replace(r#""trigger":"auto""#, r#""trigger":"auto","agent_id":null"#);
+    for (name, input) in [
+        ("quoted", quoted.as_str()),
+        ("nested", nested.as_str()),
+        ("null", null.as_str()),
+    ] {
+        assert_ne!(input, MAIN, "{name}: the replacement missed");
+        let hook = Hook::new(name);
+        let (code, stderr) = hook.run(input, &[]);
+        assert_eq!(code, 2, "{name}: stderr {stderr}");
+        assert_eq!(
+            hook.marker().as_deref(),
+            Some(format!("{input}\n").as_str()),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn input_that_is_not_a_json_object_counts_as_the_main_session() {
+    for (name, input) in [
+        ("garbage", "not json\n"),
+        ("array", r#"[{"agent_id":"a4f2c9e1b7d3"}]"#),
+        ("empty", ""),
+    ] {
+        let hook = Hook::new(name);
+        let (code, stderr) = hook.run(input, &[]);
+        assert_eq!(code, 2, "{name}: stderr {stderr}");
+        assert_eq!(
+            hook.marker().as_deref(),
+            Some(format!("{}\n", input.trim_end_matches('\n')).as_str()),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn compaction_proceeds_when_the_marker_cannot_be_written() {
+    let hook = Hook::new("unwritable");
+    let missing = hook.state.join("missing");
+    let (code, stderr) = hook.run(MAIN, &[("STATE_DIRECTORY", missing.to_str().unwrap())]);
+    assert_eq!(code, 0, "stderr {stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert_eq!(fs::read_dir(&hook.state).unwrap().count(), 0);
 }
 
 #[test]
@@ -130,9 +177,14 @@ fn outside_a_mind_or_with_rotation_off_compaction_proceeds() {
         &[("SILTA_SESSION", "")][..],
         &[("SILTA_ROTATE", "0")],
         &[("SILTA_ROTATE", "Off")],
+        &[("SILTA_ROTATE", "FALSE")],
+        &[("SILTA_ROTATE", "no")],
     ] {
         let (code, stderr) = hook.run(MAIN, env);
         assert_eq!(code, 0, "{env:?}: stderr {stderr}");
         assert_eq!(hook.marker(), None, "{env:?}");
     }
+    // Any other value leaves rotation on.
+    let (code, _) = hook.run(MAIN, &[("SILTA_ROTATE", "1")]);
+    assert_eq!(code, 2);
 }

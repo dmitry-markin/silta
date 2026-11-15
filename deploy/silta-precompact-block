@@ -1,42 +1,85 @@
-#!/bin/sh
-# The PreCompact hook (matcher "auto") of every mind, declared in
-# /etc/claude-code/managed-settings.json: blocks Claude Code's automatic compaction and
-# asks the supervisor for a rotation instead. Runs as a child of claude, outside the Bash
-# sandbox, with the unit's environment. stdin is a JSON object with session_id,
-# transcript_path and trigger, plus agent_id when the compaction is a subagent's. Exit 2
-# blocks the compaction, and the line on stderr lands in the session's context. Outside a
-# mind (no SILTA_SESSION) the compaction is allowed, as it is when the marker cannot be
-# written or when rotation is switched off for the mind (SILTA_ROTATE=0 in its unit,
-# inherited from the supervisor).
-#
-# A subagent compacts its own context, not the main session's: its compaction is allowed
-# and leaves no marker, or a subagent near its window would rotate the main session.
-# Claude Code sets agent_id only inside a subagent, never on the main thread (not even in
-# an --agent session), and names it as the field that tells the two apart; agent_type
-# does not, since the main thread of an --agent session has one too.
+#!/usr/bin/python3 -I
+"""The PreCompact hook (matcher "auto") of every mind, declared in
+/etc/claude-code/managed-settings.json: blocks Claude Code's automatic compaction of the main
+session and asks the supervisor for a rotation instead.
 
-set -u
+Runs as a child of claude, outside the Bash sandbox, with the unit's environment (hence -I:
+no PYTHON* variables, no user site, not the script's directory on sys.path). stdin is a JSON
+object with session_id, transcript_path and trigger, plus agent_id when the compaction is a
+subagent's. Exit 2 blocks the compaction, and the line on stderr lands in the session's
+context; exit 0 lets it proceed.
 
-[ -n "${SILTA_SESSION:-}" ] || exit 0
+The compaction is allowed, and no marker is left:
+- outside a mind (no SILTA_SESSION);
+- when rotation is switched off for the mind (SILTA_ROTATE=0 in its unit, inherited from the
+  supervisor);
+- for a subagent, which compacts its own context, not the main session's; blocking it with
+  the marker would rotate the main session. Claude Code sets agent_id only inside a subagent,
+  never on the main thread (not even in an --agent session), and names it as the field that
+  tells the two apart; agent_type does not, since the main thread of an --agent session has
+  one too;
+- when the marker cannot be written.
 
-case "$(printf '%s' "${SILTA_ROTATE:-1}" | tr '[:upper:]' '[:lower:]')" in
-    0|false|no|off) exit 0 ;;
-esac
+Input that is not a JSON object counts as the main session's: the marker is written and the
+compaction blocked, so a mind never falls back to Claude Code's own compaction by mistake.
+"""
 
-input=$(cat)
+import json
+import os
+import sys
 
-# A key with a string value. In valid JSON an unescaped "agent_id" followed by a colon is
-# a key, never part of a string value (quotes inside strings are escaped), and the input's
-# only nested object (effort) has no such key. Claude Code omits the key on the main
-# thread (an undefined agentId does not survive JSON serialisation).
-if printf '%s\n' "$input" | grep -q '"agent_id"[[:space:]]*:[[:space:]]*"'; then
-    exit 0
-fi
+MARKER = "rotate-requested"
+OFF = {"0", "false", "no", "off"}
 
-state="${STATE_DIRECTORY:-$HOME}"
 
-printf '%s\n' "$input" > "$state/rotate-requested.tmp" && mv "$state/rotate-requested.tmp" "$state/rotate-requested" || exit 0
+def is_subagent(data: bytes) -> bool:
+    """Whether the hook input carries a top-level agent_id (any value but null)."""
+    try:
+        hook_input = json.loads(data)
+    except ValueError:
+        return False
+    return isinstance(hook_input, dict) and hook_input.get("agent_id") is not None
 
-echo "silta: automatic compaction blocked; the host rotates the session at the next quiet moment and asks for a handoff first" >&2
 
-exit 2
+def write_marker(state: str, content: bytes) -> bool:
+    """Writes the marker through a temporary file and a rename, so the supervisor never
+    reads half of it."""
+    path = os.path.join(state, MARKER)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def main() -> int:
+    if not os.environ.get("SILTA_SESSION"):
+        return 0
+    if os.environ.get("SILTA_ROTATE", "1").lower() in OFF:
+        return 0
+
+    data = sys.stdin.buffer.read()
+    if is_subagent(data):
+        return 0
+
+    state = os.environ.get("STATE_DIRECTORY") or os.environ.get("HOME")
+    if not state or not write_marker(state, data.rstrip(b"\n") + b"\n"):
+        return 0
+
+    print(
+        "silta: automatic compaction blocked; the host rotates the session at the next quiet"
+        " moment and asks for a handoff first",
+        file=sys.stderr,
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
