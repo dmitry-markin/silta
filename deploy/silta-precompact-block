@@ -3,10 +3,17 @@
 # /etc/claude-code/managed-settings.json: blocks Claude Code's automatic compaction and
 # asks the supervisor for a rotation instead. Runs as a child of claude, outside the Bash
 # sandbox, with the unit's environment. stdin is a JSON object with session_id,
-# transcript_path and trigger. Exit 2 blocks the compaction, and the line on stderr lands
-# in the session's context. Outside a mind (no SILTA_SESSION) the compaction is allowed,
-# as it is when the marker cannot be written or when rotation is switched off for the
-# mind (SILTA_ROTATE=0 in its unit, inherited from the supervisor).
+# transcript_path and trigger, plus agent_id when the compaction is a subagent's. Exit 2
+# blocks the compaction, and the line on stderr lands in the session's context. Outside a
+# mind (no SILTA_SESSION) the compaction is allowed, as it is when the marker cannot be
+# written or when rotation is switched off for the mind (SILTA_ROTATE=0 in its unit,
+# inherited from the supervisor).
+#
+# A subagent compacts its own context, not the main session's: its compaction is allowed
+# and leaves no marker, or a subagent near its window would rotate the main session.
+# Claude Code sets agent_id only inside a subagent, never on the main thread (not even in
+# an --agent session), and names it as the field that tells the two apart; agent_type
+# does not, since the main thread of an --agent session has one too.
 
 set -u
 
@@ -16,8 +23,17 @@ case "$(printf '%s' "${SILTA_ROTATE:-1}" | tr '[:upper:]' '[:lower:]')" in
     0|false|no|off) exit 0 ;;
 esac
 
-state="${STATE_DIRECTORY:-$HOME}"
 input=$(cat)
+
+# A key with a string value. In valid JSON an unescaped "agent_id" followed by a colon is
+# a key, never part of a string value (quotes inside strings are escaped), and the input's
+# only nested object (effort) has no such key. Claude Code omits the key on the main
+# thread (an undefined agentId does not survive JSON serialisation).
+if printf '%s\n' "$input" | grep -q '"agent_id"[[:space:]]*:[[:space:]]*"'; then
+    exit 0
+fi
+
+state="${STATE_DIRECTORY:-$HOME}"
 
 printf '%s\n' "$input" > "$state/rotate-requested.tmp" && mv "$state/rotate-requested.tmp" "$state/rotate-requested" || exit 0
 

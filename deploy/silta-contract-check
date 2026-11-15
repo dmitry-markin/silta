@@ -3449,8 +3449,9 @@ def check_marker(report: Report, trace: Trace, meta: dict) -> None:
     """The hook ran with the unit's environment (SILTA_SESSION, SILTA_ROTATE,
     STATE_DIRECTORY) and wrote `rotate-requested` in the state directory
     (deploy/silta-precompact-block): its stdin, a JSON object with `session_id`,
-    `transcript_path` and `trigger` `auto`. The supervisor's rotation starts from that
-    marker (rotation.rs, state.rs `Paths::marker`)."""
+    `transcript_path` and `trigger` `auto`, and no `agent_id`, which Claude Code sets only
+    for a subagent's compaction (the hook lets those proceed without a marker). The
+    supervisor's rotation starts from that marker (rotation.rs, state.rs `Paths::marker`)."""
     marker = trace_file(trace, "marker")
     fired = marker is not None and marker.get("exists") is True
     if not report.check(
@@ -3479,6 +3480,15 @@ def check_marker(report: Report, trace: Trace, meta: dict) -> None:
             else ""
         ),
     )
+    if isinstance(content, dict):
+        report.check(
+            "hook: main thread",
+            "agent_id" not in content,
+            f"the main thread's compaction came with agent_id {content.get('agent_id')!r}: the"
+            " hook takes agent_id for a subagent's compaction and lets it proceed, so the main"
+            " session would never rotate",
+            "no agent_id",
+        )
 
 
 # --------------------------------------------------------------------------------------------------
