@@ -66,8 +66,22 @@ impl Hook {
         )
     }
 
+    fn set(&self, file: &str, content: &str) {
+        fs::write(self.state.join(file), content).unwrap();
+    }
+
     fn marker(&self) -> Option<String> {
         fs::read_to_string(self.state.join("rotate-requested")).ok()
+    }
+
+    /// The names in the state directory, sorted.
+    fn files(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&self.state)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
     }
 }
 
@@ -92,7 +106,7 @@ fn main_session_compaction_is_blocked_and_asks_for_a_rotation() {
             Some(format!("{input}\n").as_str()),
             "{name}"
         );
-        assert!(!hook.state.join("rotate-requested.tmp").exists(), "{name}");
+        assert_eq!(hook.files(), ["rotate-requested"], "{name}");
     }
 }
 
@@ -144,10 +158,13 @@ fn only_a_top_level_agent_id_is_a_subagent() {
 
 #[test]
 fn input_that_is_not_a_json_object_counts_as_the_main_session() {
+    // Too deep for Python's JSON parser, which raises RecursionError, not ValueError.
+    let deep = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
     for (name, input) in [
         ("garbage", "not json\n"),
         ("array", r#"[{"agent_id":"a4f2c9e1b7d3"}]"#),
         ("empty", ""),
+        ("deep", deep.as_str()),
     ] {
         let hook = Hook::new(name);
         let (code, stderr) = hook.run(input, &[]);
@@ -158,6 +175,23 @@ fn input_that_is_not_a_json_object_counts_as_the_main_session() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn the_supervisors_temporary_file_is_left_alone() {
+    let hook = Hook::new("supervisor-tmp");
+    // The supervisor's write_atomic, caught between its write and its rename.
+    hook.set(
+        "rotate-requested.tmp",
+        "rotation requested by the supervisor\n",
+    );
+    let (code, stderr) = hook.run(MAIN, &[]);
+    assert_eq!(code, 2, "stderr {stderr}");
+    assert_eq!(hook.marker().as_deref(), Some(format!("{MAIN}\n").as_str()));
+    assert_eq!(
+        fs::read_to_string(hook.state.join("rotate-requested.tmp")).unwrap(),
+        "rotation requested by the supervisor\n"
+    );
 }
 
 #[test]
@@ -179,6 +213,8 @@ fn outside_a_mind_or_with_rotation_off_compaction_proceeds() {
         &[("SILTA_ROTATE", "Off")],
         &[("SILTA_ROTATE", "FALSE")],
         &[("SILTA_ROTATE", "no")],
+        // The supervisor trims the value.
+        &[("SILTA_ROTATE", " 0\n")],
     ] {
         let (code, stderr) = hook.run(MAIN, env);
         assert_eq!(code, 0, "{env:?}: stderr {stderr}");

@@ -3,66 +3,55 @@
 /etc/claude-code/managed-settings.json: blocks Claude Code's automatic compaction of the main
 session and asks the supervisor for a rotation instead.
 
-Runs as a child of claude, outside the Bash sandbox, with the unit's environment (hence -I:
-no PYTHON* variables, no user site, not the script's directory on sys.path). stdin is a JSON
-object with session_id, transcript_path and trigger, plus agent_id when the compaction is a
-subagent's. Exit 2 blocks the compaction, and the line on stderr lands in the session's
-context; exit 0 lets it proceed.
+Runs as a child of claude with the unit's environment (hence -I). stdin is a JSON object with
+session_id, transcript_path and trigger, plus agent_id when the compaction is a subagent's.
+Exit 2 blocks the compaction, the stderr line landing in the session's context; any other exit
+lets it proceed.
 
-The compaction is allowed, and no marker is left:
-- outside a mind (no SILTA_SESSION);
-- when rotation is switched off for the mind (SILTA_ROTATE=0 in its unit, inherited from the
-  supervisor);
-- for a subagent, which compacts its own context, not the main session's; blocking it with
-  the marker would rotate the main session. Claude Code sets agent_id only inside a subagent,
-  never on the main thread (not even in an --agent session), and names it as the field that
-  tells the two apart; agent_type does not, since the main thread of an --agent session has
-  one too;
-- when the marker cannot be written.
-
-Input that is not a JSON object counts as the main session's: the marker is written and the
-compaction blocked, so a mind never falls back to Claude Code's own compaction by mistake.
+It blocks only once the marker is written, so that a rotation follows. The compaction proceeds
+outside a mind (no SILTA_SESSION), with rotation off (SILTA_ROTATE=0), when the marker cannot
+be written, on any unexpected error, and for a subagent: it compacts its own context, not the
+main session's. Claude Code sets agent_id only in a subagent, never on the main thread (not
+even with --agent, whose main thread has an agent_type). Input that is not a JSON object
+counts as the main session's.
 """
 
 import json
 import os
 import sys
 
-MARKER = "rotate-requested"
-OFF = {"0", "false", "no", "off"}
-
 
 def is_subagent(data: bytes) -> bool:
-    """Whether the hook input carries a top-level agent_id (any value but null)."""
     try:
         hook_input = json.loads(data)
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
     return isinstance(hook_input, dict) and hook_input.get("agent_id") is not None
 
 
 def write_marker(state: str, content: bytes) -> bool:
-    """Writes the marker through a temporary file and a rename, so the supervisor never
-    reads half of it."""
-    path = os.path.join(state, MARKER)
-    tmp = path + ".tmp"
+    """Atomically, through a temporary file of its own: the supervisor writes the marker
+    through `rotate-requested.tmp`."""
+    path = os.path.join(state, "rotate-requested")
+    tmp = f"{path}.{os.getpid()}.tmp"
     try:
         with open(tmp, "wb") as f:
             f.write(content)
         os.replace(tmp, path)
+        return True
     except OSError:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         return False
-    return True
 
 
 def main() -> int:
     if not os.environ.get("SILTA_SESSION"):
         return 0
-    if os.environ.get("SILTA_ROTATE", "1").lower() in OFF:
+    # Parsed as the supervisor parses it (parse_switch).
+    if os.environ.get("SILTA_ROTATE", "1").strip().lower() in {"0", "false", "no", "off"}:
         return 0
 
     data = sys.stdin.buffer.read()
