@@ -128,8 +128,8 @@ TasksMax=512
 # No `MemoryDenyWriteExecute`: the Claude Code binary is a JavaScript runtime with a JIT.
 # A denylist of privileged syscall groups rather than an allowlist, because a mind runs
 # arbitrary developer tools. `PrivateTmp` keeps Claude Code's messaging socket
-# (`/tmp/cc-socks-<uid>`) private to the mind. `ProtectProc=invisible` keeps minds
-# from seeing each other's processes.
+# (`/tmp/cc-socks/`) private to the mind; `silta.tmpfiles` keeps the 10-day /tmp cleanup
+# off its sockets. `ProtectProc=invisible` keeps minds from seeing each other's processes.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=

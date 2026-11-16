@@ -3,3 +3,9 @@
 d /opt/claude 0711 claude claude -
 d /var/lib/silta 0755 root root -
 d /var/backups/silta 0700 silta silta -
+# Claude Code's sockets in each mind's private /tmp: the messaging socket under
+# `cc-socks/` (or the `cc-socks-<uid>/` fallback) and the Bash sandbox's proxy sockets
+# (`claude-{http,socks}-*.sock`). Using a socket doesn't update its timestamps, so the
+# 10-day /tmp cleanup would delete them under a running mind. `*` matches one path level.
+x /tmp/systemd-private-%b-silta-session@*/tmp/*.sock
+x /tmp/systemd-private-%b-silta-session@*/tmp/*/*.sock
