@@ -1,11 +1,15 @@
-# The Claude Code install's home, traversable by the minds; the parent of the minds'
-# homes (each /var/lib/silta/<name> is made by silta-session-add); the backup directory.
+# The Claude Code install's home, traversable by the minds.
 d /opt/claude 0711 claude claude -
+
+# The parent of the minds' homes (each `/var/lib/silta/<name>` is made by `silta-session-add`).
 d /var/lib/silta 0755 root root -
+
+# The backup directory.
 d /var/backups/silta 0700 silta silta -
-# Claude Code's sockets in each mind's private /tmp: the messaging socket under
-# `cc-socks/` (or the `cc-socks-<uid>/` fallback) and the Bash sandbox's proxy sockets
-# (`claude-{http,socks}-*.sock`). Using a socket doesn't update its timestamps, so the
-# 10-day /tmp cleanup would delete them under a running mind. `*` matches one path level.
+
+# Claude Code's sockets in each mind's private `/tmp` excluded from the cleanup: the messaging
+# socket under `cc-socks/` (or the `cc-socks-<uid>/` fallback) and the Bash sandbox's proxy
+# sockets (`claude-{http,socks}-*.sock`). Using a socket doesn't update its timestamps, so the
+# 10-day `/tmp` cleanup would delete them under a running mind. `*` matches one path level.
 x /tmp/systemd-private-%b-silta-session@*/tmp/*.sock
 x /tmp/systemd-private-%b-silta-session@*/tmp/*/*.sock
