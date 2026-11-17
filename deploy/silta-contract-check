@@ -174,7 +174,9 @@ FALLBACK_OUTAGE = ["overloaded", "server_error"]
 # is the bare text, so the model gets a real book to hold rather than generated filler;
 # the message that carries it says what it is.
 HOOK_WINDOW = 150_000
-HOOK_THRESHOLD = HOOK_WINDOW - 20_000 - 13_000
+# What Claude Code takes off the window to get the threshold. check_compaction_attempted
+# takes it off the window the run recorded, which may differ in an older trace.
+HOOK_MARGIN = 20_000 + 13_000
 FILLER_FILE = "the-hound-of-the-baskervilles.txt"
 FILLER_TITLE = "The Hound of the Baskervilles by Arthur Conan Doyle"
 DEFAULT_HOOK_MODEL = "claude-haiku-5-5"
@@ -463,6 +465,15 @@ class Report:
             for status, name, detail in self.checks:
                 if status == "FAIL":
                     self.say(f"  {name}: {detail}", ERR)
+        elif self.costs and len(self.skipped_runs()) == len(self.costs):
+            # Every run left out: the preconditions alone are no contract check.
+            self.say(
+                f"no run made: only the preconditions of Claude Code {version or 'unknown'} were"
+                " checked, which says nothing about the contract",
+                WARNING,
+                "WARN",
+                words=3,
+            )
         elif version and self.skipped_runs():
             # A partial run checks only part of the contract: not enough for a version to
             # be added to TESTED_VERSIONS.
@@ -1567,13 +1578,14 @@ def record_file(trace: Trace, name: str, path: Path, **extra: Any) -> None:
 
 def check_static(report: Report, cfg: Config) -> Optional[str]:
     """The preconditions, without a model call: the two binaries, the marketplace, the
-    hook script and the managed settings. Returns the Claude Code version, if one was
-    found."""
+    hook script and the book (unless the hook run is left out: only it uses them) and the
+    managed settings. Returns the Claude Code version, if one was found."""
     version = check_claude_version(report, cfg)
     plugin_version = check_plugin_binary(report, cfg)
     check_marketplace(report, cfg, plugin_version)
-    check_hook_script(report, cfg)
-    check_filler_text(report, cfg)
+    if "hook" not in cfg.skip:
+        check_hook_script(report, cfg)
+        check_filler_text(report, cfg)
     check_managed_settings(report, cfg)
     return version
 
@@ -1792,7 +1804,7 @@ def check_managed_settings(report: Report, cfg: Config) -> None:
             f"matchers {matchers}, commands {commands}",
             f"matcher auto runs {commands}",
         )
-    elif "auto" in matchers and not runnable:
+    elif "auto" in matchers and not runnable and "hook" not in cfg.skip:
         report.warn(
             "managed PreCompact hook",
             f"the managed hook runs {commands}, which do not exist here: the hook run is skipped",
@@ -3411,25 +3423,26 @@ def check_filler_turn(report: Report, lines: list[dict], meta: dict) -> Optional
 def check_compaction_attempted(
     report: Report, lines: list[dict], trace: Trace, meta: dict, context: int
 ) -> bool:
-    """CLAUDE_CODE_AUTO_COMPACT_WINDOW is honoured: with a small window and the
-    context past the threshold (the window minus the output reserve minus 13 000,
-    HOOK_THRESHOLD), Claude Code attempts an automatic compaction, seen as a `status`
-    `compacting`, a boundary, or the hook's marker. A miss is told apart by the context
-    size: above the assumed threshold it is Claude Code's threshold that moved, below it
-    the book is shorter than assumed for this model's tokenizer."""
+    """CLAUDE_CODE_AUTO_COMPACT_WINDOW is honoured: with a small window and the context past
+    the threshold (the window minus the output reserve minus 13 000, HOOK_MARGIN, taken off
+    the window the run recorded), Claude Code attempts an automatic compaction, seen as a
+    `status` `compacting`, a boundary, or the hook's marker. A miss is told apart by the
+    context size: above the assumed threshold it is Claude Code's threshold that moved,
+    below it the book is shorter than assumed for this model's tokenizer."""
     statuses = of_type(lines, "system", "status")
     boundaries = of_type(lines, "system", "compact_boundary")
     marker = trace_file(trace, "marker")
     fired = marker is not None and marker.get("exists") is True
     attempted = any(s.get("status") == "compacting" for s in statuses) or bool(boundaries) or fired
-    if context >= HOOK_THRESHOLD:
+    threshold = meta["window"] - HOOK_MARGIN
+    if context >= threshold:
         cause = (
-            f"the context is past the assumed threshold of {HOOK_THRESHOLD}, so Claude Code's"
+            f"the context is past the assumed threshold of {threshold}, so Claude Code's"
             " threshold moved or the window is not honoured"
         )
     else:
         cause = (
-            f"the context is below the assumed threshold of {HOOK_THRESHOLD}, so the filler"
+            f"the context is below the assumed threshold of {threshold}, so the filler"
             " text is too short for this model's tokenizer"
         )
     return report.check(
