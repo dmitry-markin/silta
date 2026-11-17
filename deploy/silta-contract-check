@@ -99,7 +99,7 @@ dev/python-format-requirements.txt and run by CI in a job of their own (python f
 to the replay's.
 
 A full run makes some fifteen short turns on the configured model and, for the hook, two
-turns on a cheap model over a context of about 106 000 tokens (`--hook-model`; `--skip hook`
+turns on a cheap model over a context of about 131 000 tokens (`--hook-model`; `--skip hook`
 leaves that run out); it takes several minutes and costs about a dollar. The report ends
 with the run's cost as Claude Code counted it, at list prices, which is notional on a
 subscription.
@@ -166,16 +166,17 @@ FALLBACK_OUTAGE = ["overloaded", "server_error"]
 # A small window for CLAUDE_CODE_AUTO_COMPACT_WINDOW in the hook run, so that a modest
 # context triggers the automatic compaction (Claude Code accepts 100 000 to 1 000 000).
 # It compacts at about the window minus a 20 000-token output reserve minus 13 000 (see
-# the unit's comment on the window), 87 000 here. The filler is a whole book, The Hound
-# of the Baskervilles by Arthur Conan Doyle (1902, public domain), about 92 000 tokens,
-# which with Claude Code's own prompt comes to some 106 000, between the threshold and
-# the window. The file is the bare text, so the model gets a real book to hold rather
-# than generated filler; the message that carries it says what it is.
-HOOK_WINDOW = 120_000
+# the unit's comment on the window), 117 000 here. The filler is a whole book, The Hound
+# of the Baskervilles by Arthur Conan Doyle (1902, public domain), which with Claude
+# Code's own prompt comes to some 131 000 tokens on the default hook model (Haiku 5.5;
+# Haiku 4.5's tokenizer made it 106 000), between the threshold and the window. The file
+# is the bare text, so the model gets a real book to hold rather than generated filler;
+# the message that carries it says what it is.
+HOOK_WINDOW = 150_000
 HOOK_THRESHOLD = HOOK_WINDOW - 20_000 - 13_000
 FILLER_FILE = "the-hound-of-the-baskervilles.txt"
 FILLER_TITLE = "The Hound of the Baskervilles by Arthur Conan Doyle"
-DEFAULT_HOOK_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_HOOK_MODEL = "claude-haiku-5-5"
 
 # The variables that decide how Claude Code authenticates (lib.rs `AUTH_VARS`): the
 # supervisor drops every one of them from the environment and sets exactly one way.
@@ -3355,9 +3356,10 @@ def check_hook(report: Report, trace: Trace, meta: dict) -> None:
 
 
 def check_filler_turn(report: Report, lines: list[dict], meta: dict) -> Optional[int]:
-    """A user line carrying the whole book, about 92 000 tokens, is accepted on stdin and
-    answered on the hook model, and the short second turn ends too. Returns the context size
-    the first answer reported, or None when the run cannot be judged."""
+    """A user line carrying the whole book, which brings the context to about 131 000 tokens,
+    is accepted on stdin and answered on the hook model, and the short second turn ends too.
+    Returns the context size the first answer reported, or None when the run cannot be
+    judged."""
     results = of_type(lines, "result")
     assistants = [line for line in of_type(lines, "assistant") if is_main(line)]
     if not report.check(
@@ -3384,7 +3386,7 @@ def check_filler_turn(report: Report, lines: list[dict], meta: dict) -> Optional
 def check_compaction_attempted(
     report: Report, lines: list[dict], trace: Trace, meta: dict, context: int
 ) -> bool:
-    """CLAUDE_CODE_AUTO_COMPACT_WINDOW is honoured: with the window at its minimum and the
+    """CLAUDE_CODE_AUTO_COMPACT_WINDOW is honoured: with a small window and the
     context past the threshold (the window minus the output reserve minus 13 000,
     HOOK_THRESHOLD), Claude Code attempts an automatic compaction, seen as a `status`
     `compacting`, a boundary, or the hook's marker. A miss is told apart by the context
@@ -3804,7 +3806,7 @@ def main() -> int:
         "--hook-model",
         default=DEFAULT_HOOK_MODEL,
         help=(
-            "the model of the hook run, which reads about 106 000 tokens twice (default:"
+            "the model of the hook run, which reads about 131 000 tokens twice (default:"
             f" {DEFAULT_HOOK_MODEL})"
         ),
     )
@@ -3823,7 +3825,7 @@ def main() -> int:
         "--skip",
         help=(
             "runs to skip, comma-separated: resume,hook,fallback,badkey (hook is the slow one: two"
-            " turns over a context of about 106 000 tokens on the hook model)"
+            " turns over a context of about 131 000 tokens on the hook model)"
         ),
     )
     parser.add_argument(
