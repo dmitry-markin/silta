@@ -75,10 +75,10 @@ Claude Code is installed under the `claude` user and never updates itself. To in
    sudo runuser -u claude -- bash -c \
        "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- <version>"
    ```
-   E.g., for 2.1.283:
+   E.g., for 2.1.325:
    ```bash
    sudo runuser -u claude -- bash -c \
-       "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- 2.1.283"
+       "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- 2.1.325"
    ```
    The installer prints the version it installed. Make sure it is the one you requested.
 3. Restart the sessions onto the new version at a quiet moment:

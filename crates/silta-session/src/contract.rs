@@ -11,7 +11,7 @@ use crate::stream::Event;
 /// (deploy/silta-contract-check does the checking); any other version gets a line at
 /// every `init` line, which Claude Code writes at every turn, until the list is
 /// extended. Once per turn is deliberate: the line stays visible in the journal.
-pub const TESTED_VERSIONS: &[&str] = &["2.1.281", "2.1.283"];
+pub const TESTED_VERSIONS: &[&str] = &["2.1.281", "2.1.283", "2.1.325"];
 
 /// The `model_fallback` triggers of the checked versions that mean the primary cannot
 /// serve this Claude Code at all (a model it does not find, no access, an error no retry

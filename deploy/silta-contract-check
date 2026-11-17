@@ -130,7 +130,7 @@ from typing import Any, Callable, Optional
 # The Claude Code versions the supervisor was checked against; the same list as
 # `TESTED_VERSIONS` in crates/silta-session/src/contract.rs, which a test there keeps in
 # step. A version outside it makes the supervisor print a `contract:` line at every turn.
-TESTED_VERSIONS = ["2.1.281", "2.1.283"]
+TESTED_VERSIONS = ["2.1.281", "2.1.283", "2.1.325"]
 
 # The channel as the supervisor names it on the command line (lib.rs `CHANNEL`), the
 # marketplace and plugin behind it (assistant/marketplace), the MCP server's name in the
