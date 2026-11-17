@@ -3902,9 +3902,8 @@ def main() -> int:
         "--skip",
         type=run_list,
         help=(
-            "runs to skip, comma-separated: main,resume,hook,fallback,badkey (hook is the slow"
-            " one: two turns over a context of about 131 000 tokens on the hook model; skipping"
-            " main skips resume too, which resumes its session)"
+            "runs to skip, comma-separated: main,resume,hook,fallback,badkey (skipping main"
+            " skips resume too, which resumes its session)"
         ),
     )
     runs.add_argument(
