@@ -100,8 +100,8 @@ to the replay's.
 
 A full run makes some fifteen short turns on the configured model and, for the hook, two
 turns on a cheap model over a context of about 131 000 tokens (`--hook-model`; `--skip hook`
-leaves that run out, `--skip main,resume` the main and resume runs); it takes several minutes
-and costs about a dollar. The report ends
+leaves that run out, `--skip main,resume` the main and resume runs, and `--only` names the
+runs to make instead); it takes several minutes and costs about a dollar. The report ends
 with the run's cost as Claude Code counted it, at list prices, which is notional on a
 subscription.
 """
@@ -434,7 +434,7 @@ class Report:
         return sum(1 for status, _, _ in self.checks if status == "FAIL")
 
     def skipped_runs(self) -> list[str]:
-        """The runs a live check left out (--skip, or a hook run without its hook), which
+        """The runs a live check left out (--skip, --only, or a hook run without its hook), which
         `live` notes with the cost None; a replay notes only the traces it found."""
         return [run for run, usd in self.costs.items() if usd is None]
 
@@ -821,7 +821,9 @@ class Config:
     passthrough: dict[str, str]
     hook_model: str
     turn_timeout: float
+    # The runs left out, from --skip or as the complement of --only, which also sets `only`.
     skip: set[str]
+    only: Optional[set[str]]
     # Added to every run of Claude Code, with {logs} and {run} filled in (--claude-arg).
     claude_args: list[str]
     # This script's version (checker_version) and, run from the repository, the same
@@ -1055,7 +1057,8 @@ def configure(args: argparse.Namespace, version: Optional[str]) -> Config:
         passthrough=passthrough,
         hook_model=args.hook_model,
         turn_timeout=args.turn_timeout,
-        skip=args.skip or set(),
+        skip=runs_left_out(args.skip, args.only),
+        only=args.only,
         claude_args=(
             args.claude_arg
             if args.claude_arg is not None
@@ -3680,9 +3683,9 @@ RUNS = {
 }
 
 
-def skip_list(value: str) -> set[str]:
-    """`--skip`: run names, comma-separated; an unknown one is an error rather than a run
-    that silently goes ahead."""
+def run_list(value: str) -> set[str]:
+    """`--skip` and `--only`: run names, comma-separated; an unknown one is an error rather
+    than a run that silently goes ahead or is left out."""
     runs = set(filter(None, (name.strip() for name in value.split(","))))
     unknown = sorted(runs - RUNS.keys())
     if unknown:
@@ -3690,6 +3693,23 @@ def skip_list(value: str) -> set[str]:
             f"unknown run {', '.join(unknown)}; the runs are {','.join(RUNS)}"
         )
     return runs
+
+
+def only_list(value: str) -> set[str]:
+    """`--only`: as `run_list`, and at least one run."""
+    runs = run_list(value)
+    if not runs:
+        raise argparse.ArgumentTypeError(f"no run named; the runs are {','.join(RUNS)}")
+    return runs
+
+
+def runs_left_out(skip: Optional[set[str]], only: Optional[set[str]]) -> set[str]:
+    """The runs `live` leaves out: those of --skip, or those --only does not name. With
+    --only, resume brings main along, whose session it resumes (`live` warns when main was
+    not named); with --skip, main takes resume out with it (`live` warns there too)."""
+    if only is None:
+        return skip or set()
+    return set(RUNS) - only - ({"main"} if "resume" in only else set())
 
 
 def replay(report: Report, directory: Path) -> Optional[str]:
@@ -3728,9 +3748,18 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             report.info("aborting", "the plugin is not installed; no run")
             return version
         report.info("logs", str(cfg.logs))
+        # Why a run is left out, as the line of its SKIP says.
+        flag = "--skip" if cfg.only is None else "--only"
         main_id = str(uuid.uuid4())
+        if cfg.only is not None and "resume" in cfg.only and "main" not in cfg.only:
+            # The resume run resumes the main run's session, so main runs first.
+            report.warn(
+                "--only",
+                "resume brings main along, whose session it resumes; pass --only main,resume"
+                " to say so",
+            )
         if "main" in cfg.skip:
-            report.skip("main", "--skip")
+            report.skip("main", flag)
             report.costs["main"] = None
         else:
             session_ids.append(main_id)
@@ -3740,7 +3769,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             note_cost(report, "main", trace)
             version = seen or version
         if "resume" in cfg.skip:
-            report.skip("resume", "--skip")
+            report.skip("resume", flag)
             report.costs["resume"] = None
         elif "main" in cfg.skip:
             # The resume run resumes the main run's session, so it cannot run without it.
@@ -3757,7 +3786,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             check_resume(report, trace, drive_resume(cfg, trace, main_id))
             note_cost(report, "resume", trace)
         if "hook" in cfg.skip or hook_skip:
-            report.skip("hook", hook_skip or "--skip")
+            report.skip("hook", flag if "hook" in cfg.skip else hook_skip)
             report.costs["hook"] = None
         else:
             sid = str(uuid.uuid4())
@@ -3767,7 +3796,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             check_hook(report, trace, drive_hook(cfg, trace, sid, managed_hook))
             note_cost(report, "hook", trace)
         if "fallback" in cfg.skip:
-            report.skip("fallback", "--skip")
+            report.skip("fallback", flag)
             report.costs["fallback"] = None
         else:
             sid = str(uuid.uuid4())
@@ -3777,7 +3806,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             check_fallback(report, trace, drive_fallback(cfg, trace, sid))
             note_cost(report, "fallback", trace)
         if "badkey" in cfg.skip:
-            report.skip("bad key", "--skip")
+            report.skip("bad key", flag)
             report.costs["badkey"] = None
         else:
             sid = str(uuid.uuid4())
@@ -3868,13 +3897,22 @@ def main() -> int:
         "--home", help="with --credentials: the HOME Claude Code runs with (default: $HOME)"
     )
     parser.add_argument("--logs", help="where the traces go (default: <state>/logs/<time>)")
-    parser.add_argument(
+    runs = parser.add_mutually_exclusive_group()
+    runs.add_argument(
         "--skip",
-        type=skip_list,
+        type=run_list,
         help=(
             "runs to skip, comma-separated: main,resume,hook,fallback,badkey (hook is the slow"
             " one: two turns over a context of about 131 000 tokens on the hook model; skipping"
             " main skips resume too, which resumes its session)"
+        ),
+    )
+    runs.add_argument(
+        "--only",
+        type=only_list,
+        help=(
+            "the only runs to make, comma-separated, from the names --skip takes; resume brings"
+            " main along, whose session it resumes"
         ),
     )
     parser.add_argument(
