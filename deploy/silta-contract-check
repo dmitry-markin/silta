@@ -103,7 +103,7 @@ turns on a cheap model over a context of about 131 000 tokens (`--hook-model`; `
 leaves that run out, `--skip main,resume` the main and resume runs, and `--only` names the
 runs to make instead); it takes several minutes and costs about a dollar. The report ends
 with the run's cost as Claude Code counted it, at list prices, which is notional on a
-subscription.
+subscription, and the time it took, for each run and in all.
 """
 
 from __future__ import annotations
@@ -364,12 +364,22 @@ def emit(
         print(line, file=out, flush=True)
 
 
+def duration(seconds: float) -> str:
+    """A time for the summary: `14s`, `1m41s`."""
+    minutes, secs = divmod(round(max(seconds, 0.0)), 60)
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
 @dataclass
 class Report:
     checks: list[tuple[str, str, str]] = field(default_factory=list)
     # What each run cost, in dollars as Claude Code counts it (list prices; notional on a
     # subscription); None for a run that was skipped.
     costs: dict[str, Optional[float]] = field(default_factory=dict)
+    # How long each run made took, in seconds (`note_run`), and when the check started,
+    # for the total of a live check, which takes in the preconditions and the set-up too.
+    times: dict[str, float] = field(default_factory=dict)
+    started: float = field(default_factory=time.monotonic)
     out: Any = sys.stdout
     # `--quiet`: PASS and INFO lines are counted but not printed.
     quiet: bool = False
@@ -440,7 +450,7 @@ class Report:
         `live` notes with the cost None; a replay notes only the traces it found."""
         return [run for run, usd in self.costs.items() if usd is None]
 
-    def summary(self, version: Optional[str]) -> None:
+    def summary(self, version: Optional[str], replayed: bool = False) -> None:
         counts = {s: 0 for s in ("PASS", "FAIL", "SKIP", "WARN")}
         for status, _, _ in self.checks:
             if status in counts:
@@ -460,6 +470,18 @@ class Report:
                 f"run cost: ${sum(usd or 0.0 for usd in self.costs.values()):.2f} ({parts})",
                 NOTICE,
             )
+            # A live check's total is its wall time, the rest of which is the set-up
+            # (preconditions, plugin install, clean-up); a replay's is what its runs took.
+            runs = sum(self.times.values())
+            total = runs if replayed else time.monotonic() - self.started
+            parts = ", ".join(
+                ([] if replayed else [f"set-up {duration(total - runs)}"])
+                + [
+                    f"{run} {duration(self.times[run]) if run in self.times else 'skipped'}"
+                    for run in self.costs
+                ]
+            )
+            self.say(f"run time: {duration(total)} ({parts})", NOTICE)
         if self.failed():
             self.say("contract broken:", ERR, "FAIL", words=2)
             for status, name, detail in self.checks:
@@ -610,11 +632,20 @@ def session_cost(trace: Trace) -> float:
     )
 
 
-def note_cost(report: Report, name: str, trace: Trace) -> None:
+def trace_duration(trace: Trace) -> float:
+    """How long the run took, in seconds: the `_t` of its last entry, which `Trace.add`
+    counts from the trace's start (each run has a trace of its own). It takes in Claude
+    Code's start and its exit after stdin closes, not only the turns."""
+    return max((line.get("_t", 0.0) for line in trace.lines), default=0.0)
+
+
+def note_run(report: Report, name: str, trace: Trace) -> None:
+    """A run made: its cost and its time, for the summary."""
     cost = session_cost(trace)
     if name == "resume":
         cost = max(cost - (report.costs.get("main") or 0.0), 0.0)
     report.costs[name] = cost
+    report.times[name] = trace_duration(trace)
 
 
 def stdout_lines(trace: Trace) -> list[dict]:
@@ -3736,7 +3767,7 @@ def replay(report: Report, directory: Path) -> Optional[str]:
         trace = Trace.load(path)
         meta = next((line for line in trace.lines if line["type"] == "_meta"), {})
         result = check(report, trace, meta)
-        note_cost(report, name, trace)
+        note_run(report, name, trace)
         if name == "main":
             version = result
     if not found:
@@ -3779,7 +3810,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             report.running("main", "a fresh session with the channel, some ten turns")
             trace = Trace(cfg.logs / "main.jsonl")
             seen = check_main(report, trace, drive_main(cfg, trace, main_id))
-            note_cost(report, "main", trace)
+            note_run(report, "main", trace)
             version = seen or version
         if "resume" in cfg.skip:
             report.skip("resume", flag)
@@ -3797,7 +3828,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             report.running("resume", "the main session resumed, then an unknown id")
             trace = Trace(cfg.logs / "resume.jsonl")
             check_resume(report, trace, drive_resume(cfg, trace, main_id))
-            note_cost(report, "resume", trace)
+            note_run(report, "resume", trace)
         if "hook" in cfg.skip or hook_skip:
             report.skip("hook", flag if "hook" in cfg.skip else hook_skip)
             report.costs["hook"] = None
@@ -3807,7 +3838,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             report.running("hook", "two turns over a whole book on the hook model")
             trace = Trace(cfg.logs / "hook.jsonl")
             check_hook(report, trace, drive_hook(cfg, trace, sid, managed_hook))
-            note_cost(report, "hook", trace)
+            note_run(report, "hook", trace)
         if "fallback" in cfg.skip:
             report.skip("fallback", flag)
             report.costs["fallback"] = None
@@ -3817,7 +3848,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             report.running("fallback", "a model Claude Code does not find")
             trace = Trace(cfg.logs / "fallback.jsonl")
             check_fallback(report, trace, drive_fallback(cfg, trace, sid))
-            note_cost(report, "fallback", trace)
+            note_run(report, "fallback", trace)
         if "badkey" in cfg.skip:
             report.skip("bad key", flag)
             report.costs["badkey"] = None
@@ -3827,7 +3858,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             report.running("badkey", "a credential the API refuses")
             trace = Trace(cfg.logs / "badkey.jsonl")
             check_badkey(report, trace, drive_badkey(cfg, trace, sid))
-            note_cost(report, "badkey", trace)
+            note_run(report, "badkey", trace)
     finally:
         install.cleanup()
         cleanup_traces(cfg, session_ids)
@@ -3969,7 +4000,7 @@ def main() -> int:
     report = Report(quiet=args.quiet)
     if args.replay:
         version = replay(report, Path(args.replay))
-        report.summary(version)
+        report.summary(version, replayed=True)
         return 1 if report.failed() else 0
     cfg = configure(args, checker)
     report.say(
