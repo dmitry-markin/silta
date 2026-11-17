@@ -19,7 +19,7 @@ body:
     id: claude-code-version
     attributes:
       label: Claude Code version
-      placeholder: "2.1.283"
+      placeholder: "2.1.325"
     validations:
       required: true
   - type: textarea
