@@ -100,7 +100,8 @@ to the replay's.
 
 A full run makes some fifteen short turns on the configured model and, for the hook, two
 turns on a cheap model over a context of about 131 000 tokens (`--hook-model`; `--skip hook`
-leaves that run out); it takes several minutes and costs about a dollar. The report ends
+leaves that run out, `--skip main,resume` the main and resume runs); it takes several minutes
+and costs about a dollar. The report ends
 with the run's cost as Claude Code counted it, at list prices, which is notional on a
 subscription.
 """
@@ -432,6 +433,11 @@ class Report:
     def failed(self) -> int:
         return sum(1 for status, _, _ in self.checks if status == "FAIL")
 
+    def skipped_runs(self) -> list[str]:
+        """The runs a live check left out (--skip, or a hook run without its hook), which
+        `live` notes with the cost None; a replay notes only the traces it found."""
+        return [run for run, usd in self.costs.items() if usd is None]
+
     def summary(self, version: Optional[str]) -> None:
         counts = {s: 0 for s in ("PASS", "FAIL", "SKIP", "WARN")}
         for status, _, _ in self.checks:
@@ -457,6 +463,22 @@ class Report:
             for status, name, detail in self.checks:
                 if status == "FAIL":
                     self.say(f"  {name}: {detail}", ERR)
+        elif version and self.skipped_runs():
+            # A partial run checks only part of the contract: not enough for a version to
+            # be added to TESTED_VERSIONS.
+            skipped = ", ".join(self.skipped_runs())
+            tested = (
+                f" ({version} is in TESTED_VERSIONS)"
+                if version in TESTED_VERSIONS
+                else ": a full run is needed before adding it to TESTED_VERSIONS"
+            )
+            self.say(
+                f"contract holds for Claude Code {version} in the runs made, without {skipped}"
+                + tested,
+                NOTICE,
+                "PASS",
+                words=2,
+            )
         elif version:
             if version in TESTED_VERSIONS:
                 self.say(
@@ -1033,7 +1055,7 @@ def configure(args: argparse.Namespace, version: Optional[str]) -> Config:
         passthrough=passthrough,
         hook_model=args.hook_model,
         turn_timeout=args.turn_timeout,
-        skip=set(filter(None, (args.skip or "").split(","))),
+        skip=args.skip or set(),
         claude_args=(
             args.claude_arg
             if args.claude_arg is not None
@@ -3658,6 +3680,18 @@ RUNS = {
 }
 
 
+def skip_list(value: str) -> set[str]:
+    """`--skip`: run names, comma-separated; an unknown one is an error rather than a run
+    that silently goes ahead."""
+    runs = set(filter(None, (name.strip() for name in value.split(","))))
+    unknown = sorted(runs - RUNS.keys())
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown run {', '.join(unknown)}; the runs are {','.join(RUNS)}"
+        )
+    return runs
+
+
 def replay(report: Report, directory: Path) -> Optional[str]:
     version = None
     found = False
@@ -3693,16 +3727,29 @@ def live(report: Report, cfg: Config) -> Optional[str]:
         if not install.install():
             report.info("aborting", "the plugin is not installed; no run")
             return version
-        main_id = str(uuid.uuid4())
-        session_ids.append(main_id)
         report.info("logs", str(cfg.logs))
-        report.running("main", "a fresh session with the channel, some ten turns")
-        trace = Trace(cfg.logs / "main.jsonl")
-        seen = check_main(report, trace, drive_main(cfg, trace, main_id))
-        note_cost(report, "main", trace)
-        version = seen or version
+        main_id = str(uuid.uuid4())
+        if "main" in cfg.skip:
+            report.skip("main", "--skip")
+            report.costs["main"] = None
+        else:
+            session_ids.append(main_id)
+            report.running("main", "a fresh session with the channel, some ten turns")
+            trace = Trace(cfg.logs / "main.jsonl")
+            seen = check_main(report, trace, drive_main(cfg, trace, main_id))
+            note_cost(report, "main", trace)
+            version = seen or version
         if "resume" in cfg.skip:
             report.skip("resume", "--skip")
+            report.costs["resume"] = None
+        elif "main" in cfg.skip:
+            # The resume run resumes the main run's session, so it cannot run without it.
+            report.warn(
+                "--skip",
+                "main leaves out resume too, which resumes the main session; pass --skip"
+                " main,resume to say so",
+            )
+            report.skip("resume", "--skip main")
             report.costs["resume"] = None
         else:
             report.running("resume", "the main session resumed, then an unknown id")
@@ -3823,9 +3870,11 @@ def main() -> int:
     parser.add_argument("--logs", help="where the traces go (default: <state>/logs/<time>)")
     parser.add_argument(
         "--skip",
+        type=skip_list,
         help=(
-            "runs to skip, comma-separated: resume,hook,fallback,badkey (hook is the slow one: two"
-            " turns over a context of about 131 000 tokens on the hook model)"
+            "runs to skip, comma-separated: main,resume,hook,fallback,badkey (hook is the slow"
+            " one: two turns over a context of about 131 000 tokens on the hook model; skipping"
+            " main skips resume too, which resumes its session)"
         ),
     )
     parser.add_argument(
