@@ -95,14 +95,15 @@ function's name, so a failure leads straight to its code.
 
 The script is formatted with black at 100 columns and checked with pycodestyle (E203 and
 W503 ignored, as black's style needs), both pinned by hash in
-dev/contract-check-format-requirements.txt and run by CI in a job of their own, next to the
-replay's.
+dev/python-format-requirements.txt and run by CI in a job of their own (python format), next
+to the replay's.
 
 A full run makes some fifteen short turns on the configured model and, for the hook, two
-turns on a cheap model over a context of about 106 000 tokens (`--hook-model`; `--skip hook`
-leaves that run out); it takes several minutes and costs about a dollar. The report ends
+turns on a cheap model over a context of about 131 000 tokens (`--hook-model`; `--skip hook`
+leaves that run out, `--skip main,resume` the main and resume runs, and `--only` names the
+runs to make instead); it takes several minutes and costs about a dollar. The report ends
 with the run's cost as Claude Code counted it, at list prices, which is notional on a
-subscription.
+subscription, and the time it took, for each run and in all.
 """
 
 from __future__ import annotations
@@ -130,7 +131,7 @@ from typing import Any, Callable, Optional
 # The Claude Code versions the supervisor was checked against; the same list as
 # `TESTED_VERSIONS` in crates/silta-session/src/contract.rs, which a test there keeps in
 # step. A version outside it makes the supervisor print a `contract:` line at every turn.
-TESTED_VERSIONS = ["2.1.281", "2.1.283"]
+TESTED_VERSIONS = ["2.1.281", "2.1.283", "2.1.325"]
 
 # The channel as the supervisor names it on the command line (lib.rs `CHANNEL`), the
 # marketplace and plugin behind it (assistant/marketplace), the MCP server's name in the
@@ -166,16 +167,19 @@ FALLBACK_OUTAGE = ["overloaded", "server_error"]
 # A small window for CLAUDE_CODE_AUTO_COMPACT_WINDOW in the hook run, so that a modest
 # context triggers the automatic compaction (Claude Code accepts 100 000 to 1 000 000).
 # It compacts at about the window minus a 20 000-token output reserve minus 13 000 (see
-# the unit's comment on the window), 87 000 here. The filler is a whole book, The Hound
-# of the Baskervilles by Arthur Conan Doyle (1902, public domain), about 92 000 tokens,
-# which with Claude Code's own prompt comes to some 106 000, between the threshold and
-# the window. The file is the bare text, so the model gets a real book to hold rather
-# than generated filler; the message that carries it says what it is.
-HOOK_WINDOW = 120_000
-HOOK_THRESHOLD = HOOK_WINDOW - 20_000 - 13_000
+# the unit's comment on the window), 117 000 here. The filler is a whole book, The Hound
+# of the Baskervilles by Arthur Conan Doyle (1902, public domain), which with Claude
+# Code's own prompt comes to some 131 000 tokens on the default hook model (Haiku 5.5;
+# Haiku 4.5's tokenizer made it 106 000), between the threshold and the window. The file
+# is the bare text, so the model gets a real book to hold rather than generated filler;
+# the message that carries it says what it is.
+HOOK_WINDOW = 150_000
+# What Claude Code takes off the window to get the threshold. check_compaction_attempted
+# takes it off the window the run recorded, which may differ in an older trace.
+HOOK_MARGIN = 20_000 + 13_000
 FILLER_FILE = "the-hound-of-the-baskervilles.txt"
 FILLER_TITLE = "The Hound of the Baskervilles by Arthur Conan Doyle"
-DEFAULT_HOOK_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_HOOK_MODEL = "claude-haiku-5-5"
 
 # The variables that decide how Claude Code authenticates (lib.rs `AUTH_VARS`): the
 # supervisor drops every one of them from the environment and sets exactly one way.
@@ -360,12 +364,22 @@ def emit(
         print(line, file=out, flush=True)
 
 
+def duration(seconds: float) -> str:
+    """A time for the summary: `14s`, `1m41s`."""
+    minutes, secs = divmod(round(max(seconds, 0.0)), 60)
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
 @dataclass
 class Report:
     checks: list[tuple[str, str, str]] = field(default_factory=list)
     # What each run cost, in dollars as Claude Code counts it (list prices; notional on a
     # subscription); None for a run that was skipped.
     costs: dict[str, Optional[float]] = field(default_factory=dict)
+    # How long each run made took, in seconds (`note_run`), and when the check started,
+    # for the total of a live check, which takes in the preconditions and the set-up too.
+    times: dict[str, float] = field(default_factory=dict)
+    started: float = field(default_factory=time.monotonic)
     out: Any = sys.stdout
     # `--quiet`: PASS and INFO lines are counted but not printed.
     quiet: bool = False
@@ -431,7 +445,12 @@ class Report:
     def failed(self) -> int:
         return sum(1 for status, _, _ in self.checks if status == "FAIL")
 
-    def summary(self, version: Optional[str]) -> None:
+    def skipped_runs(self) -> list[str]:
+        """The runs a live check left out (--skip, --only, or a hook run without its hook), which
+        `live` notes with the cost None; a replay notes only the traces it found."""
+        return [run for run, usd in self.costs.items() if usd is None]
+
+    def summary(self, version: Optional[str], replayed: bool = False) -> None:
         counts = {s: 0 for s in ("PASS", "FAIL", "SKIP", "WARN")}
         for status, _, _ in self.checks:
             if status in counts:
@@ -451,11 +470,48 @@ class Report:
                 f"run cost: ${sum(usd or 0.0 for usd in self.costs.values()):.2f} ({parts})",
                 NOTICE,
             )
+            # A live check's total is its wall time, the rest of which is the set-up
+            # (preconditions, plugin install, clean-up); a replay's is what its runs took.
+            runs = sum(self.times.values())
+            total = runs if replayed else time.monotonic() - self.started
+            parts = ", ".join(
+                ([] if replayed else [f"set-up {duration(total - runs)}"])
+                + [
+                    f"{run} {duration(self.times[run]) if run in self.times else 'skipped'}"
+                    for run in self.costs
+                ]
+            )
+            self.say(f"run time: {duration(total)} ({parts})", NOTICE)
         if self.failed():
             self.say("contract broken:", ERR, "FAIL", words=2)
             for status, name, detail in self.checks:
                 if status == "FAIL":
                     self.say(f"  {name}: {detail}", ERR)
+        elif self.costs and len(self.skipped_runs()) == len(self.costs):
+            # Every run left out: the preconditions alone are no contract check.
+            self.say(
+                f"no run made: only the preconditions of Claude Code {version or 'unknown'} were"
+                " checked, which says nothing about the contract",
+                WARNING,
+                "WARN",
+                words=3,
+            )
+        elif version and self.skipped_runs():
+            # A partial run checks only part of the contract: not enough for a version to
+            # be added to TESTED_VERSIONS.
+            skipped = ", ".join(self.skipped_runs())
+            tested = (
+                f" ({version} is in TESTED_VERSIONS)"
+                if version in TESTED_VERSIONS
+                else ": a full run is needed before adding it to TESTED_VERSIONS"
+            )
+            self.say(
+                f"contract holds for Claude Code {version} in the runs made, without {skipped}"
+                + tested,
+                NOTICE,
+                "PASS",
+                words=2,
+            )
         elif version:
             if version in TESTED_VERSIONS:
                 self.say(
@@ -576,11 +632,20 @@ def session_cost(trace: Trace) -> float:
     )
 
 
-def note_cost(report: Report, name: str, trace: Trace) -> None:
+def trace_duration(trace: Trace) -> float:
+    """How long the run took, in seconds: the `_t` of its last entry, which `Trace.add`
+    counts from the trace's start (each run has a trace of its own). It takes in Claude
+    Code's start and its exit after stdin closes, not only the turns."""
+    return max((line.get("_t", 0.0) for line in trace.lines), default=0.0)
+
+
+def note_run(report: Report, name: str, trace: Trace) -> None:
+    """A run made: its cost and its time, for the summary."""
     cost = session_cost(trace)
     if name == "resume":
         cost = max(cost - (report.costs.get("main") or 0.0), 0.0)
     report.costs[name] = cost
+    report.times[name] = trace_duration(trace)
 
 
 def stdout_lines(trace: Trace) -> list[dict]:
@@ -798,7 +863,9 @@ class Config:
     passthrough: dict[str, str]
     hook_model: str
     turn_timeout: float
+    # The runs left out, from --skip or as the complement of --only, which also sets `only`.
     skip: set[str]
+    only: Optional[set[str]]
     # Added to every run of Claude Code, with {logs} and {run} filled in (--claude-arg).
     claude_args: list[str]
     # This script's version (checker_version) and, run from the repository, the same
@@ -1032,7 +1099,8 @@ def configure(args: argparse.Namespace, version: Optional[str]) -> Config:
         passthrough=passthrough,
         hook_model=args.hook_model,
         turn_timeout=args.turn_timeout,
-        skip=set(filter(None, (args.skip or "").split(","))),
+        skip=runs_left_out(args.skip, args.only),
+        only=args.only,
         claude_args=(
             args.claude_arg
             if args.claude_arg is not None
@@ -1541,13 +1609,14 @@ def record_file(trace: Trace, name: str, path: Path, **extra: Any) -> None:
 
 def check_static(report: Report, cfg: Config) -> Optional[str]:
     """The preconditions, without a model call: the two binaries, the marketplace, the
-    hook script and the managed settings. Returns the Claude Code version, if one was
-    found."""
+    hook script and the book (unless the hook run is left out: only it uses them) and the
+    managed settings. Returns the Claude Code version, if one was found."""
     version = check_claude_version(report, cfg)
     plugin_version = check_plugin_binary(report, cfg)
     check_marketplace(report, cfg, plugin_version)
-    check_hook_script(report, cfg)
-    check_filler_text(report, cfg)
+    if "hook" not in cfg.skip:
+        check_hook_script(report, cfg)
+        check_filler_text(report, cfg)
     check_managed_settings(report, cfg)
     return version
 
@@ -1766,7 +1835,7 @@ def check_managed_settings(report: Report, cfg: Config) -> None:
             f"matchers {matchers}, commands {commands}",
             f"matcher auto runs {commands}",
         )
-    elif "auto" in matchers and not runnable:
+    elif "auto" in matchers and not runnable and "hook" not in cfg.skip:
         report.warn(
             "managed PreCompact hook",
             f"the managed hook runs {commands}, which do not exist here: the hook run is skipped",
@@ -3355,9 +3424,10 @@ def check_hook(report: Report, trace: Trace, meta: dict) -> None:
 
 
 def check_filler_turn(report: Report, lines: list[dict], meta: dict) -> Optional[int]:
-    """A user line carrying the whole book, about 92 000 tokens, is accepted on stdin and
-    answered on the hook model, and the short second turn ends too. Returns the context size
-    the first answer reported, or None when the run cannot be judged."""
+    """A user line carrying the whole book, which brings the context to about 131 000 tokens,
+    is accepted on stdin and answered on the hook model, and the short second turn ends too.
+    Returns the context size the first answer reported, or None when the run cannot be
+    judged."""
     results = of_type(lines, "result")
     assistants = [line for line in of_type(lines, "assistant") if is_main(line)]
     if not report.check(
@@ -3384,25 +3454,26 @@ def check_filler_turn(report: Report, lines: list[dict], meta: dict) -> Optional
 def check_compaction_attempted(
     report: Report, lines: list[dict], trace: Trace, meta: dict, context: int
 ) -> bool:
-    """CLAUDE_CODE_AUTO_COMPACT_WINDOW is honoured: with the window at its minimum and the
-    context past the threshold (the window minus the output reserve minus 13 000,
-    HOOK_THRESHOLD), Claude Code attempts an automatic compaction, seen as a `status`
-    `compacting`, a boundary, or the hook's marker. A miss is told apart by the context
-    size: above the assumed threshold it is Claude Code's threshold that moved, below it
-    the book is shorter than assumed for this model's tokenizer."""
+    """CLAUDE_CODE_AUTO_COMPACT_WINDOW is honoured: with a small window and the context past
+    the threshold (the window minus the output reserve minus 13 000, HOOK_MARGIN, taken off
+    the window the run recorded), Claude Code attempts an automatic compaction, seen as a
+    `status` `compacting`, a boundary, or the hook's marker. A miss is told apart by the
+    context size: above the assumed threshold it is Claude Code's threshold that moved,
+    below it the book is shorter than assumed for this model's tokenizer."""
     statuses = of_type(lines, "system", "status")
     boundaries = of_type(lines, "system", "compact_boundary")
     marker = trace_file(trace, "marker")
     fired = marker is not None and marker.get("exists") is True
     attempted = any(s.get("status") == "compacting" for s in statuses) or bool(boundaries) or fired
-    if context >= HOOK_THRESHOLD:
+    threshold = meta["window"] - HOOK_MARGIN
+    if context >= threshold:
         cause = (
-            f"the context is past the assumed threshold of {HOOK_THRESHOLD}, so Claude Code's"
+            f"the context is past the assumed threshold of {threshold}, so Claude Code's"
             " threshold moved or the window is not honoured"
         )
     else:
         cause = (
-            f"the context is below the assumed threshold of {HOOK_THRESHOLD}, so the filler"
+            f"the context is below the assumed threshold of {threshold}, so the filler"
             " text is too short for this model's tokenizer"
         )
     return report.check(
@@ -3449,8 +3520,9 @@ def check_marker(report: Report, trace: Trace, meta: dict) -> None:
     """The hook ran with the unit's environment (SILTA_SESSION, SILTA_ROTATE,
     STATE_DIRECTORY) and wrote `rotate-requested` in the state directory
     (deploy/silta-precompact-block): its stdin, a JSON object with `session_id`,
-    `transcript_path` and `trigger` `auto`. The supervisor's rotation starts from that
-    marker (rotation.rs, state.rs `Paths::marker`)."""
+    `transcript_path` and `trigger` `auto`, and no `agent_id`, which Claude Code sets only
+    for a subagent's compaction (the hook lets those proceed without a marker). The
+    supervisor's rotation starts from that marker (rotation.rs, state.rs `Paths::marker`)."""
     marker = trace_file(trace, "marker")
     fired = marker is not None and marker.get("exists") is True
     if not report.check(
@@ -3479,6 +3551,15 @@ def check_marker(report: Report, trace: Trace, meta: dict) -> None:
             else ""
         ),
     )
+    if isinstance(content, dict):
+        report.check(
+            "hook: main thread",
+            "agent_id" not in content,
+            f"the main thread's compaction came with agent_id {content.get('agent_id')!r}: the"
+            " hook takes agent_id for a subagent's compaction and lets it proceed, so the main"
+            " session would never rotate",
+            "no agent_id",
+        )
 
 
 # --------------------------------------------------------------------------------------------------
@@ -3646,6 +3727,35 @@ RUNS = {
 }
 
 
+def run_list(value: str) -> set[str]:
+    """`--skip` and `--only`: run names, comma-separated; an unknown one is an error rather
+    than a run that silently goes ahead or is left out."""
+    runs = set(filter(None, (name.strip() for name in value.split(","))))
+    unknown = sorted(runs - RUNS.keys())
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown run {', '.join(unknown)}; the runs are {','.join(RUNS)}"
+        )
+    return runs
+
+
+def only_list(value: str) -> set[str]:
+    """`--only`: as `run_list`, and at least one run."""
+    runs = run_list(value)
+    if not runs:
+        raise argparse.ArgumentTypeError(f"no run named; the runs are {','.join(RUNS)}")
+    return runs
+
+
+def runs_left_out(skip: Optional[set[str]], only: Optional[set[str]]) -> set[str]:
+    """The runs `live` leaves out: those of --skip, or those --only does not name. With
+    --only, resume brings main along, whose session it resumes (`live` warns when main was
+    not named); with --skip, main takes resume out with it (`live` warns there too)."""
+    if only is None:
+        return skip or set()
+    return set(RUNS) - only - ({"main"} if "resume" in only else set())
+
+
 def replay(report: Report, directory: Path) -> Optional[str]:
     version = None
     found = False
@@ -3657,7 +3767,7 @@ def replay(report: Report, directory: Path) -> Optional[str]:
         trace = Trace.load(path)
         meta = next((line for line in trace.lines if line["type"] == "_meta"), {})
         result = check(report, trace, meta)
-        note_cost(report, name, trace)
+        note_run(report, name, trace)
         if name == "main":
             version = result
     if not found:
@@ -3681,24 +3791,46 @@ def live(report: Report, cfg: Config) -> Optional[str]:
         if not install.install():
             report.info("aborting", "the plugin is not installed; no run")
             return version
-        main_id = str(uuid.uuid4())
-        session_ids.append(main_id)
         report.info("logs", str(cfg.logs))
-        report.running("main", "a fresh session with the channel, some ten turns")
-        trace = Trace(cfg.logs / "main.jsonl")
-        seen = check_main(report, trace, drive_main(cfg, trace, main_id))
-        note_cost(report, "main", trace)
-        version = seen or version
+        # Why a run is left out, as the line of its SKIP says.
+        flag = "--skip" if cfg.only is None else "--only"
+        main_id = str(uuid.uuid4())
+        if cfg.only is not None and "resume" in cfg.only and "main" not in cfg.only:
+            # The resume run resumes the main run's session, so main runs first.
+            report.warn(
+                "--only",
+                "resume brings main along, whose session it resumes; pass --only main,resume"
+                " to say so",
+            )
+        if "main" in cfg.skip:
+            report.skip("main", flag)
+            report.costs["main"] = None
+        else:
+            session_ids.append(main_id)
+            report.running("main", "a fresh session with the channel, some ten turns")
+            trace = Trace(cfg.logs / "main.jsonl")
+            seen = check_main(report, trace, drive_main(cfg, trace, main_id))
+            note_run(report, "main", trace)
+            version = seen or version
         if "resume" in cfg.skip:
-            report.skip("resume", "--skip")
+            report.skip("resume", flag)
+            report.costs["resume"] = None
+        elif "main" in cfg.skip:
+            # The resume run resumes the main run's session, so it cannot run without it.
+            report.warn(
+                "--skip",
+                "main leaves out resume too, which resumes the main session; pass --skip"
+                " main,resume to say so",
+            )
+            report.skip("resume", "--skip main")
             report.costs["resume"] = None
         else:
             report.running("resume", "the main session resumed, then an unknown id")
             trace = Trace(cfg.logs / "resume.jsonl")
             check_resume(report, trace, drive_resume(cfg, trace, main_id))
-            note_cost(report, "resume", trace)
+            note_run(report, "resume", trace)
         if "hook" in cfg.skip or hook_skip:
-            report.skip("hook", hook_skip or "--skip")
+            report.skip("hook", flag if "hook" in cfg.skip else hook_skip)
             report.costs["hook"] = None
         else:
             sid = str(uuid.uuid4())
@@ -3706,9 +3838,9 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             report.running("hook", "two turns over a whole book on the hook model")
             trace = Trace(cfg.logs / "hook.jsonl")
             check_hook(report, trace, drive_hook(cfg, trace, sid, managed_hook))
-            note_cost(report, "hook", trace)
+            note_run(report, "hook", trace)
         if "fallback" in cfg.skip:
-            report.skip("fallback", "--skip")
+            report.skip("fallback", flag)
             report.costs["fallback"] = None
         else:
             sid = str(uuid.uuid4())
@@ -3716,9 +3848,9 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             report.running("fallback", "a model Claude Code does not find")
             trace = Trace(cfg.logs / "fallback.jsonl")
             check_fallback(report, trace, drive_fallback(cfg, trace, sid))
-            note_cost(report, "fallback", trace)
+            note_run(report, "fallback", trace)
         if "badkey" in cfg.skip:
-            report.skip("bad key", "--skip")
+            report.skip("bad key", flag)
             report.costs["badkey"] = None
         else:
             sid = str(uuid.uuid4())
@@ -3726,7 +3858,7 @@ def live(report: Report, cfg: Config) -> Optional[str]:
             report.running("badkey", "a credential the API refuses")
             trace = Trace(cfg.logs / "badkey.jsonl")
             check_badkey(report, trace, drive_badkey(cfg, trace, sid))
-            note_cost(report, "badkey", trace)
+            note_run(report, "badkey", trace)
     finally:
         install.cleanup()
         cleanup_traces(cfg, session_ids)
@@ -3794,7 +3926,7 @@ def main() -> int:
         "--hook-model",
         default=DEFAULT_HOOK_MODEL,
         help=(
-            "the model of the hook run, which reads about 106 000 tokens twice (default:"
+            "the model of the hook run, which reads about 131 000 tokens twice (default:"
             f" {DEFAULT_HOOK_MODEL})"
         ),
     )
@@ -3809,11 +3941,21 @@ def main() -> int:
         "--home", help="with --credentials: the HOME Claude Code runs with (default: $HOME)"
     )
     parser.add_argument("--logs", help="where the traces go (default: <state>/logs/<time>)")
-    parser.add_argument(
+    runs = parser.add_mutually_exclusive_group()
+    runs.add_argument(
         "--skip",
+        type=run_list,
         help=(
-            "runs to skip, comma-separated: resume,hook,fallback,badkey (hook is the slow one: two"
-            " turns over a context of about 106 000 tokens on the hook model)"
+            "runs to skip, comma-separated: main,resume,hook,fallback,badkey (skipping main"
+            " skips resume too, which resumes its session)"
+        ),
+    )
+    runs.add_argument(
+        "--only",
+        type=only_list,
+        help=(
+            "the only runs to make, comma-separated, from the names --skip takes; resume brings"
+            " main along, whose session it resumes"
         ),
     )
     parser.add_argument(
@@ -3858,7 +4000,7 @@ def main() -> int:
     report = Report(quiet=args.quiet)
     if args.replay:
         version = replay(report, Path(args.replay))
-        report.summary(version)
+        report.summary(version, replayed=True)
         return 1 if report.failed() else 0
     cfg = configure(args, checker)
     report.say(

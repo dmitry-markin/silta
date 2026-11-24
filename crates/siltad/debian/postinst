@@ -27,8 +27,8 @@ case "$1" in
         cat <<'NOTE'
 Silta: next steps
   1. Install Claude Code once, as the claude user:
-       sudo runuser -u claude -- bash -c "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- 2.1.283"
-       (replace 2.1.283 with the tested version named in the Silta release notes).
+       sudo runuser -u claude -- bash -c "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- 2.1.325"
+       (replace 2.1.325 with the tested version named in the Silta release notes).
   2. Install the packages for the md2pdf and research skills (PDF generation), otherwise they
      fail at use:
        sudo apt install pandoc fonts-dejavu fonts-noto-core fonts-noto-color-emoji

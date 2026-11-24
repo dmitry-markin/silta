@@ -75,10 +75,10 @@ Claude Code is installed under the `claude` user and never updates itself. To in
    sudo runuser -u claude -- bash -c \
        "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- <version>"
    ```
-   E.g., for 2.1.283:
+   E.g., for 2.1.325:
    ```bash
    sudo runuser -u claude -- bash -c \
-       "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- 2.1.283"
+       "curl --proto '=https' --tlsv1.3 -fsSL https://claude.ai/install.sh | bash -s -- 2.1.325"
    ```
    The installer prints the version it installed. Make sure it is the one you requested.
 3. Restart the sessions onto the new version at a quiet moment:
@@ -161,6 +161,17 @@ If clients mark the assistant's messages "Encrypted by a device not verified by 
 3. Start the daemon with `sudo systemctl start siltad`.
 
 The account's other sessions, such as the Element one it was registered with, become unverified, so it is advised to end such sessions first. The users will also see the warning that the assistant's identity was reset.
+
+### Applying an edited persona to a running session
+
+Claude Code keeps the system prompt, persona included, from a conversation's first request until it is compacted, so an edited `/etc/silta/persona.md` reaches a session only at its next rotation. To apply it at once to session `<name>` (from `siltad.toml`):
+
+1. Add a drop-in with `sudo systemctl edit silta-session@<name>`, then `sudo systemctl restart silta-session@<name>`:
+   ```
+   [Service]
+   Environment=SILTA_PROMPT_SNAPSHOT=0
+   ```
+2. After the next rotation, remove it with `sudo systemctl revert silta-session@<name>` (or `edit`, if the drop-in holds other overrides) and restart. Removing it earlier brings the old persona back.
 
 ### Recovering a session if the request was flagged
 

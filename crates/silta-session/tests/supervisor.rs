@@ -32,6 +32,7 @@ impl Fixture {
             session: "test".into(),
             state: self.home.clone(),
             persona: tests.join("fake-claude.sh"),
+            prompt_snapshot: None,
             claude_bin: tests.join("fake-claude.sh"),
             plugin_bin: PathBuf::from("/nonexistent/silta-claude"),
             socket: PathBuf::from("/nonexistent/sock"),
@@ -205,6 +206,49 @@ async fn fresh_start_resume_and_graceful_stop() {
         !fx.home.join("session-id").exists(),
         "a refused resume drops the id"
     );
+    fs::remove_dir_all(&fx.home).unwrap();
+}
+
+/// The persona goes to every start, fresh or resumed, and `--system-prompt-snapshot`
+/// only when the unit sets `SILTA_PROMPT_SNAPSHOT`.
+#[tokio::test]
+async fn persona_and_prompt_snapshot_reach_claude() {
+    let fx = Fixture::new("persona");
+    let mut cfg = fx.config();
+    let persona = format!("--append-system-prompt-file {} ", cfg.persona.display());
+    let args = |log: &str| -> Vec<String> {
+        log.lines()
+            .filter_map(|l| l.strip_prefix("args "))
+            .map(|l| format!("{l} "))
+            .collect()
+    };
+
+    for (snapshot, starts_so_far) in [(None, 1), (Some(false), 2), (Some(true), 3)] {
+        cfg.prompt_snapshot = snapshot;
+        let stop = CancellationToken::new();
+        let run = tokio::spawn({
+            let cfg = cfg.clone();
+            let stop = stop.clone();
+            async move { silta_session::run(&cfg, stop).await }
+        });
+        let log = fx
+            .until(10, |l| {
+                l.matches("ready after answer").count() == starts_so_far
+            })
+            .await;
+        stop.cancel();
+        assert_eq!(run.await.unwrap(), 0);
+        let args = args(&log);
+        let last = args.last().unwrap();
+        assert!(last.contains(&persona), "{last}");
+        match snapshot {
+            None => assert!(!last.contains("--system-prompt-snapshot"), "{last}"),
+            Some(false) => assert!(last.contains("--system-prompt-snapshot off "), "{last}"),
+            Some(true) => assert!(last.contains("--system-prompt-snapshot on "), "{last}"),
+        }
+        // The first start is a fresh session, the later ones resume it.
+        assert_eq!(last.contains("--resume "), starts_so_far > 1, "{last}");
+    }
     fs::remove_dir_all(&fx.home).unwrap();
 }
 

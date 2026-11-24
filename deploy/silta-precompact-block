@@ -1,26 +1,74 @@
-#!/bin/sh
-# The PreCompact hook (matcher "auto") of every mind, declared in
-# /etc/claude-code/managed-settings.json: blocks Claude Code's automatic compaction and
-# asks the supervisor for a rotation instead. Runs as a child of claude, outside the Bash
-# sandbox, with the unit's environment. stdin is a JSON object with session_id,
-# transcript_path and trigger. Exit 2 blocks the compaction, and the line on stderr lands
-# in the session's context. Outside a mind (no SILTA_SESSION) the compaction is allowed,
-# as it is when the marker cannot be written or when rotation is switched off for the
-# mind (SILTA_ROTATE=0 in its unit, inherited from the supervisor).
+#!/usr/bin/python3 -I
+"""The PreCompact hook (matcher "auto") of every mind, declared in
+/etc/claude-code/managed-settings.json: blocks Claude Code's automatic compaction of the main
+session and asks the supervisor for a rotation instead.
 
-set -u
+Runs as a child of claude with the unit's environment (hence -I). stdin is a JSON object with
+session_id, transcript_path and trigger, plus agent_id when the compaction is a subagent's.
+Exit 2 blocks the compaction, the stderr line landing in the session's context; any other exit
+lets it proceed.
 
-[ -n "${SILTA_SESSION:-}" ] || exit 0
+It blocks only once the marker is written, so that a rotation follows. The compaction proceeds
+outside a mind (no SILTA_SESSION), with rotation off (SILTA_ROTATE=0), when the marker cannot
+be written, on any unexpected error, and for a subagent: it compacts its own context, not the
+main session's. Claude Code sets agent_id only in a subagent, never on the main thread (not
+even with --agent, whose main thread has an agent_type). Input that is not a JSON object
+counts as the main session's.
+"""
 
-case "$(printf '%s' "${SILTA_ROTATE:-1}" | tr '[:upper:]' '[:lower:]')" in
-    0|false|no|off) exit 0 ;;
-esac
+import json
+import os
+import sys
 
-state="${STATE_DIRECTORY:-$HOME}"
-input=$(cat)
 
-printf '%s\n' "$input" > "$state/rotate-requested.tmp" && mv "$state/rotate-requested.tmp" "$state/rotate-requested" || exit 0
+def is_subagent(data: bytes) -> bool:
+    try:
+        hook_input = json.loads(data)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(hook_input, dict) and hook_input.get("agent_id") is not None
 
-echo "silta: automatic compaction blocked; the host rotates the session at the next quiet moment and asks for a handoff first" >&2
 
-exit 2
+def write_marker(state: str, content: bytes) -> bool:
+    """Atomically, through a temporary file of its own: the supervisor writes the marker
+    through `rotate-requested.tmp`."""
+    path = os.path.join(state, "rotate-requested")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(content)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def main() -> int:
+    if not os.environ.get("SILTA_SESSION"):
+        return 0
+    # Parsed as the supervisor parses it (parse_switch).
+    if os.environ.get("SILTA_ROTATE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return 0
+
+    data = sys.stdin.buffer.read()
+    if is_subagent(data):
+        return 0
+
+    state = os.environ.get("STATE_DIRECTORY") or os.environ.get("HOME")
+    if not state or not write_marker(state, data.rstrip(b"\n") + b"\n"):
+        return 0
+
+    print(
+        "silta: automatic compaction blocked; the host rotates the session at the next quiet"
+        " moment and asks for a handoff first",
+        file=sys.stderr,
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

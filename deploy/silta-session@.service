@@ -24,6 +24,13 @@ Environment=HOME=/var/lib/silta/%i
 Environment=SILTA_SESSION=%i
 Environment=SILTA_SOCKET=/run/siltad/siltad.sock
 Environment=SILTA_PERSONA=/etc/silta/persona.md
+# Claude Code records the system prompt, persona included, on a conversation's first
+# request and sends that record on every later request and resume until the next
+# compaction, so an edited persona reaches a running mind only at its next rotation.
+# SILTA_PROMPT_SNAPSHOT=0 in a drop-in renders the prompt anew on every request instead
+# (`--system-prompt-snapshot off`); 1 asks for the recording explicitly. Unset leaves
+# Claude Code's default.
+#Environment=SILTA_PROMPT_SNAPSHOT=0
 Environment=SILTA_CLAUDE_BIN=/usr/lib/silta/silta-claude
 # How long silta-session waits for claude to finish its turn and exit after stdin is
 # closed, before killing it. Kept below `TimeoutStopSec` so the supervisor, not systemd,
@@ -121,8 +128,8 @@ TasksMax=512
 # No `MemoryDenyWriteExecute`: the Claude Code binary is a JavaScript runtime with a JIT.
 # A denylist of privileged syscall groups rather than an allowlist, because a mind runs
 # arbitrary developer tools. `PrivateTmp` keeps Claude Code's messaging socket
-# (`/tmp/cc-socks-<uid>`) private to the mind. `ProtectProc=invisible` keeps minds
-# from seeing each other's processes.
+# (`/tmp/cc-socks/`) private to the mind; `silta.tmpfiles` keeps the 10-day /tmp cleanup
+# off its sockets. `ProtectProc=invisible` keeps minds from seeing each other's processes.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
